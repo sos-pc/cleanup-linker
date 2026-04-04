@@ -606,6 +606,65 @@ def trigger_sync():
     return jsonify({"status": "sync started"})
 
 
+@app.route("/cleanup", methods=["POST"])
+def cleanup_orphans():
+    """
+    Endpoint pour rechercher et déplacer les torrents orphelins (upgrades ratés passés).
+    """
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if token != WEBHOOK_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    def run_cleanup():
+        log.info("=== Début du nettoyage des orphelins ===")
+        # On force une sync pour avoir la DB à jour
+        sync_db()
+
+        with get_db() as conn:
+            # Récupère tous les torrents (hors TARGET_CAT)
+            torrents = conn.execute(
+                "SELECT DISTINCT torrent_hash, torrent_name, category "
+                "FROM files WHERE torrent_hash IS NOT NULL AND category != ?",
+                (TARGET_CAT,),
+            ).fetchall()
+
+            to_move = []
+            for t in torrents:
+                # Cherche s'il y a au moins un fichier de ce torrent dans /data/Media
+                linked = conn.execute(
+                    "SELECT 1 FROM files "
+                    "WHERE torrent_hash = ? AND path LIKE '/data/Media/%' LIMIT 1",
+                    (t["torrent_hash"],),
+                ).fetchone()
+
+                if not linked:
+                    to_move.append(t)
+
+        if not to_move:
+            log.info("Aucun torrent orphelin trouvé.")
+            return
+
+        try:
+            s = qbit_session()
+            hashes = "|".join(t["torrent_hash"] for t in to_move)
+            s.post(
+                f"{QBIT_URL}/api/v2/torrents/setCategory",
+                data={"hashes": hashes, "category": TARGET_CAT},
+            )
+
+            for t in to_move:
+                log.info(
+                    f"  ✓ Orphan [{t['category']}] {t['torrent_name']} → {TARGET_CAT}"
+                )
+
+            log.info(f"=== Nettoyage terminé : {len(to_move)} torrents déplacés ===")
+        except Exception as e:
+            log.error(f"Erreur qBit lors du nettoyage: {e}")
+
+    threading.Thread(target=run_cleanup, daemon=True).start()
+    return jsonify({"status": "cleanup started"})
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
