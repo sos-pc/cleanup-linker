@@ -665,6 +665,72 @@ def cleanup_orphans():
     return jsonify({"status": "cleanup started"})
 
 
+@app.route("/restore", methods=["POST"])
+def restore_last_cleanup():
+    """
+    Remet les torrents déplacés par le dernier /cleanup dans leur catégorie d'origine.
+    Fonctionne tant que la DB n'a pas été resyncée après le cleanup.
+    """
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if token != WEBHOOK_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    def run_restore():
+        log.info("=== Début de la restauration ===")
+        try:
+            s = qbit_session()
+            # Torrents actuellement dans cleanuparr-unlinked côté qBit
+            all_torrents = qbit_get_torrents(s)
+            in_target = {
+                t["hash"]: t for t in all_torrents if t.get("category") == TARGET_CAT
+            }
+
+            if not in_target:
+                log.info("Aucun torrent dans la catégorie cible, rien à restaurer.")
+                return
+
+            # Catégories d'origine depuis la DB (avant resync)
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT torrent_hash, torrent_name, category "
+                    "FROM files WHERE torrent_hash IS NOT NULL AND category != ?",
+                    (TARGET_CAT,),
+                ).fetchall()
+
+            # Regroupe par catégorie d'origine pour batch les appels qBit
+            by_cat = {}
+            restored = []
+            for row in rows:
+                h = row["torrent_hash"]
+                if h not in in_target:
+                    continue  # pas dans cleanuparr-unlinked, rien à faire
+                cat = row["category"]
+                by_cat.setdefault(cat, []).append(row)
+
+            if not by_cat:
+                log.info("Aucun torrent à restaurer (DB déjà resyncée ?).")
+                return
+
+            for cat, torrents in by_cat.items():
+                hashes = "|".join(t["torrent_hash"] for t in torrents)
+                s.post(
+                    f"{QBIT_URL}/api/v2/torrents/setCategory",
+                    data={"hashes": hashes, "category": cat},
+                )
+                for t in torrents:
+                    log.info(
+                        f"  ↩ Restauré [{TARGET_CAT}] {t['torrent_name']} → {cat}"
+                    )
+                    restored.append(t)
+
+            log.info(f"=== Restauration terminée : {len(restored)} torrents remis en place ===")
+        except Exception as e:
+            log.error(f"Erreur lors de la restauration: {e}")
+
+    threading.Thread(target=run_restore, daemon=True).start()
+    return jsonify({"status": "restore started"})
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
