@@ -78,8 +78,29 @@ def init_db():
                 torrent_hash TEXT PRIMARY KEY,
                 marked_at    INTEGER DEFAULT (strftime('%s','now'))
             );
+
+            -- Historique de tous les moves effectués par cleanup-linker
+            CREATE TABLE IF NOT EXISTS cleanup_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                torrent_hash  TEXT    NOT NULL,
+                torrent_name  TEXT,
+                original_cat  TEXT,
+                source        TEXT,   -- 'webhook', 'cleanup'
+                moved_at      INTEGER DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_log_hash ON cleanup_log(torrent_hash);
+            CREATE INDEX IF NOT EXISTS idx_log_moved ON cleanup_log(moved_at);
         """)
     log.info("DB initialisée")
+
+
+def log_move(torrent_hash: str, torrent_name: str, original_cat: str, source: str):
+    """Enregistre un move dans le cleanup_log (persisté même après resync)."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO cleanup_log (torrent_hash, torrent_name, original_cat, source) VALUES (?, ?, ?, ?)",
+            (torrent_hash, torrent_name, original_cat, source),
+        )
 
 
 def mark_arr_managed(download_id: str):
@@ -522,6 +543,7 @@ def move_torrents_for_path(file_path: str, check_links: bool = True):
 
         for t in safe_to_move:
             log.info(f"  ✓ [{t['category']}] {t['name']} → {TARGET_CAT}")
+            log_move(t["info_hash"], t["name"], t["category"], "webhook")
 
         # Nettoie la DB locale
         with get_db() as conn:
@@ -686,6 +708,8 @@ def cleanup_orphans():
                 f"{QBIT_URL}/api/v2/torrents/setCategory",
                 data={"hashes": hashes, "category": TARGET_CAT},
             )
+            for t in torrents:
+                log_move(t["torrent_hash"], t["torrent_name"], t["category"], "cleanup")
             log.info(f"=== Nettoyage terminé : {len(torrents)} torrents déplacés ===")
         except Exception as e:
             log.error(f"Erreur qBit lors du nettoyage: {e}")
@@ -718,38 +742,52 @@ def restore_last_cleanup():
                 log.info("Aucun torrent dans la catégorie cible, rien à restaurer.")
                 return
 
-            # Catégories d'origine depuis la DB (avant resync)
+            # Source 1 : cleanup_log (fonctionne même après resync)
             with get_db() as conn:
-                rows = conn.execute(
-                    "SELECT DISTINCT torrent_hash, torrent_name, category "
-                    "FROM files WHERE torrent_hash IS NOT NULL AND category != ?",
+                log_rows = conn.execute(
+                    "SELECT torrent_hash, torrent_name, original_cat FROM cleanup_log "
+                    "WHERE original_cat != ? ORDER BY moved_at DESC",
                     (TARGET_CAT,),
                 ).fetchall()
 
+            # Dédoublonne par hash (garde l'entrée la plus récente)
+            hash_to_cat = {}
+            for r in log_rows:
+                if r["torrent_hash"] not in hash_to_cat:
+                    hash_to_cat[r["torrent_hash"]] = (r["torrent_name"], r["original_cat"])
+
+            # Source 2 : files table (fallback si cleanup_log vide = ancien container)
+            if not hash_to_cat:
+                log.info("cleanup_log vide, fallback sur la table files...")
+                with get_db() as conn:
+                    file_rows = conn.execute(
+                        "SELECT DISTINCT torrent_hash, torrent_name, category "
+                        "FROM files WHERE torrent_hash IS NOT NULL AND category != ?",
+                        (TARGET_CAT,),
+                    ).fetchall()
+                for r in file_rows:
+                    hash_to_cat[r["torrent_hash"]] = (r["torrent_name"], r["category"])
+
             # Regroupe par catégorie d'origine pour batch les appels qBit
             by_cat = {}
-            restored = []
-            for row in rows:
-                h = row["torrent_hash"]
+            for h, (name, cat) in hash_to_cat.items():
                 if h not in in_target:
                     continue  # pas dans cleanuparr-unlinked, rien à faire
-                cat = row["category"]
-                by_cat.setdefault(cat, []).append(row)
+                by_cat.setdefault(cat, []).append({"hash": h, "name": name})
 
             if not by_cat:
-                log.info("Aucun torrent à restaurer (DB déjà resyncée ?).")
+                log.info("Aucun torrent à restaurer.")
                 return
 
+            restored = []
             for cat, torrents in by_cat.items():
-                hashes = "|".join(t["torrent_hash"] for t in torrents)
+                hashes = "|".join(t["hash"] for t in torrents)
                 s.post(
                     f"{QBIT_URL}/api/v2/torrents/setCategory",
                     data={"hashes": hashes, "category": cat},
                 )
                 for t in torrents:
-                    log.info(
-                        f"  ↩ Restauré [{TARGET_CAT}] {t['torrent_name']} → {cat}"
-                    )
+                    log.info(f"  ↩ Restauré [{TARGET_CAT}] {t['name']} → {cat}")
                     restored.append(t)
 
             log.info(f"=== Restauration terminée : {len(restored)} torrents remis en place ===")
@@ -880,6 +918,23 @@ def bootstrap_arr_managed():
     return jsonify({"status": "bootstrap started", "dry_run": dry_run})
 
 
+@app.route("/history")
+def history():
+    """Historique des derniers moves effectués par cleanup-linker."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if token != WEBHOOK_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    limit = min(int(request.args.get("limit", 50)), 500)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, torrent_hash, torrent_name, original_cat, source, "
+            "datetime(moved_at, 'unixepoch') as moved_at "
+            "FROM cleanup_log ORDER BY moved_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
@@ -893,12 +948,14 @@ def stats():
         ).fetchone()[0]
         inodes = conn.execute("SELECT COUNT(DISTINCT inode) FROM files").fetchone()[0]
         arr_managed_count = conn.execute("SELECT COUNT(*) FROM arr_managed").fetchone()[0]
+        log_count = conn.execute("SELECT COUNT(*) FROM cleanup_log").fetchone()[0]
     return jsonify(
         {
             "total_paths": total,
             "linked_to_torrent": linked,
             "unique_inodes": inodes,
             "arr_managed_torrents": arr_managed_count,
+            "cleanup_log_entries": log_count,
         }
     )
 

@@ -238,6 +238,7 @@ Triggers: ✅ On File Import
 | `/bootstrap?token=...` | POST | Token | Peuple arr_managed depuis l'historique *arr |
 | `/cleanup?token=...` | POST | Token | Déplace les torrents *arr orphelins |
 | `/restore?token=...` | POST | Token | Restaure les torrents après un cleanup raté |
+| `/history?token=...` | GET | Token | Historique des moves (param `limit`, défaut 50) |
 | `/stats?token=...` | GET | Token | Statistiques de la DB |
 | `/health` | GET | Non | Healthcheck |
 
@@ -290,9 +291,25 @@ curl -XPOST 'http://192.168.1.111:5001/cleanup?token=VOTRE_TOKEN'
 
 ---
 
+## Historique des moves
+
+Chaque torrent déplacé vers `cleanuparr-unlinked` est enregistré dans la table `cleanup_log` de la DB SQLite (persistée dans `/config/db.sqlite`). Cette table survit aux resyncs et recreations du container.
+
+```bash
+# Voir les 50 derniers moves
+curl -s 'http://192.168.1.111:5001/history?token=VOTRE_TOKEN' | python3 -m json.tool
+
+# Voir les 200 derniers
+curl -s 'http://192.168.1.111:5001/history?token=VOTRE_TOKEN&limit=200' | python3 -m json.tool
+```
+
+Chaque entrée contient : `torrent_hash`, `torrent_name`, `original_cat`, `source` (webhook ou cleanup), `moved_at`.
+
+---
+
 ## En cas de cleanup raté
 
-Si des torrents ont été déplacés à tort vers `cleanuparr-unlinked`, l'endpoint `/restore` permet de les remettre en place **tant que la DB n'a pas été resyncée** (fenêtre de ~12h) :
+Si des torrents ont été déplacés à tort vers `cleanuparr-unlinked`, l'endpoint `/restore` permet de les remettre en place. Il utilise la table `cleanup_log` comme source principale — **il fonctionne donc même après une resync** :
 
 ```bash
 curl -XPOST 'http://192.168.1.111:5001/restore?token=VOTRE_TOKEN'
