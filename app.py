@@ -763,9 +763,15 @@ def restore_last_cleanup():
 @app.route("/bootstrap", methods=["POST"])
 def bootstrap_arr_managed():
     """
-    Interroge l'historique Sonarr + Radarr pour marquer tous les torrents
-    qui ont un jour été importés par *arr (downloadFolderImported).
-    À lancer une seule fois après installation pour rattraper l'historique.
+    Peuple arr_managed depuis trois sources complémentaires :
+
+    1. Historique *arr (downloadId) — imports via download client
+    2. Historique *arr (droppedPath) — même records, mais matché via le
+       chemin fichier dans notre DB (filet si le hash qBit diffère du downloadId)
+    3. DB locale hardlinks actifs — torrents ayant actuellement un fichier
+       dans /data/Media/ (couvre tout import quelle que soit la méthode)
+
+    À lancer une seule fois après installation.
     """
     token = request.args.get("token") or request.headers.get("X-Token")
     if token != WEBHOOK_TOKEN:
@@ -776,8 +782,10 @@ def bootstrap_arr_managed():
     def run_bootstrap():
         prefix = "[DRY RUN] " if dry_run else ""
         log.info(f"=== {prefix}Début bootstrap arr_managed ===")
-        total = 0
 
+        marked_hashes = set()  # dédoublonne toutes sources confondues
+
+        # ── Sources 1 & 2 : historique *arr ──────────────────────────────────
         for label, base_url, api_key in [
             ("Sonarr", SONARR_URL, SONARR_API_KEY),
             ("Radarr", RADARR_URL, RADARR_API_KEY),
@@ -787,7 +795,16 @@ def bootstrap_arr_managed():
                 continue
             try:
                 page, page_size = 1, 500
-                marked = 0
+                by_dlid = 0
+                by_path = 0
+
+                # Pré-charge index path→hash depuis la DB pour Source 2
+                with get_db() as conn:
+                    path_rows = conn.execute(
+                        "SELECT path, torrent_hash FROM files WHERE torrent_hash IS NOT NULL"
+                    ).fetchall()
+                path_to_hash = {r["path"]: r["torrent_hash"] for r in path_rows}
+
                 while True:
                     r = requests.get(
                         f"{base_url}/api/v3/history",
@@ -804,21 +821,60 @@ def bootstrap_arr_managed():
                     records = data.get("records", [])
                     if not records:
                         break
+
                     for rec in records:
+                        # Source 1 — downloadId
                         did = rec.get("downloadId", "")
                         if did:
-                            if not dry_run:
-                                mark_arr_managed(did)
-                            marked += 1
+                            h = did.lower().strip()
+                            if h not in marked_hashes:
+                                marked_hashes.add(h)
+                                by_dlid += 1
+
+                        # Source 2 — droppedPath → hash via DB locale
+                        dropped = rec.get("data", {}).get("droppedPath", "")
+                        if dropped and dropped in path_to_hash:
+                            h = path_to_hash[dropped]
+                            if h not in marked_hashes:
+                                marked_hashes.add(h)
+                                by_path += 1
+
                     if len(records) < page_size:
                         break
                     page += 1
-                log.info(f"{label}: {marked} entrées {'seraient marquées' if dry_run else 'marquées'}")
-                total += marked
+
+                log.info(
+                    f"{label}: {by_dlid} via downloadId + {by_path} via droppedPath "
+                    f"({'dry run' if dry_run else 'marqués'})"
+                )
             except Exception as e:
                 log.error(f"Erreur bootstrap {label}: {e}")
 
-        log.info(f"=== {prefix}Bootstrap terminé : {total} hashes au total ===")
+        # ── Source 3 : hardlinks actifs dans /data/Media/ ────────────────────
+        try:
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT torrent_hash FROM files "
+                    "WHERE torrent_hash IS NOT NULL AND path LIKE '/data/Media/%'"
+                ).fetchall()
+            new_from_links = sum(1 for r in rows if r["torrent_hash"] not in marked_hashes)
+            for r in rows:
+                marked_hashes.add(r["torrent_hash"])
+            log.info(
+                f"DB locale: {new_from_links} nouveaux via hardlinks /data/Media/ "
+                f"({'dry run' if dry_run else 'marqués'})"
+            )
+        except Exception as e:
+            log.error(f"Erreur bootstrap DB locale: {e}")
+
+        # ── Écriture en DB (sauf dry run) ─────────────────────────────────────
+        if not dry_run:
+            for h in marked_hashes:
+                mark_arr_managed(h)
+
+        log.info(
+            f"=== {prefix}Bootstrap terminé : {len(marked_hashes)} hashes uniques ==="
+        )
 
     threading.Thread(target=run_bootstrap, daemon=True).start()
     return jsonify({"status": "bootstrap started", "dry_run": dry_run})
