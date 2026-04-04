@@ -794,7 +794,7 @@ def bootstrap_arr_managed():
                         params={
                             "pageSize": page_size,
                             "page": page,
-                            "eventType": "downloadFolderImported",
+                            "eventType": 3,  # 3 = downloadFolderImported
                         },
                         headers={"X-Api-Key": api_key},
                         timeout=30,
