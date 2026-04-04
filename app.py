@@ -29,6 +29,11 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "cleanup-token-bobynas")
 DB_PATH = os.getenv("DB_PATH", "/config/db.sqlite")
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_HOURS", "12")) * 3600
 
+SONARR_URL     = os.getenv("SONARR_URL", "")
+SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
+RADARR_URL     = os.getenv("RADARR_URL", "")
+RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
+
 # Extensions pertinentes (vidéo uniquement)
 VIDEO_EXTENSIONS = {
     ".mkv",
@@ -67,8 +72,25 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_inode ON files(inode);
             CREATE INDEX IF NOT EXISTS idx_path  ON files(path);
             CREATE INDEX IF NOT EXISTS idx_hash  ON files(torrent_hash);
+
+            -- Torrents ayant un jour été importés par Sonarr/Radarr
+            CREATE TABLE IF NOT EXISTS arr_managed (
+                torrent_hash TEXT PRIMARY KEY,
+                marked_at    INTEGER DEFAULT (strftime('%s','now'))
+            );
         """)
     log.info("DB initialisée")
+
+
+def mark_arr_managed(download_id: str):
+    """Enregistre un hash torrent comme géré par *arr (idempotent)."""
+    if not download_id:
+        return
+    h = download_id.lower().strip()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO arr_managed (torrent_hash) VALUES (?)", (h,)
+        )
 
 
 # ── qBittorrent ──────────────────────────────────────────────────────────────
@@ -531,6 +553,11 @@ def webhook():
     is_upgrade = data.get("isUpgrade", False)
     log.info(f"Reçu event: {event} | isUpgrade: {is_upgrade}")
 
+    # Marque toujours le downloadId comme arr_managed dès qu'il est présent
+    download_id = data.get("downloadId", "")
+    if download_id:
+        mark_arr_managed(download_id)
+
     # Test ping
     if event == "Test":
         log.info("Test webhook reçu ✓")
@@ -615,49 +642,51 @@ def cleanup_orphans():
     if token != WEBHOOK_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
 
+    dry_run = request.args.get("dry_run", "false").lower() in ("1", "true", "yes")
+
     def run_cleanup():
-        log.info("=== Début du nettoyage des orphelins ===")
-        # On force une sync pour avoir la DB à jour
+        prefix = "[DRY RUN] " if dry_run else ""
+        log.info(f"=== {prefix}Début du nettoyage des orphelins ===")
         sync_db()
 
         with get_db() as conn:
-            # Récupère tous les torrents (hors TARGET_CAT)
+            # Uniquement les torrents connus de *arr (jamais les ajouts manuels)
+            # ET qui n'ont plus aucun hardlink dans /data/Media
             torrents = conn.execute(
-                "SELECT DISTINCT torrent_hash, torrent_name, category "
-                "FROM files WHERE torrent_hash IS NOT NULL AND category != ?",
+                """
+                SELECT DISTINCT f.torrent_hash, f.torrent_name, f.category
+                FROM files f
+                INNER JOIN arr_managed am ON am.torrent_hash = f.torrent_hash
+                WHERE f.torrent_hash IS NOT NULL
+                  AND f.category != ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM files m
+                      WHERE m.torrent_hash = f.torrent_hash
+                        AND m.path LIKE '/data/Media/%'
+                  )
+                """,
                 (TARGET_CAT,),
             ).fetchall()
 
-            to_move = []
-            for t in torrents:
-                # Cherche s'il y a au moins un fichier de ce torrent dans /data/Media
-                linked = conn.execute(
-                    "SELECT 1 FROM files "
-                    "WHERE torrent_hash = ? AND path LIKE '/data/Media/%' LIMIT 1",
-                    (t["torrent_hash"],),
-                ).fetchone()
+        if not torrents:
+            log.info(f"{prefix}Aucun torrent orphelin trouvé.")
+            return
 
-                if not linked:
-                    to_move.append(t)
+        for t in torrents:
+            log.info(f"  {'[DRY RUN] ' if dry_run else '✓ '}Orphan [{t['category']}] {t['torrent_name']} → {TARGET_CAT}")
 
-        if not to_move:
-            log.info("Aucun torrent orphelin trouvé.")
+        if dry_run:
+            log.info(f"=== [DRY RUN] {len(torrents)} torrents seraient déplacés (aucune action effectuée) ===")
             return
 
         try:
             s = qbit_session()
-            hashes = "|".join(t["torrent_hash"] for t in to_move)
+            hashes = "|".join(t["torrent_hash"] for t in torrents)
             s.post(
                 f"{QBIT_URL}/api/v2/torrents/setCategory",
                 data={"hashes": hashes, "category": TARGET_CAT},
             )
-
-            for t in to_move:
-                log.info(
-                    f"  ✓ Orphan [{t['category']}] {t['torrent_name']} → {TARGET_CAT}"
-                )
-
-            log.info(f"=== Nettoyage terminé : {len(to_move)} torrents déplacés ===")
+            log.info(f"=== Nettoyage terminé : {len(torrents)} torrents déplacés ===")
         except Exception as e:
             log.error(f"Erreur qBit lors du nettoyage: {e}")
 
@@ -731,6 +760,70 @@ def restore_last_cleanup():
     return jsonify({"status": "restore started"})
 
 
+@app.route("/bootstrap", methods=["POST"])
+def bootstrap_arr_managed():
+    """
+    Interroge l'historique Sonarr + Radarr pour marquer tous les torrents
+    qui ont un jour été importés par *arr (downloadFolderImported).
+    À lancer une seule fois après installation pour rattraper l'historique.
+    """
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if token != WEBHOOK_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    dry_run = request.args.get("dry_run", "false").lower() in ("1", "true", "yes")
+
+    def run_bootstrap():
+        prefix = "[DRY RUN] " if dry_run else ""
+        log.info(f"=== {prefix}Début bootstrap arr_managed ===")
+        total = 0
+
+        for label, base_url, api_key in [
+            ("Sonarr", SONARR_URL, SONARR_API_KEY),
+            ("Radarr", RADARR_URL, RADARR_API_KEY),
+        ]:
+            if not api_key:
+                log.warning(f"{label}: API key manquante, ignoré")
+                continue
+            try:
+                page, page_size = 1, 500
+                marked = 0
+                while True:
+                    r = requests.get(
+                        f"{base_url}/api/v3/history",
+                        params={
+                            "pageSize": page_size,
+                            "page": page,
+                            "eventType": "downloadFolderImported",
+                        },
+                        headers={"X-Api-Key": api_key},
+                        timeout=30,
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    records = data.get("records", [])
+                    if not records:
+                        break
+                    for rec in records:
+                        did = rec.get("downloadId", "")
+                        if did:
+                            if not dry_run:
+                                mark_arr_managed(did)
+                            marked += 1
+                    if len(records) < page_size:
+                        break
+                    page += 1
+                log.info(f"{label}: {marked} entrées {'seraient marquées' if dry_run else 'marquées'}")
+                total += marked
+            except Exception as e:
+                log.error(f"Erreur bootstrap {label}: {e}")
+
+        log.info(f"=== {prefix}Bootstrap terminé : {total} hashes au total ===")
+
+    threading.Thread(target=run_bootstrap, daemon=True).start()
+    return jsonify({"status": "bootstrap started", "dry_run": dry_run})
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
@@ -743,8 +836,14 @@ def stats():
             "SELECT COUNT(*) FROM files WHERE torrent_hash IS NOT NULL"
         ).fetchone()[0]
         inodes = conn.execute("SELECT COUNT(DISTINCT inode) FROM files").fetchone()[0]
+        arr_managed_count = conn.execute("SELECT COUNT(*) FROM arr_managed").fetchone()[0]
     return jsonify(
-        {"total_paths": total, "linked_to_torrent": linked, "unique_inodes": inodes}
+        {
+            "total_paths": total,
+            "linked_to_torrent": linked,
+            "unique_inodes": inodes,
+            "arr_managed_torrents": arr_managed_count,
+        }
     )
 
 
