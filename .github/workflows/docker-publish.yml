@@ -2,7 +2,7 @@ name: Docker Build and Publish
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "kiro" ]
   pull_request:
     branches: [ "main" ]
   # Permet de lancer l'action manuellement depuis l'interface GitHub
@@ -39,6 +39,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=kiro,enable=${{ github.ref == 'refs/heads/kiro' }}
             type=sha,format=short
 
       - name: Build and push Docker image
