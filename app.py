@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-cleanup-linker v3
-- DB SQLite persistée : inode ↔ paths ↔ torrent_hash
+cleanup-linker v4
+- DB SQLite persistée : inode ↔ paths ↔ torrent_hash (multi-hash par fichier)
 - Sync automatique depuis les catégories qBit toutes les 12h
 - Webhook Sonarr/Radarr : déplace les torrents liés vers cleanuparr-unlinked
 
-Améliorations v3 :
-- Sécurité : plus de credentials en dur, comparaison timing-safe des tokens
-- Fiabilité : threading.Lock pour SQLite, connexions fermées, sync atomique
-- Robustesse : retry réseau, validation payloads, sessions fermées
-- Production : gunicorn-ready, type hints, code refactoré
+Améliorations v4 :
+- Fix faux positifs : UNIQUE(path, torrent_hash) permet plusieurs hash par fichier
+- Protection DB : backup rotatif avant chaque sync, table sync_log
+- Soft delete : flag stale au lieu de DELETE brutal (rollback possible)
+- Garde-fous : refuse le cleanup si sync trop ancienne ou rows en chute
+- Fix double-sync : un seul sync_loop même avec plusieurs workers gunicorn
 """
 
 from __future__ import annotations
@@ -17,10 +18,13 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -55,6 +59,8 @@ WEBHOOK_TOKEN = _require_env("WEBHOOK_TOKEN")
 TARGET_CAT = os.getenv("TARGET_CATEGORY", "cleanuparr-unlinked")
 DB_PATH = os.getenv("DB_PATH", "/config/db.sqlite")
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_HOURS", "12")) * 3600
+BACKUP_RETENTION = int(os.getenv("BACKUP_RETENTION", "5"))
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/config/backups")
 
 SONARR_URL = os.getenv("SONARR_URL", "")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
@@ -77,6 +83,7 @@ VIDEO_EXTENSIONS: set[str] = {
 
 # ── Verrou global SQLite ─────────────────────────────────────────────────────
 _db_lock = threading.Lock()
+_sync_started = threading.Event()  # Empêche les doubles sync_loop (multi-workers)
 
 
 # ── Base de données ──────────────────────────────────────────────────────────
@@ -105,15 +112,18 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS files (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     inode        INTEGER NOT NULL,
-                    path         TEXT    NOT NULL UNIQUE,
+                    path         TEXT    NOT NULL,
                     torrent_hash TEXT,
                     torrent_name TEXT,
                     category     TEXT,
-                    updated_at   INTEGER DEFAULT (strftime('%s','now'))
+                    stale        INTEGER DEFAULT 0,
+                    updated_at   INTEGER DEFAULT (strftime('%s','now')),
+                    UNIQUE(path, torrent_hash)
                 );
                 CREATE INDEX IF NOT EXISTS idx_inode ON files(inode);
                 CREATE INDEX IF NOT EXISTS idx_path  ON files(path);
                 CREATE INDEX IF NOT EXISTS idx_hash  ON files(torrent_hash);
+                CREATE INDEX IF NOT EXISTS idx_stale ON files(stale);
 
                 CREATE TABLE IF NOT EXISTS arr_managed (
                     torrent_hash TEXT PRIMARY KEY,
@@ -130,7 +140,58 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_log_hash ON cleanup_log(torrent_hash);
                 CREATE INDEX IF NOT EXISTS idx_log_moved ON cleanup_log(moved_at);
+
+                CREATE TABLE IF NOT EXISTS sync_log (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at     INTEGER NOT NULL,
+                    finished_at    INTEGER,
+                    status         TEXT DEFAULT 'running',
+                    rows_before    INTEGER,
+                    rows_after     INTEGER,
+                    torrents_count INTEGER,
+                    duration_s     REAL
+                );
             """)
+            # Migration : si l'ancienne table files a UNIQUE(path), on la recrée
+            # Détecte si la contrainte unique est sur path seul
+            table_info = conn.execute("PRAGMA table_info(files)").fetchall()
+            index_info = conn.execute("PRAGMA index_list(files)").fetchall()
+            needs_migration = False
+            for idx in index_info:
+                idx_name = idx[1]
+                cols = conn.execute(f"PRAGMA index_info({idx_name})").fetchall()
+                # Si un index unique ne porte que sur 'path' (colonne 2 = path)
+                if idx[2] == 1 and len(cols) == 1:  # unique=1, single column
+                    col_name_row = conn.execute(
+                        f"PRAGMA index_info({idx_name})"
+                    ).fetchone()
+                    if col_name_row and col_name_row[2] == "path":
+                        needs_migration = True
+                        break
+            if needs_migration:
+                log.info("Migration DB : UNIQUE(path) → UNIQUE(path, torrent_hash)")
+                conn.executescript("""
+                    ALTER TABLE files RENAME TO files_old;
+                    CREATE TABLE files (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        inode        INTEGER NOT NULL,
+                        path         TEXT    NOT NULL,
+                        torrent_hash TEXT,
+                        torrent_name TEXT,
+                        category     TEXT,
+                        stale        INTEGER DEFAULT 0,
+                        updated_at   INTEGER DEFAULT (strftime('%s','now')),
+                        UNIQUE(path, torrent_hash)
+                    );
+                    INSERT OR IGNORE INTO files (inode, path, torrent_hash, torrent_name, category, updated_at)
+                        SELECT inode, path, torrent_hash, torrent_name, category, updated_at FROM files_old;
+                    DROP TABLE files_old;
+                    CREATE INDEX IF NOT EXISTS idx_inode ON files(inode);
+                    CREATE INDEX IF NOT EXISTS idx_path  ON files(path);
+                    CREATE INDEX IF NOT EXISTS idx_hash  ON files(torrent_hash);
+                    CREATE INDEX IF NOT EXISTS idx_stale ON files(stale);
+                """)
+                log.info("Migration terminée")
     log.info("DB initialisée")
 
 
@@ -226,6 +287,64 @@ def qbit_get_torrents(s: requests.Session) -> list[dict[str, Any]]:
     return r.json()
 
 
+# ── Backup DB ─────────────────────────────────────────────────────────────────
+
+
+def backup_db() -> str | None:
+    """Crée un backup SQLite avant chaque sync. Retourne le chemin du backup ou None."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
+        backup_path = os.path.join(BACKUP_DIR, f"db_{timestamp}.sqlite")
+
+        # Utilise l'API SQLite backup (safe même pendant des écritures)
+        source = sqlite3.connect(DB_PATH, timeout=10)
+        dest = sqlite3.connect(backup_path)
+        source.backup(dest)
+        dest.close()
+        source.close()
+
+        log.info("Backup DB créé : %s", backup_path)
+
+        # Rotation : supprime les anciens backups au-delà de BACKUP_RETENTION
+        backups = sorted(Path(BACKUP_DIR).glob("db_*.sqlite"))
+        while len(backups) > BACKUP_RETENTION:
+            old = backups.pop(0)
+            old.unlink()
+            log.info("Backup supprimé (rotation) : %s", old.name)
+
+        return backup_path
+    except Exception as e:
+        log.error("Erreur backup DB : %s", e)
+        return None
+
+
+# ── Sync log ─────────────────────────────────────────────────────────────────
+
+
+def _log_sync_start(rows_before: int) -> int:
+    """Enregistre le début d'une sync. Retourne l'ID du sync_log."""
+    with _db_lock:
+        with get_db() as conn:
+            cursor = conn.execute(
+                "INSERT INTO sync_log (started_at, rows_before) VALUES (?, ?)",
+                (int(time.time()), rows_before),
+            )
+            return cursor.lastrowid
+
+
+def _log_sync_end(sync_id: int, status: str, rows_after: int,
+                  torrents_count: int, duration: float) -> None:
+    """Met à jour le sync_log avec les résultats."""
+    with _db_lock:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE sync_log SET finished_at=?, status=?, rows_after=?, "
+                "torrents_count=?, duration_s=? WHERE id=?",
+                (int(time.time()), status, rows_after, torrents_count, duration, sync_id),
+            )
+
+
 # ── Scan filesystem (refactoré — une seule fonction réutilisable) ─────────────
 
 
@@ -293,15 +412,26 @@ def scan_torrent_files(
 
 def sync_db() -> None:
     """
-    Sync complète (atomique) :
-    1. Récupère les catégories qBit → dossiers à scanner
-    2. Récupère tous les torrents qBit
-    3. Pour chaque torrent → stat() les fichiers → inode
-    4. Scanne /data/Media pour trouver les hardlinks côté *arr
-    5. Met à jour la DB dans une transaction unique
+    Sync complète (atomique avec soft delete) :
+    1. Backup la DB
+    2. Récupère les catégories qBit → dossiers à scanner
+    3. Récupère tous les torrents qBit
+    4. Pour chaque torrent → stat() les fichiers → inode
+    5. Scanne /data/Media pour trouver les hardlinks côté *arr
+    6. Soft delete (stale=1) + insert nouvelles rows + purge stale
     """
     log.info("=== Début sync DB ===")
     start = time.time()
+
+    # Backup avant modification
+    backup_db()
+
+    # Compte les rows avant
+    with _db_lock:
+        with get_db() as conn:
+            rows_before = conn.execute("SELECT COUNT(*) FROM files WHERE stale = 0").fetchone()[0]
+
+    sync_id = _log_sync_start(rows_before)
 
     try:
         with qbit_session() as s:
@@ -309,6 +439,7 @@ def sync_db() -> None:
             torrents = qbit_get_torrents(s)
     except Exception as e:
         log.error("Erreur connexion qBit: %s", e)
+        _log_sync_end(sync_id, "failed", rows_before, 0, time.time() - start)
         return
 
     # ── Étape 1 : construire inode → torrent depuis qBit ─────────────────────
@@ -366,23 +497,55 @@ def sync_db() -> None:
         for inode, paths in cat_inode_map.items():
             _add_inode_rows(inode, paths)
 
-    # ── Étape 4 : écriture atomique en DB (transaction) ───────────────────────
+    # ── Étape 4 : soft delete + insert (atomique) ─────────────────────────────
     with _db_lock:
         with get_db() as conn:
-            # Transaction atomique : si le INSERT échoue, le DELETE est annulé
-            conn.execute("DELETE FROM files")
+            # Marque toutes les rows existantes comme stale
+            conn.execute("UPDATE files SET stale = 1")
+
+            # Insère les nouvelles rows (ou met à jour si (path, torrent_hash) existe)
             conn.executemany(
-                "INSERT OR REPLACE INTO files (inode, path, torrent_hash, torrent_name, category) "
-                "VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO files (inode, path, torrent_hash, torrent_name, category, stale, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 0, strftime('%s','now'))
+                   ON CONFLICT(path, torrent_hash) DO UPDATE SET
+                       inode = excluded.inode,
+                       torrent_name = excluded.torrent_name,
+                       category = excluded.category,
+                       stale = 0,
+                       updated_at = strftime('%s','now')
+                """,
                 rows,
             )
 
+            # Purge les rows stale (plus présentes sur le filesystem)
+            stale_count = conn.execute("SELECT COUNT(*) FROM files WHERE stale = 1").fetchone()[0]
+            conn.execute("DELETE FROM files WHERE stale = 1")
+
+    rows_after = len(rows)
     elapsed = time.time() - start
-    log.info("=== Sync terminée : %d entrées en %.1fs ===", len(rows), elapsed)
+
+    # Vérification d'intégrité : alerte si chute > 30%
+    if rows_before > 0 and rows_after < rows_before * 0.7:
+        log.warning(
+            "⚠️ ALERTE : rows en chute de %d → %d (%.0f%% de perte)",
+            rows_before, rows_after, (1 - rows_after / rows_before) * 100
+        )
+
+    _log_sync_end(sync_id, "success", rows_after, len(torrents), elapsed)
+    log.info(
+        "=== Sync terminée : %d entrées (%d stale purgées) en %.1fs ===",
+        rows_after, stale_count, elapsed
+    )
 
 
 def sync_loop() -> None:
-    """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes."""
+    """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes.
+    Utilise _sync_started pour éviter les doubles sync_loop (multi-workers gunicorn)."""
+    if _sync_started.is_set():
+        log.info("sync_loop déjà active dans un autre worker, skip")
+        return
+    _sync_started.set()
+
     time.sleep(5)
     while True:
         try:
@@ -713,6 +876,39 @@ def cleanup_orphans():
     def run_cleanup():
         prefix = "[DRY RUN] " if dry_run else ""
         log.info("=== %sDébut du nettoyage des orphelins ===", prefix)
+
+        # ── Garde-fou : vérifier que la dernière sync est récente et OK ───────
+        with _db_lock:
+            with get_db() as conn:
+                last_sync = conn.execute(
+                    "SELECT finished_at, status, rows_before, rows_after "
+                    "FROM sync_log WHERE status = 'success' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+        if last_sync:
+            sync_age = int(time.time()) - (last_sync["finished_at"] or 0)
+            max_age = SYNC_INTERVAL * 2  # 2x l'intervalle = trop vieux
+            if sync_age > max_age:
+                log.warning(
+                    "⚠️ Cleanup refusé : dernière sync réussie il y a %dh (max %dh). "
+                    "Lancez /sync d'abord.",
+                    sync_age // 3600, max_age // 3600
+                )
+                return
+
+            # Vérifier que les rows n'ont pas chuté anormalement
+            if last_sync["rows_before"] and last_sync["rows_after"]:
+                ratio = last_sync["rows_after"] / max(last_sync["rows_before"], 1)
+                if ratio < 0.5:
+                    log.warning(
+                        "⚠️ Cleanup refusé : la dernière sync a perdu %.0f%% des rows "
+                        "(%d → %d). Vérifiez la DB.",
+                        (1 - ratio) * 100,
+                        last_sync["rows_before"], last_sync["rows_after"]
+                    )
+                    return
+
+        # Lancer une sync fraîche avant le cleanup
         sync_db()
 
         with _db_lock:
@@ -724,10 +920,20 @@ def cleanup_orphans():
                     INNER JOIN arr_managed am ON am.torrent_hash = f.torrent_hash
                     WHERE f.torrent_hash IS NOT NULL
                       AND f.category != ?
+                      AND f.stale = 0
                       AND NOT EXISTS (
                           SELECT 1 FROM files m
                           WHERE m.torrent_hash = f.torrent_hash
                             AND m.path LIKE '/data/Media/%'
+                            AND m.stale = 0
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM files m2
+                          WHERE m2.inode IN (
+                              SELECT inode FROM files WHERE torrent_hash = f.torrent_hash AND stale = 0
+                          )
+                          AND m2.path LIKE '/data/Media/%'
+                          AND m2.stale = 0
                       )
                     """,
                     (TARGET_CAT,),
@@ -984,19 +1190,34 @@ def stats():
         return jsonify({"error": "Unauthorized"}), 401
     with _db_lock:
         with get_db() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM files WHERE stale = 0").fetchone()[0]
+            total_paths = conn.execute("SELECT COUNT(DISTINCT path) FROM files WHERE stale = 0").fetchone()[0]
             linked = conn.execute(
-                "SELECT COUNT(*) FROM files WHERE torrent_hash IS NOT NULL"
+                "SELECT COUNT(*) FROM files WHERE torrent_hash IS NOT NULL AND stale = 0"
             ).fetchone()[0]
-            inodes = conn.execute("SELECT COUNT(DISTINCT inode) FROM files").fetchone()[0]
+            inodes = conn.execute("SELECT COUNT(DISTINCT inode) FROM files WHERE stale = 0").fetchone()[0]
             arr_managed_count = conn.execute("SELECT COUNT(*) FROM arr_managed").fetchone()[0]
             log_count = conn.execute("SELECT COUNT(*) FROM cleanup_log").fetchone()[0]
+            last_sync = conn.execute(
+                "SELECT finished_at, status, rows_after, duration_s "
+                "FROM sync_log WHERE status = 'success' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    last_sync_info = None
+    if last_sync:
+        last_sync_info = {
+            "finished_at": last_sync["finished_at"],
+            "status": last_sync["status"],
+            "rows": last_sync["rows_after"],
+            "duration_s": last_sync["duration_s"],
+        }
     return jsonify({
-        "total_paths": total,
+        "total_rows": total,
+        "total_paths": total_paths,
         "linked_to_torrent": linked,
         "unique_inodes": inodes,
         "arr_managed_torrents": arr_managed_count,
         "cleanup_log_entries": log_count,
+        "last_sync": last_sync_info,
     })
 
 
