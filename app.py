@@ -123,7 +123,6 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_inode ON files(inode);
                 CREATE INDEX IF NOT EXISTS idx_path  ON files(path);
                 CREATE INDEX IF NOT EXISTS idx_hash  ON files(torrent_hash);
-                CREATE INDEX IF NOT EXISTS idx_stale ON files(stale);
 
                 CREATE TABLE IF NOT EXISTS arr_managed (
                     torrent_hash TEXT PRIMARY KEY,
@@ -192,6 +191,14 @@ def init_db() -> None:
                     CREATE INDEX IF NOT EXISTS idx_stale ON files(stale);
                 """)
                 log.info("Migration terminée")
+            else:
+                # Ajoute la colonne stale si elle n'existe pas encore
+                cols = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+                if "stale" not in cols:
+                    conn.execute("ALTER TABLE files ADD COLUMN stale INTEGER DEFAULT 0")
+                    log.info("Colonne 'stale' ajoutée à la table files")
+            # Crée l'index stale (après migration si nécessaire)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_stale ON files(stale)")
     log.info("DB initialisée")
 
 
