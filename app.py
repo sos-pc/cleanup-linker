@@ -199,6 +199,11 @@ def init_db() -> None:
                     log.info("Colonne 'stale' ajoutée à la table files")
             # Crée l'index stale (après migration si nécessaire)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stale ON files(stale)")
+            # Index partiel sur les paths Media — accélère le cleanup
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_hash "
+                "ON files(torrent_hash) WHERE path LIKE '/data/Media/%'"
+            )
     log.info("DB initialisée")
 
 
@@ -539,6 +544,12 @@ def sync_db() -> None:
         )
 
     _log_sync_end(sync_id, "success", rows_after, len(torrents), elapsed)
+
+    # A3 : met à jour les stats pour l'optimiseur SQLite
+    with _db_lock:
+        with get_db() as conn:
+            conn.execute("ANALYZE files")
+
     log.info(
         "=== Sync terminée : %d entrées (%d stale purgées) en %.1fs ===",
         rows_after, stale_count, elapsed
@@ -915,28 +926,62 @@ def cleanup_orphans():
                     )
                     return
 
-        # Lancer une sync fraîche avant le cleanup
-        sync_db()
-
+        # B1 : sync fraîche seulement si > 2 min depuis la dernière
         with _db_lock:
             with get_db() as conn:
-                torrents = conn.execute(
-                    """
-                    SELECT DISTINCT f.torrent_hash, f.torrent_name, f.category
-                    FROM files f
-                    INNER JOIN arr_managed am ON am.torrent_hash = f.torrent_hash
-                    WHERE f.torrent_hash IS NOT NULL
-                      AND f.category != ?
-                      AND f.stale = 0
-                      AND NOT EXISTS (
-                          SELECT 1 FROM files m
-                          WHERE m.torrent_hash = f.torrent_hash
-                            AND m.path LIKE '/data/Media/%'
-                            AND m.stale = 0
-                      )
-                    """,
-                    (TARGET_CAT,),
-                ).fetchall()
+                last_ok = conn.execute(
+                    "SELECT finished_at FROM sync_log WHERE status='success' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+        cooldown = 120  # secondes
+        if last_ok and (int(time.time()) - (last_ok["finished_at"] or 0)) < cooldown:
+            log.info("Sync récente (<2 min), skip re-sync avant cleanup")
+        else:
+            sync_db()
+
+        # A1 : requête en 2 étapes pour éviter le NOT EXISTS corrélé (lent sur 124k rows)
+        t_query = time.time()
+        with _db_lock:
+            with get_db() as conn:
+                # Étape 1 : hash qui ont AU MOINS un fichier dans /data/Media/ — 1 seule passe
+                media_hashes = set(
+                    r[0] for r in conn.execute(
+                        "SELECT DISTINCT torrent_hash FROM files "
+                        "WHERE path LIKE '/data/Media/%' AND stale = 0 AND torrent_hash IS NOT NULL"
+                    ).fetchall()
+                )
+                log.info("Étape 1 (hashes Media) : %d hashes en %.2fs",
+                         len(media_hashes), time.time() - t_query)
+
+                # Étape 2 : orphelins = arr_managed ET hash PAS dans media_hashes
+                t2 = time.time()
+                if media_hashes:
+                    placeholders = ",".join("?" * len(media_hashes))
+                    torrents = conn.execute(
+                        f"""
+                        SELECT DISTINCT f.torrent_hash, f.torrent_name, f.category
+                        FROM files f
+                        INNER JOIN arr_managed am ON am.torrent_hash = f.torrent_hash
+                        WHERE f.torrent_hash IS NOT NULL
+                          AND f.category != ?
+                          AND f.stale = 0
+                          AND f.torrent_hash NOT IN ({placeholders})
+                        """,
+                        (TARGET_CAT, *media_hashes),
+                    ).fetchall()
+                else:
+                    torrents = conn.execute(
+                        """
+                        SELECT DISTINCT f.torrent_hash, f.torrent_name, f.category
+                        FROM files f
+                        INNER JOIN arr_managed am ON am.torrent_hash = f.torrent_hash
+                        WHERE f.torrent_hash IS NOT NULL
+                          AND f.category != ?
+                          AND f.stale = 0
+                        """,
+                        (TARGET_CAT,),
+                    ).fetchall()
+                log.info("Étape 2 (orphelins) : %d trouvés en %.2fs",
+                         len(torrents), time.time() - t2)
 
         if not torrents:
             log.info("%sAucun torrent orphelin trouvé.", prefix)
