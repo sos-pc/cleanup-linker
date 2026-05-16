@@ -934,14 +934,6 @@ def cleanup_orphans():
                             AND m.path LIKE '/data/Media/%'
                             AND m.stale = 0
                       )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM files m2
-                          WHERE m2.inode IN (
-                              SELECT inode FROM files WHERE torrent_hash = f.torrent_hash AND stale = 0
-                          )
-                          AND m2.path LIKE '/data/Media/%'
-                          AND m2.stale = 0
-                      )
                     """,
                     (TARGET_CAT,),
                 ).fetchall()
