@@ -150,6 +150,9 @@ services:
       - SONARR_API_KEY=VOTRE_CLE_API_SONARR
       - RADARR_URL=http://radarr:7878
       - RADARR_API_KEY=VOTRE_CLE_API_RADARR
+      - JELLYFIN_URL=http://jellyfin:8096
+      - JELLYFIN_API_KEY=VOTRE_CLE_API_JELLYFIN
+      - JELLYFIN_PATH_MAP=/Multimedia:/data/Multimedia
 
 networks:
   default:
@@ -173,6 +176,11 @@ networks:
 | `SONARR_API_KEY` | — | Clé API Sonarr (Settings → General) |
 | `RADARR_URL` | — | URL Radarr (requis pour `/bootstrap`) |
 | `RADARR_API_KEY` | — | Clé API Radarr (Settings → General) |
+| `JELLYFIN_URL` | — | URL Jellyfin. Vide = suppressions Jellyfin désactivées |
+| `JELLYFIN_API_KEY` | — | Clé API Jellyfin (Tableau de bord → Clés API) |
+| `JELLYFIN_PATH_MAP` | `/Multimedia:/data/Multimedia` | Traduction des chemins vus par Jellyfin. Format `préfixe_jf:préfixe_local`, séparés par des virgules |
+| `JELLYFIN_FALLBACK_MATCH` | `true` | Autorise la résolution par métadonnées quand l'item n'est pas encore indexé |
+| `JELLYFIN_FALLBACK_MAX` | `10` | Nombre max de chemins que le fallback peut retenir avant d'abandonner |
 
 ---
 
@@ -205,6 +213,81 @@ Triggers: ✅ On File Import
 
 ---
 
+## Configuration Jellyfin
+
+Supprimer un média depuis Jellyfin déclenche la même mécanique que depuis Sonarr/Radarr : le hardlink de la bibliothèque disparaît, cleanup-linker retrouve l'inode, et déplace le torrent original **et** ses cross-seeds.
+
+### Pourquoi une indexation est nécessaire
+
+Contrairement aux webhooks Sonarr/Radarr, le payload `ItemDeleted` de Jellyfin **ne contient pas le chemin du fichier** — seulement un `ItemId` interne. Et l'event part *après* la suppression : l'API Jellyfin ne peut plus répondre, l'item n'existe plus.
+
+La correspondance doit donc être établie **avant**. À chaque sync, cleanup-linker interroge Jellyfin (`GET /Items?Recursive=true&Fields=Path`, un seul appel paginé, aucun scan disque) et tague les lignes de `files` avec la colonne `jellyfin_item_id` :
+
+```
+files
+inode  │ path                                   │ torrent_hash │ jellyfin_item_id
+───────┼────────────────────────────────────────┼──────────────┼─────────────────
+12345  │ /data/Media/Séries/…/S01E14.mkv        │ 222d582cec   │ a1b2c3d4…
+12345  │ /data/Media/Séries/…/S01E14.mkv        │ bd4a11bf5b   │ a1b2c3d4…
+12345  │ /data/Multimedia/Séries/…/S01E14.mkv   │ 222d582cec   │ NULL
+12345  │ /data/Multimedia/cross-seeds/…/S01E14  │ 40056fb95f   │ NULL
+```
+
+Seul le chemin vu par Jellyfin est tagué — l'inode se charge du reste. À la suppression : `jellyfin_item_id` → inode → tous les hashes → cross-seeds → qBit.
+
+### Plugin Webhook
+
+Tableau de bord → Extensions → Webhook → **Add Generic Destination**
+
+```
+Webhook Name  : cleanup-linker
+Webhook Url   : http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN
+Notification Type : ✅ Item Deleted
+Item Type     : ✅ Movies   ✅ Episodes
+                ❌ Series   ❌ Seasons   (conteneurs ignorés, voir plus bas)
+Send All Properties : ✅ obligatoire
+```
+
+`Send All Properties` envoie le JSON brut ; sans cette case il faut fournir un template Handlebars et la route ne recevra pas `ItemId`.
+
+Si Jellyfin n'est pas sur le réseau Docker `mediastack`, utilise l'IP de l'hôte (`http://192.168.1.111:5001`) plutôt que le nom de container.
+
+### Les deux garde-fous
+
+`ItemDeleted` ne se déclenche pas seulement sur une suppression volontaire : il part dès qu'un item quitte la base Jellyfin — refresh de métadonnées, réidentification, **retrait d'une bibliothèque**. Dans ces cas les fichiers sont toujours sur le disque.
+
+1. **Le hardlink a-t-il vraiment disparu ?** Un `os.stat()` sur le chemin tagué. S'il répond, l'event est ignoré. C'est ce qui empêche un retrait de bibliothèque de balancer toute la collection vers `cleanuparr-unlinked`.
+2. **Le torrent sert-il encore ?** Garde-fou existant, partagé avec Sonarr/Radarr : un pack de saison dont d'autres épisodes sont encore hardlinkés n'est pas déplacé.
+
+### Séries et saisons
+
+Une `Series` ou une `Season` est un dossier, pas un fichier : rien à taguer. Jellyfin émet un `ItemDeleted` par épisode, ce sont ces events qui portent l'action. Les events conteneurs sont explicitement ignorés (visible dans les logs).
+
+### Média non indexé
+
+Un média ajouté *puis* supprimé entre deux syncs n'a jamais été tagué. Le fallback (`JELLYFIN_FALLBACK_MATCH`) restreint alors les candidats par métadonnées (`SeriesName` + saison, ou titre + année) et **ne retient que les chemins réellement absents du disque**. Au-delà de `JELLYFIN_FALLBACK_MAX` chemins il abandonne : un titre trop générique ne doit pas déclencher un déplacement de masse.
+
+Pour combler l'écart sans attendre la sync :
+
+```bash
+curl -XPOST 'http://192.168.1.111:5001/jellyfin/index?token=VOTRE_TOKEN'
+```
+
+### Bibliothèques couvertes
+
+Seules les bibliothèques dont les fichiers sont indexés par cleanup-linker sont résolvables : celles sous `/data/Media/` et sous les dossiers de catégories qBit. Une bibliothèque pointant ailleurs (musique, YouTube…) produira un `unresolved` dans les logs, sans effet de bord.
+
+### Tester sans rien déplacer
+
+```bash
+# Ajoute &dry_run=true à l'URL du webhook, ou rejoue un payload à la main
+curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"NotificationType":"ItemDeleted","ItemType":"Episode","ItemId":"..."}'
+```
+
+---
+
 ## Événements gérés
 
 ### Sonarr
@@ -227,6 +310,18 @@ Triggers: ✅ On File Import
 | `Download` isUpgrade=false | Import normal | Marqué arr_managed, ignoré sinon |
 | `Test` | Test webhook | Répond OK |
 
+### Jellyfin
+
+Route dédiée `/jellyfin` — le payload Jellyfin n'a pas le même format que celui des *arrs.
+
+| Event | ItemType | Action |
+|---|---|---|
+| `ItemDeleted` | `Movie`, `Episode`, `Video` | Résout `ItemId` → chemin → inode, puis move vers cleanuparr-unlinked |
+| `ItemDeleted` | `Series`, `Season` | Ignoré (conteneur — les épisodes remontent individuellement) |
+| Autre | — | Ignoré |
+
+Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visibles dans `/history` et réversibles via `/restore`.
+
 ---
 
 ## Endpoints API
@@ -240,6 +335,8 @@ Triggers: ✅ On File Import
 | `/restore?token=...` | POST | Token | Restaure les torrents après un cleanup raté |
 | `/history?token=...` | GET | Token | Historique des moves (param `limit`, défaut 50) |
 | `/stats?token=...` | GET | Token | Statistiques de la DB |
+| `/jellyfin?token=...` | POST | Token | Reçoit les events Jellyfin (param `dry_run`) |
+| `/jellyfin/index?token=...` | POST | Token | Force la réindexation Jellyfin |
 | `/health` | GET | Non | Healthcheck |
 
 ---

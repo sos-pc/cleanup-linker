@@ -69,6 +69,30 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
+# ── Jellyfin ─────────────────────────────────────────────────────────────────
+# Optionnel : si JELLYFIN_URL/JELLYFIN_API_KEY sont absents, la route /jellyfin
+# répond 503 et l'indexation est simplement sautée à chaque sync.
+JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").rstrip("/")
+JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
+
+# Jellyfin voit les fichiers via ses propres montages : le container monte
+# /data/Multimedia sur /Multimedia, donc il annonce "/Multimedia/Films/x.mkv"
+# là où la DB stocke "/data/Multimedia/Films/x.mkv". Format : "préfixe_jf:préfixe_local"
+# séparés par des virgules. Les préfixes les plus longs sont appliqués en premier.
+JELLYFIN_PATH_MAP = os.getenv("JELLYFIN_PATH_MAP", "/Multimedia:/data/Multimedia")
+
+# Filet quand l'item n'a jamais été indexé (média ajouté puis supprimé entre
+# deux syncs) : on restreint les candidats par métadonnées et on n'agit que sur
+# les fichiers réellement absents du disque.
+JELLYFIN_FALLBACK_MATCH = os.getenv("JELLYFIN_FALLBACK_MATCH", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Borne le rayon d'action du fallback : au-delà, le motif est jugé trop large
+# (titre générique) et on préfère ne rien faire plutôt que déplacer à l'aveugle.
+JELLYFIN_FALLBACK_MAX = int(os.getenv("JELLYFIN_FALLBACK_MAX", "10"))
+
 # Extensions pertinentes (vidéo uniquement — .iso retiré)
 VIDEO_EXTENSIONS: set[str] = {
     ".mkv",
@@ -199,6 +223,17 @@ def init_db() -> None:
                     log.info("Colonne 'stale' ajoutée à la table files")
             # Crée l'index stale (après migration si nécessaire)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_stale ON files(stale)")
+            # Correspondance item Jellyfin → ligne fichier. Un même chemin porte
+            # plusieurs lignes (une par torrent_hash) : elles sont toutes taguées,
+            # la lecture se fait en DISTINCT.
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+            if "jellyfin_item_id" not in cols:
+                conn.execute("ALTER TABLE files ADD COLUMN jellyfin_item_id TEXT")
+                log.info("Colonne 'jellyfin_item_id' ajoutée à la table files")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jellyfin_item "
+                "ON files(jellyfin_item_id) WHERE jellyfin_item_id IS NOT NULL"
+            )
             # Index partiel sur les paths Media — accélère le cleanup
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_media_hash "
@@ -271,8 +306,14 @@ def qbit_session():
             data={"username": QBIT_USER, "password": QBIT_PASS},
             timeout=10,
         )
-        if r.text != "Ok.":
-            raise RuntimeError(f"qBit login failed: {r.text}")
+        # qBittorrent < 5.x répond 200 "Ok." ; 5.x répond 204 sans corps et
+        # ne fournit que le cookie SID. On accepte les deux formes.
+        body_ok = r.text.strip() == "Ok."
+        has_sid = any(c.startswith("QBT_SID") for c in s.cookies.keys())
+        if not (body_ok or (r.ok and has_sid)):
+            raise RuntimeError(
+                f"qBit login failed: HTTP {r.status_code} body={r.text.strip()!r}"
+            )
         yield s
     finally:
         s.close()
@@ -555,6 +596,15 @@ def sync_db() -> None:
         rows_after, stale_count, elapsed
     )
 
+    # Les tags Jellyfin portent sur des chemins qui viennent d'être reconstruits :
+    # on réindexe dans la foulée. Isolé pour qu'un Jellyfin injoignable ne fasse
+    # jamais échouer la sync elle-même.
+    if jellyfin_enabled():
+        try:
+            sync_jellyfin_ids()
+        except Exception as e:
+            log.error("Erreur indexation Jellyfin: %s", e)
+
 
 def sync_loop() -> None:
     """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes.
@@ -608,15 +658,213 @@ def find_crossseeds_for_hash(original_hash: str) -> list[dict[str, Any]]:
     return find_all_torrents_for_hash(original_hash)
 
 
+# ── Jellyfin ─────────────────────────────────────────────────────────────────
+
+
+def jellyfin_enabled() -> bool:
+    return bool(JELLYFIN_URL and JELLYFIN_API_KEY)
+
+
+def _parse_path_map(raw: str) -> list[tuple[str, str]]:
+    """Parse "préfixe_jf:préfixe_local,..." → liste triée du plus long au plus court."""
+    pairs: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        jf, local = entry.split(":", 1)
+        jf, local = jf.strip().rstrip("/"), local.strip().rstrip("/")
+        if jf and local:
+            pairs.append((jf, local))
+    # Le préfixe le plus spécifique gagne (/Multimedia/Films avant /Multimedia)
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
+
+
+_PATH_MAP = _parse_path_map(JELLYFIN_PATH_MAP)
+
+
+def map_jellyfin_path(path: str) -> str:
+    """Traduit un chemin vu par Jellyfin en chemin tel que stocké dans la DB."""
+    if not path:
+        return path
+    for jf_prefix, local_prefix in _PATH_MAP:
+        if path == jf_prefix or path.startswith(jf_prefix + "/"):
+            return local_prefix + path[len(jf_prefix):]
+    return path
+
+
+def jellyfin_fetch_items() -> list[dict[str, Any]]:
+    """
+    Récupère tous les médias Jellyfin avec leur chemin fichier.
+    Un seul type d'appel, paginé — aucun scan disque.
+    """
+    items: list[dict[str, Any]] = []
+    start, page_size = 0, 1000
+    session = _create_retry_session()
+    try:
+        while True:
+            r = session.get(
+                f"{JELLYFIN_URL}/Items",
+                params={
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Movie,Episode,Video",
+                    "Fields": "Path",
+                    "EnableTotalRecordCount": "false",
+                    "StartIndex": start,
+                    "Limit": page_size,
+                },
+                headers={"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'},
+                timeout=60,
+            )
+            r.raise_for_status()
+            batch = r.json().get("Items", [])
+            if not batch:
+                break
+            items.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+    finally:
+        session.close()
+    return items
+
+
+def sync_jellyfin_ids() -> int:
+    """
+    Tague les lignes de `files` avec l'id de l'item Jellyfin correspondant.
+
+    C'est la seule façon de relier un event ItemDeleted à un fichier : le payload
+    du webhook ne transporte que l'ItemId, et l'item n'existe plus côté Jellyfin
+    au moment où l'event arrive. La correspondance doit donc être établie avant.
+    """
+    if not jellyfin_enabled():
+        return 0
+
+    log.info("=== Indexation Jellyfin ===")
+    start = time.time()
+    try:
+        items = jellyfin_fetch_items()
+    except Exception as e:
+        log.error("Erreur API Jellyfin: %s", e)
+        return 0
+
+    updates: list[tuple[str, str]] = []
+    sans_path = 0
+    for item in items:
+        item_id, path = item.get("Id"), item.get("Path")
+        if not item_id or not path:
+            sans_path += 1
+            continue
+        updates.append((item_id, map_jellyfin_path(path)))
+
+    if not updates:
+        log.warning("Jellyfin : aucun item exploitable (%d items reçus)", len(items))
+        return 0
+
+    with _db_lock:
+        with get_db() as conn:
+            # Repart de zéro : un item réidentifié change d'id, l'ancien tag
+            # ne doit pas survivre. Atomique — rollback si l'UPDATE échoue.
+            conn.execute(
+                "UPDATE files SET jellyfin_item_id = NULL WHERE jellyfin_item_id IS NOT NULL"
+            )
+            conn.executemany(
+                "UPDATE files SET jellyfin_item_id = ? WHERE path = ?", updates
+            )
+            tagged = conn.execute(
+                "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
+            ).fetchone()[0]
+
+    log.info(
+        "=== Indexation Jellyfin terminée : %d/%d items rattachés à un fichier "
+        "indexé en %.1fs (%d sans chemin) ===",
+        tagged, len(updates), time.time() - start, sans_path,
+    )
+    if tagged == 0 and updates:
+        log.warning(
+            "⚠️ Aucun item Jellyfin rattaché : vérifie JELLYFIN_PATH_MAP (actuel: %s)",
+            JELLYFIN_PATH_MAP,
+        )
+    return tagged
+
+
+def _jellyfin_paths_for_item(item_id: str) -> list[str]:
+    """Chemins DB taggés avec cet item Jellyfin."""
+    with _db_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT path FROM files WHERE jellyfin_item_id = ?", (item_id,)
+            ).fetchall()
+    return [r["path"] for r in rows]
+
+
+def _jellyfin_paths_by_metadata(data: dict[str, Any]) -> list[str]:
+    """
+    Filet quand l'item n'a jamais été indexé : on restreint par métadonnées puis
+    on ne garde que les chemins réellement absents du disque. Un fichier encore
+    présent n'est jamais retenu, ce qui rend un faux positif très improbable.
+    """
+    item_type = data.get("ItemType", "")
+    patterns: list[str] = []
+
+    if item_type == "Episode":
+        series = data.get("SeriesName")
+        season = data.get("SeasonNumber")
+        if series and season is not None:
+            patterns.append(f"%/{series}/Season {int(season):02d}/%")
+            patterns.append(f"%/{series} (%/Season {int(season):02d}/%")
+    elif item_type in ("Movie", "Video"):
+        name, year = data.get("Name"), data.get("Year")
+        if name and year:
+            patterns.append(f"%/{name} ({year})%")
+        elif name:
+            patterns.append(f"%/{name}%")
+
+    if not patterns:
+        return []
+
+    candidates: set[str] = set()
+    with _db_lock:
+        with get_db() as conn:
+            for pat in patterns:
+                for row in conn.execute(
+                    "SELECT DISTINCT path FROM files WHERE path LIKE ?", (pat,)
+                ).fetchall():
+                    candidates.add(row["path"])
+
+    disparus = [p for p in candidates if not os.path.exists(p)]
+    if candidates:
+        log.info(
+            "  [fallback] %d candidat(s) par métadonnées, %d réellement absent(s) du disque",
+            len(candidates), len(disparus),
+        )
+    if len(disparus) > JELLYFIN_FALLBACK_MAX:
+        log.warning(
+            "  [fallback] %d chemins pour un seul item — motif jugé trop large, "
+            "abandon (JELLYFIN_FALLBACK_MAX=%d)",
+            len(disparus), JELLYFIN_FALLBACK_MAX,
+        )
+        return []
+    return disparus
+
 
 # ── Nettoyage ────────────────────────────────────────────────────────────────
 
 
-def move_torrents_for_path(file_path: str, check_links: bool = True) -> int:
+def move_torrents_for_path(
+    file_path: str,
+    check_links: bool = True,
+    source: str = "webhook",
+    dry_run: bool = False,
+) -> int:
     """
     1. Cherche le path dans la DB locale → inode → hash original
     2. Cherche dans la DB cross-seed tous les cross-seeds liés
     3. Déplace tout (original + cross-seeds) vers cleanuparr-unlinked
+
+    `source` est tracé dans cleanup_log (webhook / jellyfin / cleanup).
+    `dry_run` journalise ce qui serait déplacé sans toucher à qBit ni à la DB.
     """
     with _db_lock:
         with get_db() as conn:
@@ -701,6 +949,17 @@ def move_torrents_for_path(file_path: str, check_links: bool = True) -> int:
                 log.info("  → Aucun torrent à déplacer (tous ont des hardlinks actifs)")
                 return 0
 
+            if dry_run:
+                for t in safe_to_move:
+                    log.info(
+                        "  [DRY RUN] [%s] %s → %s", t.get("category", "?"), t["name"], TARGET_CAT
+                    )
+                log.info(
+                    "  → [DRY RUN] %d torrent(s) seraient déplacés (aucune action)",
+                    len(safe_to_move),
+                )
+                return len(safe_to_move)
+
             hashes = "|".join(t["info_hash"] for t in safe_to_move)
             s.post(
                 f"{QBIT_URL}/api/v2/torrents/setCategory",
@@ -710,7 +969,7 @@ def move_torrents_for_path(file_path: str, check_links: bool = True) -> int:
 
             for t in safe_to_move:
                 log.info("  ✓ [%s] %s → %s", t.get("category", "?"), t["name"], TARGET_CAT)
-                log_move(t["info_hash"], t["name"], t.get("category", ""), "webhook")
+                log_move(t["info_hash"], t["name"], t.get("category", ""), source)
 
             # Nettoie la DB locale
             with _db_lock:
@@ -864,6 +1123,105 @@ def webhook():
         return jsonify({"moved": moved, "event": "DownloadUpgrade"})
 
     return jsonify({"status": "ignored", "event": event})
+
+
+# ── Webhook Jellyfin ─────────────────────────────────────────────────────────
+
+
+@app.route("/jellyfin", methods=["POST"])
+def jellyfin_webhook():
+    """
+    Reçoit les events du plugin Webhook de Jellyfin (destination "Generic",
+    option "Send All Properties" cochée pour recevoir le JSON brut).
+
+    Le payload ne contient pas le chemin du fichier, seulement un ItemId — d'où
+    la résolution via la colonne `files.jellyfin_item_id` remplie à chaque sync.
+    """
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not jellyfin_enabled():
+        return jsonify({"error": "JELLYFIN_URL / JELLYFIN_API_KEY non configurés"}), 503
+
+    # force=True : le plugin Webhook ne garantit pas l'en-tête Content-Type
+    data = request.get_json(silent=True, force=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
+
+    dry_run = request.args.get("dry_run", "false").lower() in ("1", "true", "yes")
+    notif = data.get("NotificationType", "")
+    item_type = data.get("ItemType", "")
+    item_id = data.get("ItemId", "")
+    label = data.get("SeriesName") or data.get("Name") or item_id
+
+    log.info(
+        "Reçu event Jellyfin: %s | type=%s | %s%s",
+        notif, item_type, label, " [DRY RUN]" if dry_run else "",
+    )
+
+    if notif != "ItemDeleted":
+        return jsonify({"status": "ignored", "notification": notif})
+
+    # Series/Season sont des dossiers, pas des fichiers : rien à taguer. Jellyfin
+    # émet un ItemDeleted par épisode, ce sont eux qui portent l'action.
+    if item_type in ("Series", "Season"):
+        log.info("  Conteneur %s ignoré (les épisodes sont traités un par un)", item_type)
+        return jsonify({"status": "ignored", "reason": f"{item_type} container"})
+
+    if not item_id:
+        return jsonify({"error": "Champ 'ItemId' manquant"}), 400
+
+    paths = _jellyfin_paths_for_item(item_id)
+    resolution = "index"
+
+    if not paths and JELLYFIN_FALLBACK_MATCH:
+        log.info("  Item %s absent de l'index, tentative par métadonnées", item_id)
+        paths = _jellyfin_paths_by_metadata(data)
+        resolution = "fallback"
+
+    if not paths:
+        log.warning(
+            "  Item Jellyfin non résolu: %s (%s). Média ajouté depuis la dernière "
+            "sync, ou hors périmètre de l'index.",
+            label, item_id,
+        )
+        return jsonify({"status": "unresolved", "item_id": item_id}), 200
+
+    # Garde-fou : ItemDeleted part aussi quand un item quitte simplement la base
+    # Jellyfin (refresh, réidentification, retrait d'une bibliothèque) alors que
+    # le fichier est toujours là. On n'agit que sur un hardlink réellement supprimé.
+    encore_presents = [p for p in paths if os.path.exists(p)]
+    if encore_presents:
+        log.info(
+            "  ⏭ Ignoré : %d/%d chemin(s) encore présent(s) sur le disque "
+            "(retrait de bibliothèque ou refresh, pas une suppression)",
+            len(encore_presents), len(paths),
+        )
+        return jsonify(
+            {"status": "ignored", "reason": "file still on disk", "paths": encore_presents}
+        )
+
+    moved = 0
+    for path in paths:
+        log.info("  Jellyfin ItemDeleted (%s): %s", resolution, path)
+        moved += move_torrents_for_path(path, source="jellyfin", dry_run=dry_run)
+
+    return jsonify(
+        {"moved": moved, "paths": paths, "resolution": resolution, "dry_run": dry_run}
+    )
+
+
+@app.route("/jellyfin/index", methods=["POST"])
+def jellyfin_reindex():
+    """Force une réindexation Jellyfin sans attendre la prochaine sync complète."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    if not jellyfin_enabled():
+        return jsonify({"error": "JELLYFIN_URL / JELLYFIN_API_KEY non configurés"}), 503
+    threading.Thread(target=sync_jellyfin_ids, daemon=True).start()
+    return jsonify({"status": "jellyfin index started"})
 
 
 @app.route("/health")
@@ -1242,6 +1600,9 @@ def stats():
             inodes = conn.execute("SELECT COUNT(DISTINCT inode) FROM files WHERE stale = 0").fetchone()[0]
             arr_managed_count = conn.execute("SELECT COUNT(*) FROM arr_managed").fetchone()[0]
             log_count = conn.execute("SELECT COUNT(*) FROM cleanup_log").fetchone()[0]
+            jellyfin_tagged = conn.execute(
+                "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
+            ).fetchone()[0]
             last_sync = conn.execute(
                 "SELECT finished_at, status, rows_after, duration_s "
                 "FROM sync_log WHERE status = 'success' ORDER BY id DESC LIMIT 1"
@@ -1261,6 +1622,8 @@ def stats():
         "unique_inodes": inodes,
         "arr_managed_torrents": arr_managed_count,
         "cleanup_log_entries": log_count,
+        "jellyfin_enabled": jellyfin_enabled(),
+        "jellyfin_indexed_paths": jellyfin_tagged,
         "last_sync": last_sync_info,
     })
 
