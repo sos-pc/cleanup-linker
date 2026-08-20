@@ -696,6 +696,10 @@ def find_crossseeds_for_hash(original_hash: str) -> list[dict[str, Any]]:
 # ── Jellyfin ─────────────────────────────────────────────────────────────────
 
 
+class _IndexDropTooLarge(Exception):
+    """Levée pour annuler (rollback) une réindexation qui perdrait trop de tags."""
+
+
 def jellyfin_enabled() -> bool:
     return bool(JELLYFIN_URL and JELLYFIN_API_KEY)
 
@@ -802,22 +806,39 @@ def sync_jellyfin_ids() -> int:
         log.warning("Jellyfin : aucun item exploitable (%d items reçus)", len(items))
         return 0
 
-    with _db_lock:
-        with get_db() as conn:
-            # Repart de zéro : un item réidentifié change d'id, l'ancien tag
-            # ne doit pas survivre. Atomique — rollback si l'UPDATE échoue.
-            conn.execute(
-                "UPDATE files SET jellyfin_item_id = NULL, jellyfin_series_id = NULL, "
-                "jellyfin_season_id = NULL WHERE jellyfin_item_id IS NOT NULL"
-            )
-            conn.executemany(
-                "UPDATE files SET jellyfin_item_id = ?, jellyfin_series_id = ?, "
-                "jellyfin_season_id = ? WHERE path = ?",
-                updates,
-            )
-            tagged = conn.execute(
-                "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
-            ).fetchone()[0]
+    try:
+        with _db_lock:
+            with get_db() as conn:
+                avant = conn.execute(
+                    "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
+                ).fetchone()[0]
+
+                # Repart de zéro : un item réidentifié change d'id, l'ancien tag
+                # ne doit pas survivre. Atomique — rollback si l'UPDATE échoue.
+                conn.execute(
+                    "UPDATE files SET jellyfin_item_id = NULL, jellyfin_series_id = NULL, "
+                    "jellyfin_season_id = NULL WHERE jellyfin_item_id IS NOT NULL"
+                )
+                conn.executemany(
+                    "UPDATE files SET jellyfin_item_id = ?, jellyfin_series_id = ?, "
+                    "jellyfin_season_id = ? WHERE path = ?",
+                    updates,
+                )
+                tagged = conn.execute(
+                    "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
+                ).fetchone()[0]
+
+                # Pendant une analyse de médiathèque, Jellyfin peut renvoyer des items
+                # sans chemin : le reset les effacerait de l'index. On annule plutôt
+                # que de dégrader — l'exception fait rollback via get_db().
+                if avant > 0 and tagged < avant * 0.7:
+                    raise _IndexDropTooLarge(f"{avant} → {tagged}")
+    except _IndexDropTooLarge as e:
+        log.warning(
+            "⚠️ Indexation Jellyfin annulée : les tags chuteraient de %s "
+            "(analyse de médiathèque en cours ?). Index précédent conservé.", e
+        )
+        return 0
 
     log.info(
         "=== Indexation Jellyfin terminée : %d/%d items rattachés à un fichier "
@@ -1615,6 +1636,44 @@ def cleanup_orphans():
                     ).fetchall()
                 log.info("Étape 2 (orphelins) : %d trouvés en %.2fs",
                          len(torrents), time.time() - t2)
+
+                # Étape 3 : étendre aux cross-seeds partageant les mêmes inodes.
+                # Sans ça le cleanup ne déplace que le hash importé par l'*arr et
+                # laisse ses cross-seeds derrière : ils hardlinkent le même fichier,
+                # donc aucun espace n'est libéré.
+                # Ils ne sont jamais dans arr_managed (cross-seed les ajoute lui-même),
+                # d'où leur exclusion par l'INNER JOIN de l'étape 2.
+                t3 = time.time()
+                orphan_hashes = [t["torrent_hash"] for t in torrents]
+                if orphan_hashes:
+                    ph = ",".join("?" * len(orphan_hashes))
+                    voisins = conn.execute(
+                        f"""
+                        SELECT DISTINCT torrent_hash, torrent_name, category
+                        FROM files
+                        WHERE stale = 0
+                          AND torrent_hash IS NOT NULL
+                          AND category != ?
+                          AND torrent_hash NOT IN ({ph})
+                          AND inode IN (
+                              SELECT DISTINCT inode FROM files
+                              WHERE torrent_hash IN ({ph}) AND stale = 0
+                          )
+                        """,
+                        (TARGET_CAT, *orphan_hashes, *orphan_hashes),
+                    ).fetchall()
+
+                    # Un torrent multi-fichiers peut partager un inode avec un
+                    # orphelin tout en gardant d'autres fichiers encore hardlinkés
+                    # (pack de saison cross-seedé avec un épisode isolé). media_hashes
+                    # les écarte — même garantie que _check_hardlinks_active côté webhook.
+                    crossseeds = [v for v in voisins if v["torrent_hash"] not in media_hashes]
+                    protégés = len(voisins) - len(crossseeds)
+                    if protégés:
+                        log.info("  %d voisin(s) conservé(s) : hardlinks /data/Media actifs", protégés)
+                    torrents = list(torrents) + crossseeds
+                    log.info("Étape 3 (cross-seeds) : +%d en %.2fs",
+                             len(crossseeds), time.time() - t3)
 
         if not torrents:
             log.info("%sAucun torrent orphelin trouvé.", prefix)
