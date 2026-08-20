@@ -1645,10 +1645,24 @@ def cleanup_orphans():
                 # d'où leur exclusion par l'INNER JOIN de l'étape 2.
                 t3 = time.time()
                 orphan_hashes = [t["torrent_hash"] for t in torrents]
-                ph = ",".join("?" * len(orphan_hashes)) if orphan_hashes else "NULL"
+
                 # Amorce sur deux sources : les orphelins qu'on vient de trouver, et
                 # les torrents déjà dans la catégorie cible — leurs cross-seeds ont pu
                 # rester derrière lors d'un move précédent, ou être ajoutés après coup.
+                # Les clauses sont construites conditionnellement : avec une liste vide,
+                # "NOT IN (NULL)" vaudrait NULL et écarterait toutes les lignes.
+                params: list[Any] = [TARGET_CAT]
+                exclusion = ""
+                if orphan_hashes:
+                    ph = ",".join("?" * len(orphan_hashes))
+                    exclusion = f"AND torrent_hash NOT IN ({ph})"
+                    params += orphan_hashes
+                    amorce = f"(torrent_hash IN ({ph}) OR category = ?)"
+                    params += [*orphan_hashes, TARGET_CAT]
+                else:
+                    amorce = "category = ?"
+                    params.append(TARGET_CAT)
+
                 voisins = conn.execute(
                     f"""
                     SELECT DISTINCT torrent_hash, torrent_name, category
@@ -1656,14 +1670,13 @@ def cleanup_orphans():
                     WHERE stale = 0
                       AND torrent_hash IS NOT NULL
                       AND category != ?
-                      AND torrent_hash NOT IN ({ph})
+                      {exclusion}
                       AND inode IN (
                           SELECT DISTINCT inode FROM files
-                          WHERE stale = 0
-                            AND (torrent_hash IN ({ph}) OR category = ?)
+                          WHERE stale = 0 AND {amorce}
                       )
                     """,
-                    (TARGET_CAT, *orphan_hashes, *orphan_hashes, TARGET_CAT),
+                    params,
                 ).fetchall()
                 # Un torrent multi-fichiers peut partager un inode avec un
                 # orphelin tout en gardant d'autres fichiers encore hardlinkés
