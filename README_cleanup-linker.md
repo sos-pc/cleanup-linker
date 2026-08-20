@@ -104,11 +104,13 @@ Toutes les 12h (configurable), le scanner reconstruit entièrement la DB locale 
 3. Scanne `/data/Multimedia/cross-seeds/` pour les hardlinks cross-seed
 4. Scanne `/data/Media/` pour les hardlinks Sonarr/Radarr
 5. Croise les inodes avec la liste des torrents qBit → peuple la DB
-6. Marque `arr_managed` tout torrent hardlinké dans `/data/Media/`
+6. Marque `arr_managed` tout torrent hardlinké dans `/data/Media/`, et en retire ceux dont le torrent n'est plus dans qBittorrent
 
 L'étape 6 est un filet contre les webhooks ratés — service arrêté pendant un import, type d'event non coché dans un *arr, livraison échouée. Un hardlink dans une racine *arr prouve l'import indépendamment de tout event reçu.
 
 Le critère ne porte que sur `/data/Media/` : un torrent vivant uniquement sous `/data/Multimedia/` (ajout manuel) n'est jamais marqué, donc jamais candidat au `/cleanup`.
+
+La purge, elle, se fonde sur la **liste des torrents qBittorrent**, pas sur la table `files` : un torrent bien présent dans le client mais dont les fichiers ont disparu du disque n'a aucune ligne dans `files` et serait retiré à tort. Sans cette purge, une release re-téléchargée plus tard reprendrait le même hash et serait considérée gérée par un *arr d'emblée, même ajoutée à la main.
 
 ---
 

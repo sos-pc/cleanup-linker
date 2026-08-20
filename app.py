@@ -310,6 +310,47 @@ def refresh_arr_managed_from_links() -> int:
             return cur.rowcount
 
 
+def purge_arr_managed_absents(qbit_hashes: set[str]) -> int:
+    """
+    Retire d'arr_managed les hashes dont le torrent n'est plus dans qBittorrent.
+
+    Le critère est la liste qBit, pas la table `files` : un torrent bien présent
+    dans le client mais dont les fichiers ont disparu du disque n'a aucune ligne
+    dans `files` et serait purgé à tort (209 cas sur l'installation de référence).
+
+    Sans ça, une release re-téléchargée plus tard reprend le même hash et serait
+    considérée gérée par un *arr d'emblée, même ajoutée à la main.
+    """
+    if not qbit_hashes:
+        log.warning("arr_managed : purge annulée, liste qBit vide")
+        return 0
+
+    with _db_lock:
+        with get_db() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM arr_managed").fetchone()[0]
+            if not total:
+                return 0
+            connus = set(
+                r[0] for r in conn.execute("SELECT torrent_hash FROM arr_managed")
+            )
+            absents = [h for h in connus if h.lower() not in qbit_hashes]
+
+            # Même garde-fou que ses voisins : une liste qBit tronquée ferait
+            # disparaître un marquage encore valide.
+            if len(absents) > total * 0.3:
+                log.warning(
+                    "⚠️ arr_managed : purge de %d/%d lignes (%.0f%%) refusée — "
+                    "liste qBittorrent suspecte",
+                    len(absents), total, 100 * len(absents) / total,
+                )
+                return 0
+
+            if absents:
+                ph = ",".join("?" * len(absents))
+                conn.execute(f"DELETE FROM arr_managed WHERE torrent_hash IN ({ph})", absents)
+            return len(absents)
+
+
 def mark_arr_managed(download_id: str) -> None:
     """Enregistre un hash torrent comme géré par *arr (idempotent)."""
     if not download_id:
@@ -659,6 +700,11 @@ def sync_db() -> None:
         n = refresh_arr_managed_from_links()
         if n:
             log.info("arr_managed : +%d torrent(s) via hardlinks /data/Media", n)
+        # La liste qBit vient d'être récupérée pour cette sync : c'est la source
+        # d'autorité sur ce qui existe encore.
+        p = purge_arr_managed_absents({t.get("hash", "").lower() for t in torrents})
+        if p:
+            log.info("arr_managed : -%d torrent(s) absents de qBittorrent", p)
     except Exception as e:
         log.error("Erreur rafraîchissement arr_managed: %s", e)
 
