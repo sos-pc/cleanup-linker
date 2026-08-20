@@ -92,6 +92,9 @@ JELLYFIN_FALLBACK_MATCH = os.getenv("JELLYFIN_FALLBACK_MATCH", "true").lower() i
 # Borne le rayon d'action du fallback : au-delà, le motif est jugé trop large
 # (titre générique) et on préfère ne rien faire plutôt que déplacer à l'aveugle.
 JELLYFIN_FALLBACK_MAX = int(os.getenv("JELLYFIN_FALLBACK_MAX", "10"))
+# Une série entière compte légitimement beaucoup de fichiers : plafond distinct
+# pour les suppressions de conteneur (Series/Season).
+JELLYFIN_FALLBACK_MAX_CONTAINER = int(os.getenv("JELLYFIN_FALLBACK_MAX_CONTAINER", "500"))
 
 # Extensions pertinentes (vidéo uniquement — .iso retiré)
 VIDEO_EXTENSIONS: set[str] = {
@@ -227,12 +230,24 @@ def init_db() -> None:
             # plusieurs lignes (une par torrent_hash) : elles sont toutes taguées,
             # la lecture se fait en DISTINCT.
             cols = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
-            if "jellyfin_item_id" not in cols:
-                conn.execute("ALTER TABLE files ADD COLUMN jellyfin_item_id TEXT")
-                log.info("Colonne 'jellyfin_item_id' ajoutée à la table files")
+            for col in ("jellyfin_item_id", "jellyfin_series_id", "jellyfin_season_id"):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {col} TEXT")
+                    log.info("Colonne '%s' ajoutée à la table files", col)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jellyfin_item "
                 "ON files(jellyfin_item_id) WHERE jellyfin_item_id IS NOT NULL"
+            )
+            # Une suppression de série/saison dans Jellyfin n'émet qu'un seul event,
+            # sur le conteneur — jamais un par épisode. Ces index permettent de
+            # remonter du conteneur à ses fichiers.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jellyfin_series "
+                "ON files(jellyfin_series_id) WHERE jellyfin_series_id IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jellyfin_season "
+                "ON files(jellyfin_season_id) WHERE jellyfin_season_id IS NOT NULL"
             )
             # Index partiel sur les paths Media — accélère le cleanup
             conn.execute(
@@ -749,14 +764,19 @@ def sync_jellyfin_ids() -> int:
         log.error("Erreur API Jellyfin: %s", e)
         return 0
 
-    updates: list[tuple[str, str]] = []
+    updates: list[tuple[str, str | None, str | None, str]] = []
     sans_path = 0
     for item in items:
         item_id, path = item.get("Id"), item.get("Path")
         if not item_id or not path:
             sans_path += 1
             continue
-        updates.append((item_id, map_jellyfin_path(path)))
+        # SeriesId/SeasonId sont renvoyés nativement pour les épisodes : c'est ce
+        # qui permet de traiter une suppression de série ou de saison, Jellyfin
+        # n'émettant qu'un seul event sur le conteneur.
+        updates.append(
+            (item_id, item.get("SeriesId"), item.get("SeasonId"), map_jellyfin_path(path))
+        )
 
     if not updates:
         log.warning("Jellyfin : aucun item exploitable (%d items reçus)", len(items))
@@ -767,10 +787,13 @@ def sync_jellyfin_ids() -> int:
             # Repart de zéro : un item réidentifié change d'id, l'ancien tag
             # ne doit pas survivre. Atomique — rollback si l'UPDATE échoue.
             conn.execute(
-                "UPDATE files SET jellyfin_item_id = NULL WHERE jellyfin_item_id IS NOT NULL"
+                "UPDATE files SET jellyfin_item_id = NULL, jellyfin_series_id = NULL, "
+                "jellyfin_season_id = NULL WHERE jellyfin_item_id IS NOT NULL"
             )
             conn.executemany(
-                "UPDATE files SET jellyfin_item_id = ? WHERE path = ?", updates
+                "UPDATE files SET jellyfin_item_id = ?, jellyfin_series_id = ?, "
+                "jellyfin_season_id = ? WHERE path = ?",
+                updates,
             )
             tagged = conn.execute(
                 "SELECT COUNT(DISTINCT path) FROM files WHERE jellyfin_item_id IS NOT NULL"
@@ -789,17 +812,59 @@ def sync_jellyfin_ids() -> int:
     return tagged
 
 
-def _jellyfin_paths_for_item(item_id: str) -> list[str]:
-    """Chemins DB taggés avec cet item Jellyfin."""
+def _jellyfin_paths_for_item(item_id: str, item_type: str = "") -> list[str]:
+    """
+    Chemins DB rattachés à cet item Jellyfin.
+
+    Un Movie/Episode est tagué directement ; une Series/Season est un dossier, on
+    passe donc par les épisodes qu'elle contient (colonnes jellyfin_series_id /
+    jellyfin_season_id).
+    """
+    column = {
+        "Series": "jellyfin_series_id",
+        "Season": "jellyfin_season_id",
+    }.get(item_type, "jellyfin_item_id")
     with _db_lock:
         with get_db() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT path FROM files WHERE jellyfin_item_id = ?", (item_id,)
+                f"SELECT DISTINCT path FROM files WHERE {column} = ?", (item_id,)
             ).fetchall()
     return [r["path"] for r in rows]
 
 
-def _jellyfin_paths_by_metadata(data: dict[str, Any]) -> list[str]:
+# Profondeur minimale d'un dossier commun exploitable : ['', 'data', 'Media', 'Séries']
+# En dessous, le préfixe engloberait une racine entière — jamais légitime pour une
+# seule série, et le LIKE ratisserait des torrents sans rapport.
+_MIN_ROOT_DEPTH = 4
+
+
+def _common_root(paths: list[str]) -> str:
+    """
+    Ramène une liste de chemins à un point d'entrée unique pour move_torrents_for_path.
+
+    Un seul chemin → lui-même (branche correspondance exacte). Plusieurs → leur
+    dossier commun, que la branche préfixe traite en une seule passe qBit au lieu
+    d'une session par épisode.
+
+    Découpage sur "/" plutôt que os.path.commonpath : les chemins de la DB sont
+    toujours POSIX, et on garantit ainsi une coupure sur une frontière de segment.
+    Retourne "" si le dossier commun est trop haut pour être sûr.
+    """
+    if len(paths) == 1:
+        return paths[0]
+
+    common: list[str] = []
+    for segments in zip(*(p.split("/") for p in paths)):
+        if len(set(segments)) != 1:
+            break
+        common.append(segments[0])
+
+    if len(common) < _MIN_ROOT_DEPTH:
+        return ""
+    return "/".join(common)
+
+
+def _jellyfin_paths_by_metadata(data: dict[str, Any], max_paths: int) -> list[str]:
     """
     Filet quand l'item n'a jamais été indexé : on restreint par métadonnées puis
     on ne garde que les chemins réellement absents du disque. Un fichier encore
@@ -808,7 +873,16 @@ def _jellyfin_paths_by_metadata(data: dict[str, Any]) -> list[str]:
     item_type = data.get("ItemType", "")
     patterns: list[str] = []
 
-    if item_type == "Episode":
+    if item_type in ("Series", "Season"):
+        series = data.get("SeriesName") or data.get("Name")
+        if series:
+            season = data.get("IndexNumber") if item_type == "Season" else None
+            if season is not None:
+                patterns.append(f"%/{series}%/Season {int(season):02d}/%")
+            else:
+                patterns.append(f"%/{series}/%")
+                patterns.append(f"%/{series} (%/%")
+    elif item_type == "Episode":
         series = data.get("SeriesName")
         season = data.get("SeasonNumber")
         if series and season is not None:
@@ -839,11 +913,11 @@ def _jellyfin_paths_by_metadata(data: dict[str, Any]) -> list[str]:
             "  [fallback] %d candidat(s) par métadonnées, %d réellement absent(s) du disque",
             len(candidates), len(disparus),
         )
-    if len(disparus) > JELLYFIN_FALLBACK_MAX:
+    if len(disparus) > max_paths:
         log.warning(
-            "  [fallback] %d chemins pour un seul item — motif jugé trop large, "
-            "abandon (JELLYFIN_FALLBACK_MAX=%d)",
-            len(disparus), JELLYFIN_FALLBACK_MAX,
+            "  [fallback] %d chemins pour un seul item — motif jugé trop large, abandon "
+            "(plafond %d)",
+            len(disparus), max_paths,
         )
         return []
     return disparus
@@ -1163,21 +1237,22 @@ def jellyfin_webhook():
     if notif != "ItemDeleted":
         return jsonify({"status": "ignored", "notification": notif})
 
-    # Series/Season sont des dossiers, pas des fichiers : rien à taguer. Jellyfin
-    # émet un ItemDeleted par épisode, ce sont eux qui portent l'action.
-    if item_type in ("Series", "Season"):
-        log.info("  Conteneur %s ignoré (les épisodes sont traités un par un)", item_type)
-        return jsonify({"status": "ignored", "reason": f"{item_type} container"})
-
     if not item_id:
         return jsonify({"error": "Champ 'ItemId' manquant"}), 400
 
-    paths = _jellyfin_paths_for_item(item_id)
+    # Supprimer une série ou une saison n'émet qu'un seul event, sur le conteneur —
+    # jamais un par épisode (vérifié en production). On remonte donc aux fichiers
+    # via jellyfin_series_id / jellyfin_season_id.
+    is_container = item_type in ("Series", "Season")
+
+    paths = _jellyfin_paths_for_item(item_id, item_type)
     resolution = "index"
 
     if not paths and JELLYFIN_FALLBACK_MATCH:
         log.info("  Item %s absent de l'index, tentative par métadonnées", item_id)
-        paths = _jellyfin_paths_by_metadata(data)
+        paths = _jellyfin_paths_by_metadata(
+            data, JELLYFIN_FALLBACK_MAX_CONTAINER if is_container else JELLYFIN_FALLBACK_MAX
+        )
         resolution = "fallback"
 
     if not paths:
@@ -1190,26 +1265,49 @@ def jellyfin_webhook():
 
     # Garde-fou : ItemDeleted part aussi quand un item quitte simplement la base
     # Jellyfin (refresh, réidentification, retrait d'une bibliothèque) alors que
-    # le fichier est toujours là. On n'agit que sur un hardlink réellement supprimé.
-    encore_presents = [p for p in paths if os.path.exists(p)]
-    if encore_presents:
+    # les fichiers sont toujours là. On ne retient que les hardlinks réellement
+    # supprimés — sur un conteneur, c'est ce qui distingue une suppression d'un
+    # simple retrait de bibliothèque, qui laisserait tout en place.
+    disparus = [p for p in paths if not os.path.exists(p)]
+    if not disparus:
         log.info(
-            "  ⏭ Ignoré : %d/%d chemin(s) encore présent(s) sur le disque "
+            "  ⏭ Ignoré : les %d chemin(s) sont encore présents sur le disque "
             "(retrait de bibliothèque ou refresh, pas une suppression)",
-            len(encore_presents), len(paths),
+            len(paths),
         )
-        return jsonify(
-            {"status": "ignored", "reason": "file still on disk", "paths": encore_presents}
+        return jsonify({"status": "ignored", "reason": "file still on disk"})
+
+    if len(disparus) < len(paths):
+        log.info(
+            "  %d/%d chemin(s) réellement supprimés, les autres sont conservés",
+            len(disparus), len(paths),
         )
 
-    moved = 0
-    for path in paths:
-        log.info("  Jellyfin ItemDeleted (%s): %s", resolution, path)
-        moved += move_torrents_for_path(path, source="jellyfin", dry_run=dry_run)
+    # Un seul point d'entrée : la branche préfixe de move_torrents_for_path traite
+    # tous les inodes d'un dossier en une passe, au lieu d'une session qBit par épisode.
+    root = _common_root(disparus)
 
-    return jsonify(
-        {"moved": moved, "paths": paths, "resolution": resolution, "dry_run": dry_run}
-    )
+    if root:
+        log.info("  Jellyfin ItemDeleted (%s) %s: %s", resolution, item_type or "?", root)
+        moved = move_torrents_for_path(root, source="jellyfin", dry_run=dry_run)
+    else:
+        # Les chemins ne partagent pas de dossier commun assez profond : on traite
+        # chacun séparément plutôt que de risquer un préfixe trop large.
+        log.warning(
+            "  Pas de dossier commun sûr pour %d chemins — traitement individuel",
+            len(disparus),
+        )
+        moved = sum(
+            move_torrents_for_path(p, source="jellyfin", dry_run=dry_run) for p in disparus
+        )
+
+    return jsonify({
+        "moved": moved,
+        "root": root or None,
+        "deleted_paths": len(disparus),
+        "resolution": resolution,
+        "dry_run": dry_run,
+    })
 
 
 @app.route("/jellyfin/index", methods=["POST"])

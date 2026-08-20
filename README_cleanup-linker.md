@@ -180,7 +180,8 @@ networks:
 | `JELLYFIN_API_KEY` | — | Clé API Jellyfin (Tableau de bord → Clés API) |
 | `JELLYFIN_PATH_MAP` | `/Multimedia:/data/Multimedia` | Traduction des chemins vus par Jellyfin. Format `préfixe_jf:préfixe_local`, séparés par des virgules |
 | `JELLYFIN_FALLBACK_MATCH` | `true` | Autorise la résolution par métadonnées quand l'item n'est pas encore indexé |
-| `JELLYFIN_FALLBACK_MAX` | `10` | Nombre max de chemins que le fallback peut retenir avant d'abandonner |
+| `JELLYFIN_FALLBACK_MAX` | `10` | Nombre max de chemins que le fallback peut retenir pour un film/épisode |
+| `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série/saison, qui compte légitimement beaucoup de fichiers |
 
 ---
 
@@ -225,12 +226,12 @@ La correspondance doit donc être établie **avant**. À chaque sync, cleanup-li
 
 ```
 files
-inode  │ path                                   │ torrent_hash │ jellyfin_item_id
-───────┼────────────────────────────────────────┼──────────────┼─────────────────
-12345  │ /data/Media/Séries/…/S01E14.mkv        │ 222d582cec   │ a1b2c3d4…
-12345  │ /data/Media/Séries/…/S01E14.mkv        │ bd4a11bf5b   │ a1b2c3d4…
-12345  │ /data/Multimedia/Séries/…/S01E14.mkv   │ 222d582cec   │ NULL
-12345  │ /data/Multimedia/cross-seeds/…/S01E14  │ 40056fb95f   │ NULL
+inode  │ path                                   │ torrent_hash │ jellyfin_item_id │ jellyfin_series_id
+───────┼────────────────────────────────────────┼──────────────┼──────────────────┼───────────────────
+12345  │ /data/Media/Séries/…/S01E14.mkv        │ 222d582cec   │ a1b2c3d4…        │ e896855b…
+12345  │ /data/Media/Séries/…/S01E14.mkv        │ bd4a11bf5b   │ a1b2c3d4…        │ e896855b…
+12345  │ /data/Multimedia/Séries/…/S01E14.mkv   │ 222d582cec   │ NULL             │ NULL
+12345  │ /data/Multimedia/cross-seeds/…/S01E14  │ 40056fb95f   │ NULL             │ NULL
 ```
 
 Seul le chemin vu par Jellyfin est tagué — l'inode se charge du reste. À la suppression : `jellyfin_item_id` → inode → tous les hashes → cross-seeds → qBit.
@@ -243,8 +244,7 @@ Tableau de bord → Extensions → Webhook → **Add Generic Destination**
 Webhook Name  : cleanup-linker
 Webhook Url   : http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN
 Notification Type : ✅ Item Deleted
-Item Type     : ✅ Movies   ✅ Episodes
-                ❌ Series   ❌ Seasons   (conteneurs ignorés, voir plus bas)
+Item Type     : ✅ Movies   ✅ Episodes   ✅ Series   ✅ Seasons
 Send All Properties : ✅ obligatoire
 ```
 
@@ -261,7 +261,13 @@ Si Jellyfin n'est pas sur le réseau Docker `mediastack`, utilise l'IP de l'hôt
 
 ### Séries et saisons
 
-Une `Series` ou une `Season` est un dossier, pas un fichier : rien à taguer. Jellyfin émet un `ItemDeleted` par épisode, ce sont ces events qui portent l'action. Les events conteneurs sont explicitement ignorés (visible dans les logs).
+Supprimer une série entière depuis Jellyfin **n'émet qu'un seul event**, sur le conteneur — jamais un event par épisode (vérifié en production : une suppression de 14 épisodes n'a produit qu'un `ItemDeleted` de type `Series`).
+
+Une `Series` ou une `Season` étant un dossier, elle n'a pas de ligne dans `files`. On remonte donc à ses fichiers par les colonnes `jellyfin_series_id` / `jellyfin_season_id`, renseignées sur chaque épisode pendant l'indexation (l'API Jellyfin renvoie nativement `SeriesId` et `SeasonId`).
+
+Les chemins retenus sont ensuite ramenés à leur **dossier commun**, traité en une seule passe par la branche préfixe de `move_torrents_for_path` — une seule session qBittorrent au lieu d'une par épisode. Si ce dossier commun remonte trop haut (moins de 4 segments, ce qui engloberait une racine entière), il est rejeté et chaque chemin est traité séparément.
+
+C'est aussi ici que le garde-fou compte le plus : retirer une bibliothèque de Jellyfin émet le même event `Series`, mais les fichiers restent sur le disque — aucun n'est retenu, aucun torrent n'est déplacé.
 
 ### Média non indexé
 
@@ -317,7 +323,7 @@ Route dédiée `/jellyfin` — le payload Jellyfin n'a pas le même format que c
 | Event | ItemType | Action |
 |---|---|---|
 | `ItemDeleted` | `Movie`, `Episode`, `Video` | Résout `ItemId` → chemin → inode, puis move vers cleanuparr-unlinked |
-| `ItemDeleted` | `Series`, `Season` | Ignoré (conteneur — les épisodes remontent individuellement) |
+| `ItemDeleted` | `Series`, `Season` | Résout via `jellyfin_series_id` / `jellyfin_season_id` → dossier commun → move en une passe |
 | Autre | — | Ignoré |
 
 Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visibles dans `/history` et réversibles via `/restore`.
