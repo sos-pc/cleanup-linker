@@ -96,17 +96,26 @@ JELLYFIN_FALLBACK_MAX = int(os.getenv("JELLYFIN_FALLBACK_MAX", "10"))
 # pour les suppressions de conteneur (Series/Season).
 JELLYFIN_FALLBACK_MAX_CONTAINER = int(os.getenv("JELLYFIN_FALLBACK_MAX_CONTAINER", "500"))
 
-# Extensions pertinentes (vidéo uniquement — .iso retiré)
-VIDEO_EXTENSIONS: set[str] = {
-    ".mkv",
-    ".mp4",
-    ".avi",
-    ".ts",
-    ".m2ts",
-    ".mov",
-    ".wmv",
-    ".flv",
-}
+# Extensions indexées. Un fichier dont l'extension manque ici est invisible pour
+# tout le service : ni webhook ni /cleanup ne pourront déplacer son torrent.
+# Configurable pour ne plus dépendre d'un rebuild — la casse et le point initial
+# sont normalisés, "mkv" et ".MKV" sont acceptés.
+_DEFAULT_VIDEO_EXTENSIONS = ".mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v"
+
+
+def _parse_extensions(raw: str) -> set[str]:
+    exts: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        exts.add(entry if entry.startswith(".") else f".{entry}")
+    return exts
+
+
+VIDEO_EXTENSIONS: set[str] = _parse_extensions(
+    os.getenv("VIDEO_EXTENSIONS", _DEFAULT_VIDEO_EXTENSIONS)
+)
 
 # ── Verrou global SQLite ─────────────────────────────────────────────────────
 _db_lock = threading.Lock()

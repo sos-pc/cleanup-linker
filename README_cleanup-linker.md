@@ -172,6 +172,7 @@ networks:
 | `DB_PATH` | `/config/db.sqlite` | Chemin de la DB locale |
 | `CROSSSEED_DB` | `/config/crossseed/cross-seed.db` | Chemin de la DB cross-seed |
 | `SYNC_INTERVAL_HOURS` | `12` | Fréquence de resync en heures |
+| `VIDEO_EXTENSIONS` | voir ci-dessous | Extensions indexées, séparées par des virgules. Le point initial et la casse sont optionnels |
 | `SONARR_URL` | — | URL Sonarr (requis pour `/bootstrap`) |
 | `SONARR_API_KEY` | — | Clé API Sonarr (Settings → General) |
 | `RADARR_URL` | — | URL Radarr (requis pour `/bootstrap`) |
@@ -454,4 +455,12 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
 
-**Extensions vidéo** — Seuls les fichiers avec les extensions suivantes sont indexés : `.mkv`, `.mp4`, `.avi`, `.ts`, `.m2ts`, `.mov`, `.wmv`, `.flv`, `.iso`.
+**Extensions vidéo** — Par défaut : `.mkv`, `.mp4`, `.avi`, `.ts`, `.m2ts`, `.mov`, `.wmv`, `.flv`, `.iso`, `.m4v`.
+
+Un fichier dont l'extension ne figure pas dans cette liste est **invisible pour tout le service** : son torrent ne sera déplacé ni par un webhook, ni par `/cleanup`, sans message d'erreur explicite — seulement un `Chemin non trouvé en DB` ou un `unresolved`. Si tu constates ça sur un média qui existe bien, vérifie son extension avant tout le reste.
+
+La liste s'ajuste sans rebuild via `VIDEO_EXTENSIONS` :
+
+```yaml
+- VIDEO_EXTENSIONS=.mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v,.webm
+```
