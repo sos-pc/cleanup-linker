@@ -1645,35 +1645,37 @@ def cleanup_orphans():
                 # d'où leur exclusion par l'INNER JOIN de l'étape 2.
                 t3 = time.time()
                 orphan_hashes = [t["torrent_hash"] for t in torrents]
-                if orphan_hashes:
-                    ph = ",".join("?" * len(orphan_hashes))
-                    voisins = conn.execute(
-                        f"""
-                        SELECT DISTINCT torrent_hash, torrent_name, category
-                        FROM files
-                        WHERE stale = 0
-                          AND torrent_hash IS NOT NULL
-                          AND category != ?
-                          AND torrent_hash NOT IN ({ph})
-                          AND inode IN (
-                              SELECT DISTINCT inode FROM files
-                              WHERE torrent_hash IN ({ph}) AND stale = 0
-                          )
-                        """,
-                        (TARGET_CAT, *orphan_hashes, *orphan_hashes),
-                    ).fetchall()
-
-                    # Un torrent multi-fichiers peut partager un inode avec un
-                    # orphelin tout en gardant d'autres fichiers encore hardlinkés
-                    # (pack de saison cross-seedé avec un épisode isolé). media_hashes
-                    # les écarte — même garantie que _check_hardlinks_active côté webhook.
-                    crossseeds = [v for v in voisins if v["torrent_hash"] not in media_hashes]
-                    protégés = len(voisins) - len(crossseeds)
-                    if protégés:
-                        log.info("  %d voisin(s) conservé(s) : hardlinks /data/Media actifs", protégés)
-                    torrents = list(torrents) + crossseeds
-                    log.info("Étape 3 (cross-seeds) : +%d en %.2fs",
-                             len(crossseeds), time.time() - t3)
+                ph = ",".join("?" * len(orphan_hashes)) if orphan_hashes else "NULL"
+                # Amorce sur deux sources : les orphelins qu'on vient de trouver, et
+                # les torrents déjà dans la catégorie cible — leurs cross-seeds ont pu
+                # rester derrière lors d'un move précédent, ou être ajoutés après coup.
+                voisins = conn.execute(
+                    f"""
+                    SELECT DISTINCT torrent_hash, torrent_name, category
+                    FROM files
+                    WHERE stale = 0
+                      AND torrent_hash IS NOT NULL
+                      AND category != ?
+                      AND torrent_hash NOT IN ({ph})
+                      AND inode IN (
+                          SELECT DISTINCT inode FROM files
+                          WHERE stale = 0
+                            AND (torrent_hash IN ({ph}) OR category = ?)
+                      )
+                    """,
+                    (TARGET_CAT, *orphan_hashes, *orphan_hashes, TARGET_CAT),
+                ).fetchall()
+                # Un torrent multi-fichiers peut partager un inode avec un
+                # orphelin tout en gardant d'autres fichiers encore hardlinkés
+                # (pack de saison cross-seedé avec un épisode isolé). media_hashes
+                # les écarte — même garantie que _check_hardlinks_active côté webhook.
+                crossseeds = [v for v in voisins if v["torrent_hash"] not in media_hashes]
+                protégés = len(voisins) - len(crossseeds)
+                if protégés:
+                    log.info("  %d voisin(s) conservé(s) : hardlinks /data/Media actifs", protégés)
+                torrents = list(torrents) + crossseeds
+                log.info("Étape 3 (cross-seeds) : +%d en %.2fs",
+                         len(crossseeds), time.time() - t3)
 
         if not torrents:
             log.info("%sAucun torrent orphelin trouvé.", prefix)

@@ -431,7 +431,9 @@ curl -XPOST 'http://192.168.1.111:5001/cleanup?token=VOTRE_TOKEN'
 
 `/cleanup` étend son résultat aux **cross-seeds partageant les mêmes inodes**. Sans ça il ne déplacerait que le hash importé par l'*arr : les cross-seeds ne sont jamais dans `arr_managed` (c'est cross-seed qui les ajoute, pas Sonarr/Radarr), ils resteraient derrière à hardlinker le même fichier, et aucun espace ne serait libéré.
 
-L'extension est filtrée par les hashes ayant encore un fichier dans `/data/Media` : un pack de saison cross-seedé avec un épisode isolé partage un inode avec l'orphelin mais garde d'autres épisodes en bibliothèque — il n'est pas déplacé.
+L'extension part de deux sources : les orphelins trouvés à l'instant, **et** les torrents déjà dans `cleanuparr-unlinked` — leurs cross-seeds ont pu rester derrière lors d'un move précédent, ou être ajoutés par cross-seed après coup. `/cleanup` rattrape donc les moves incomplets du passé.
+
+Elle est filtrée par les hashes ayant encore un fichier dans `/data/Media` : un pack de saison cross-seedé avec un épisode isolé partage un inode avec l'orphelin mais garde d'autres épisodes en bibliothèque — il n'est pas déplacé.
 
 Chaque torrent déplacé vers `cleanuparr-unlinked` est enregistré dans la table `cleanup_log` de la DB SQLite (persistée dans `/config/db.sqlite`). Cette table survit aux resyncs et recreations du container.
 
