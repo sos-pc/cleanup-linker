@@ -183,6 +183,7 @@ networks:
 | `JELLYFIN_FALLBACK_MATCH` | `true` | Autorise la résolution par métadonnées quand l'item n'est pas encore indexé |
 | `JELLYFIN_FALLBACK_MAX` | `10` | Nombre max de chemins que le fallback peut retenir pour un film/épisode |
 | `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série/saison, qui compte légitimement beaucoup de fichiers |
+| `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit la suppression en action Sonarr/Radarr au lieu de déplacer les torrents directement |
 
 ---
 
@@ -283,6 +284,37 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin/index?token=VOTRE_TOKEN'
 ### Bibliothèques couvertes
 
 Seules les bibliothèques dont les fichiers sont indexés par cleanup-linker sont résolvables : celles sous `/data/Media/` et sous les dossiers de catégories qBit. Une bibliothèque pointant ailleurs (musique, YouTube…) produira un `unresolved` dans les logs, sans effet de bord.
+
+### Déléguer à Sonarr / Radarr
+
+Supprimer depuis Jellyfin détruit le hardlink, mais **rien n'en informe Sonarr ou Radarr**. Ils continuent de croire qu'ils détiennent le fichier — et comme le média reste *monitored*, ils le **retéléchargent** au prochain rescan. Le torrent a été déplacé, l'espace n'est pas récupéré pour autant.
+
+`JELLYFIN_DELEGATE_TO_ARR=true` change l'approche : au lieu d'agir sur qBittorrent, cleanup-linker traduit l'event en action *arr.
+
+```
+Jellyfin ItemDeleted
+    ↓  résolution ItemId → chemins (identique)
+    ↓  identification de la série/du film par préfixe de chemin
+Sonarr/Radarr : dé-monitorer, puis supprimer l'enregistrement du fichier
+    ↓  l'*arr émet son propre webhook
+/webhook  →  move_torrents_for_path()   ← le chemin de code existant
+qBit → cleanuparr-unlinked
+```
+
+L'identification se fait par **préfixe de chemin**, jamais par titre : le dossier d'une série Sonarr est toujours un ancêtre du chemin de ses épisodes, ce qui donne une correspondance exacte. Le préfixe le plus long gagne si des racines sont imbriquées.
+
+L'ordre compte : on dé-monitore **avant** de supprimer, sinon l'*arr peut relancer une recherche entre les deux appels et retélécharger ce qu'on vient de retirer.
+
+| Event Jellyfin | Action *arr |
+|---|---|
+| `Episode` | Dé-monitore l'épisode, supprime son `episodefile` |
+| `Season` | Dé-monitore les épisodes de la saison, supprime leurs fichiers |
+| `Series` | Idem + dé-monitore la série elle-même |
+| `Movie` | Dé-monitore le film, supprime son `moviefile` |
+
+L'entrée reste dans Sonarr/Radarr avec son historique et ses réglages — seul le monitoring bascule.
+
+**Repli** : si le média n'est géré par aucun *arr (typiquement une bibliothèque Jellyfin pointant directement sur un dossier de téléchargement), on retombe sur le déplacement direct des torrents. Idem si l'*arr est injoignable — une erreur d'API n'interrompt jamais le traitement.
 
 ### Tester sans rien déplacer
 

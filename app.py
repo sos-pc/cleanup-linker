@@ -96,6 +96,17 @@ JELLYFIN_FALLBACK_MAX = int(os.getenv("JELLYFIN_FALLBACK_MAX", "10"))
 # pour les suppressions de conteneur (Series/Season).
 JELLYFIN_FALLBACK_MAX_CONTAINER = int(os.getenv("JELLYFIN_FALLBACK_MAX_CONTAINER", "500"))
 
+# Traduit une suppression Jellyfin en action Sonarr/Radarr (dé-monitorer puis
+# supprimer l'enregistrement du fichier) au lieu de déplacer les torrents nous-mêmes.
+# L'*arr émet alors son propre webhook, qui repasse par le chemin de code existant.
+# Sans ça, l'*arr croit toujours détenir le fichier et le retélécharge.
+# Opt-in : déclenche des actions destructrices côté *arr.
+JELLYFIN_DELEGATE_TO_ARR = os.getenv("JELLYFIN_DELEGATE_TO_ARR", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Extensions indexées. Un fichier dont l'extension manque ici est invisible pour
 # tout le service : ni webhook ni /cleanup ne pourront déplacer son torrent.
 # Configurable pour ne plus dépendre d'un rebuild — la casse et le point initial
@@ -932,6 +943,148 @@ def _jellyfin_paths_by_metadata(data: dict[str, Any], max_paths: int) -> list[st
     return disparus
 
 
+# ── Délégation à Sonarr / Radarr ─────────────────────────────────────────────
+
+
+def _arr_request(
+    method: str, base_url: str, api_key: str, endpoint: str, **kwargs: Any
+) -> Any:
+    """Appel à l'API v3 d'un *arr. Retourne le JSON, ou None si corps vide."""
+    session = _create_retry_session()
+    try:
+        r = session.request(
+            method,
+            f"{base_url.rstrip('/')}/api/v3/{endpoint}",
+            headers={"X-Api-Key": api_key},
+            timeout=30,
+            **kwargs,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else None
+    finally:
+        session.close()
+
+
+def _match_by_path(entries: list[dict[str, Any]], paths: list[str]) -> dict[str, Any] | None:
+    """
+    Retrouve l'entrée *arr dont le dossier contient les chemins supprimés.
+
+    Correspondance par préfixe de chemin, pas par titre : le dossier d'une série
+    Sonarr est toujours un ancêtre du chemin de ses épisodes, ce qui donne une
+    identification exacte là où un rapprochement de titres serait approximatif.
+    Le préfixe le plus long gagne, au cas où des racines seraient imbriquées.
+    """
+    best: tuple[int, dict[str, Any]] | None = None
+    for entry in entries:
+        folder = (entry.get("path") or "").rstrip("/")
+        if not folder:
+            continue
+        if any(p == folder or p.startswith(folder + "/") for p in paths):
+            if best is None or len(folder) > best[0]:
+                best = (len(folder), entry)
+    return best[1] if best else None
+
+
+def _delegate_sonarr(paths: list[str], item_type: str, dry_run: bool) -> dict[str, Any] | None:
+    """Dé-monitore puis supprime les fichiers côté Sonarr. None si série inconnue."""
+    if not (SONARR_URL and SONARR_API_KEY):
+        return None
+
+    series = _match_by_path(_arr_request("GET", SONARR_URL, SONARR_API_KEY, "series") or [], paths)
+    if not series:
+        return None
+
+    sid, titre = series["id"], series.get("title", "?")
+    targets = [
+        f
+        for f in (
+            _arr_request("GET", SONARR_URL, SONARR_API_KEY, "episodefile", params={"seriesId": sid})
+            or []
+        )
+        if f.get("path") in set(paths)
+    ]
+    if not targets:
+        log.info("  Sonarr : série '%s' trouvée mais aucun episodefile correspondant", titre)
+        return None
+
+    file_ids = {f["id"] for f in targets}
+    episodes = _arr_request(
+        "GET", SONARR_URL, SONARR_API_KEY, "episode", params={"seriesId": sid}
+    ) or []
+    episode_ids = [e["id"] for e in episodes if e.get("episodeFileId") in file_ids]
+
+    action = f"Sonarr '{titre}' : {len(episode_ids)} épisode(s) dé-monitoré(s), {len(targets)} fichier(s) supprimé(s)"
+    if item_type == "Series":
+        action += " + série dé-monitorée"
+
+    if dry_run:
+        log.info("  [DRY RUN] %s", action)
+        return {"arr": "sonarr", "series": titre, "episodes": len(episode_ids),
+                "files": len(targets), "dry_run": True}
+
+    # Dé-monitorer d'abord : sinon Sonarr peut relancer une recherche entre les
+    # deux appels et retélécharger ce qu'on vient de retirer.
+    if episode_ids:
+        _arr_request("PUT", SONARR_URL, SONARR_API_KEY, "episode/monitor",
+                     json={"episodeIds": episode_ids, "monitored": False})
+    if item_type == "Series":
+        series["monitored"] = False
+        _arr_request("PUT", SONARR_URL, SONARR_API_KEY, f"series/{sid}", json=series)
+
+    # La suppression déclenche le webhook EpisodeFileDelete de Sonarr, qui
+    # repasse par /webhook et déplace les torrents.
+    for f in targets:
+        _arr_request("DELETE", SONARR_URL, SONARR_API_KEY, f"episodefile/{f['id']}")
+
+    log.info("  ✓ %s", action)
+    return {"arr": "sonarr", "series": titre, "episodes": len(episode_ids), "files": len(targets)}
+
+
+def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
+    """Dé-monitore puis supprime le fichier côté Radarr. None si film inconnu."""
+    if not (RADARR_URL and RADARR_API_KEY):
+        return None
+
+    movie = _match_by_path(_arr_request("GET", RADARR_URL, RADARR_API_KEY, "movie") or [], paths)
+    if not movie:
+        return None
+
+    mid, titre = movie["id"], movie.get("title", "?")
+    file_id = (movie.get("movieFile") or {}).get("id")
+
+    action = f"Radarr '{titre}' : dé-monitoré" + (
+        f", fichier {file_id} supprimé" if file_id else ", aucun fichier référencé"
+    )
+    if dry_run:
+        log.info("  [DRY RUN] %s", action)
+        return {"arr": "radarr", "movie": titre, "file_id": file_id, "dry_run": True}
+
+    movie["monitored"] = False
+    _arr_request("PUT", RADARR_URL, RADARR_API_KEY, f"movie/{mid}", json=movie)
+    if file_id:
+        _arr_request("DELETE", RADARR_URL, RADARR_API_KEY, f"moviefile/{file_id}")
+
+    log.info("  ✓ %s", action)
+    return {"arr": "radarr", "movie": titre, "file_id": file_id}
+
+
+def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str, Any] | None:
+    """
+    Traduit une suppression Jellyfin en action Sonarr/Radarr.
+
+    Retourne None si le média n'est géré par aucun *arr — l'appelant retombe
+    alors sur le déplacement direct des torrents.
+    """
+    try:
+        if item_type in ("Series", "Season", "Episode"):
+            return _delegate_sonarr(paths, item_type, dry_run)
+        if item_type in ("Movie", "Video"):
+            return _delegate_radarr(paths, dry_run)
+    except Exception as e:
+        log.error("  Erreur délégation *arr : %s", e)
+    return None
+
+
 # ── Nettoyage ────────────────────────────────────────────────────────────────
 
 
@@ -1291,6 +1444,21 @@ def jellyfin_webhook():
             "  %d/%d chemin(s) réellement supprimés, les autres sont conservés",
             len(disparus), len(paths),
         )
+
+    # Traduction en action *arr quand le média y est géré : sans ça l'*arr croit
+    # toujours détenir le fichier et le retélécharge. C'est lui qui émettra ensuite
+    # son propre webhook, lequel déplace les torrents par le chemin de code habituel.
+    if JELLYFIN_DELEGATE_TO_ARR:
+        delegated = delegate_to_arr(disparus, item_type, dry_run)
+        if delegated:
+            return jsonify({
+                "status": "delegated",
+                "delegated_to": delegated,
+                "deleted_paths": len(disparus),
+                "resolution": resolution,
+                "dry_run": dry_run,
+            })
+        log.info("  Média inconnu de Sonarr/Radarr — déplacement direct des torrents")
 
     # Un seul point d'entrée : la branche préfixe de move_torrents_for_path traite
     # tous les inodes d'un dossier en une passe, au lieu d'une session qBit par épisode.
