@@ -288,6 +288,28 @@ def log_move(torrent_hash: str, torrent_name: str, original_cat: str, source: st
             )
 
 
+def refresh_arr_managed_from_links() -> int:
+    """
+    Marque arr_managed tout torrent actuellement hardlinké dans /data/Media.
+
+    Filet contre les webhooks ratés — service arrêté pendant un import, type
+    d'event non coché dans un *arr, livraison échouée. Un hardlink dans une
+    racine *arr est la preuve de l'import, indépendamment de tout event reçu.
+
+    Le critère ne porte que sur /data/Media : un torrent vivant uniquement sous
+    /data/Multimedia (ajout manuel) n'est jamais marqué, donc jamais candidat au
+    cleanup. C'est ce qui distingue le contenu géré des ajouts manuels.
+    """
+    with _db_lock:
+        with get_db() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO arr_managed (torrent_hash) "
+                "SELECT DISTINCT torrent_hash FROM files "
+                "WHERE torrent_hash IS NOT NULL AND path LIKE '/data/Media/%' AND stale = 0"
+            )
+            return cur.rowcount
+
+
 def mark_arr_managed(download_id: str) -> None:
     """Enregistre un hash torrent comme géré par *arr (idempotent)."""
     if not download_id:
@@ -630,6 +652,15 @@ def sync_db() -> None:
         "=== Sync terminée : %d entrées (%d stale purgées) en %.1fs ===",
         rows_after, stale_count, elapsed
     )
+
+    # files vient d'être reconstruite : c'est le moment où l'état des hardlinks
+    # est le plus fiable. Isolé pour ne jamais faire échouer la sync.
+    try:
+        n = refresh_arr_managed_from_links()
+        if n:
+            log.info("arr_managed : +%d torrent(s) via hardlinks /data/Media", n)
+    except Exception as e:
+        log.error("Erreur rafraîchissement arr_managed: %s", e)
 
     # Les tags Jellyfin portent sur des chemins qui viennent d'être reconstruits :
     # on réindexe dans la foulée. Isolé pour qu'un Jellyfin injoignable ne fasse

@@ -104,6 +104,11 @@ Toutes les 12h (configurable), le scanner reconstruit entièrement la DB locale 
 3. Scanne `/data/Multimedia/cross-seeds/` pour les hardlinks cross-seed
 4. Scanne `/data/Media/` pour les hardlinks Sonarr/Radarr
 5. Croise les inodes avec la liste des torrents qBit → peuple la DB
+6. Marque `arr_managed` tout torrent hardlinké dans `/data/Media/`
+
+L'étape 6 est un filet contre les webhooks ratés — service arrêté pendant un import, type d'event non coché dans un *arr, livraison échouée. Un hardlink dans une racine *arr prouve l'import indépendamment de tout event reçu.
+
+Le critère ne porte que sur `/data/Media/` : un torrent vivant uniquement sous `/data/Multimedia/` (ajout manuel) n'est jamais marqué, donc jamais candidat au `/cleanup`.
 
 ---
 
@@ -382,7 +387,9 @@ Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visib
 
 ## Workflow premier démarrage
 
-Le `/cleanup` repose sur la table `arr_managed` pour ne jamais toucher les torrents ajoutés manuellement. Après une première installation (ou si le service était absent pendant une longue période), il faut peupler cette table depuis l'historique Sonarr/Radarr.
+Le `/cleanup` repose sur la table `arr_managed` pour ne jamais toucher les torrents ajoutés manuellement.
+
+En régime établi elle s'entretient seule : chaque webhook enregistre son `downloadId`, et chaque sync marque les torrents hardlinkés dans `/data/Media/`. `/bootstrap` ne sert donc qu'une fois — après une première installation, ou si le service a été absent longtemps — pour récupérer l'historique Sonarr/Radarr des imports antérieurs, que la DB locale ne peut pas reconstituer.
 
 **Étape 1 — Bootstrap (une seule fois)**
 
