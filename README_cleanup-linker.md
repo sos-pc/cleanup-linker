@@ -312,6 +312,8 @@ L'identification se fait par **préfixe de chemin**, jamais par titre : le dossi
 
 L'ordre compte : on dé-monitore **avant** de supprimer, sinon l'*arr peut relancer une recherche entre les deux appels et retélécharger ce qu'on vient de retirer.
 
+Le dé-monitorage passe par les endpoints à charge minimale — `episode/monitor`, `series/editor`, `movie/editor` — jamais par un `PUT` sur la ressource, qui exigerait de renvoyer l'objet complet et donc de risquer d'abîmer une fiche sur un champ mal repris.
+
 | Event Jellyfin | Action *arr |
 |---|---|
 | `Episode` | Dé-monitore l'épisode, supprime son `episodefile` |

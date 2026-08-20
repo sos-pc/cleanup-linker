@@ -1126,8 +1126,13 @@ def _delegate_sonarr(paths: list[str], item_type: str, dry_run: bool) -> dict[st
         _arr_request("PUT", SONARR_URL, SONARR_API_KEY, "episode/monitor",
                      json={"episodeIds": episode_ids, "monitored": False})
     if item_type == "Series":
-        series["monitored"] = False
-        _arr_request("PUT", SONARR_URL, SONARR_API_KEY, f"series/{sid}", json=series)
+        # Endpoint "editor" plutôt que PUT series/{id} : il prend une charge
+        # minimale au lieu d'exiger le renvoi de l'objet série complet, qu'un
+        # champ mal repris suffirait à abîmer.
+        _arr_request(
+            "PUT", SONARR_URL, SONARR_API_KEY, "series/editor",
+            json={"seriesIds": [sid], "monitored": False},
+        )
 
     # La suppression déclenche le webhook EpisodeFileDelete de Sonarr, qui
     # repasse par /webhook et déplace les torrents.
@@ -1157,8 +1162,11 @@ def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
         log.info("  [DRY RUN] %s", action)
         return {"arr": "radarr", "movie": titre, "file_id": file_id, "dry_run": True}
 
-    movie["monitored"] = False
-    _arr_request("PUT", RADARR_URL, RADARR_API_KEY, f"movie/{mid}", json=movie)
+    # Endpoint "editor" : charge minimale, aucun renvoi de l'objet film complet.
+    _arr_request(
+        "PUT", RADARR_URL, RADARR_API_KEY, "movie/editor",
+        json={"movieIds": [mid], "monitored": False},
+    )
     if file_id:
         _arr_request("DELETE", RADARR_URL, RADARR_API_KEY, f"moviefile/{file_id}")
 
