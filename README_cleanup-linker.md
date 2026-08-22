@@ -191,6 +191,7 @@ networks:
 | `JELLYFIN_FALLBACK_MAX` | `10` | Nombre max de chemins que le fallback peut retenir pour un film/épisode |
 | `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série/saison, qui compte légitimement beaucoup de fichiers |
 | `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit la suppression en action Sonarr/Radarr au lieu de déplacer les torrents directement |
+| `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
 
 ---
 
@@ -322,6 +323,20 @@ Le dé-monitorage passe par les endpoints à charge minimale — `episode/monito
 | `Movie` | Dé-monitore le film, supprime son `moviefile` |
 
 L'entrée reste dans Sonarr/Radarr avec son historique et ses réglages — seul le monitoring bascule.
+
+### Supprimer l'entrée plutôt que la dé-monitorer
+
+Une série vidée mais conservée reste indéfiniment dans Sonarr, à 0 fichier, en affichant ses épisodes manquants. `JELLYFIN_ARR_DELETE_CONTAINERS=true` retire l'entrée pour les **conteneurs uniquement** :
+
+| Event Jellyfin | Action |
+|---|---|
+| `Series` | `DELETE /series/{id}?deleteFiles=true` |
+| `Movie` | `DELETE /movie/{id}?deleteFiles=true` |
+| `Season`, `Episode` | inchangé — supprimer une saison ne doit pas retirer la série |
+
+Effet secondaire appréciable : Sonarr n'émet plus qu'un seul `SeriesDelete`, résolu par préfixe de dossier, au lieu d'un `EpisodeFileDelete` par épisode qui déplaçait le même torrent autant de fois.
+
+Désactivé par défaut : c'est irréversible côté *arr — on perd l'historique, le profil de qualité, les tags et le monitoring. **À vérifier avant d'activer** : si tu utilises des listes d'import (Trakt, IMDb…), la série sera ré-ajoutée au prochain sync, sauf à gérer les exclusions.
 
 **Repli** : si le média n'est géré par aucun *arr (typiquement une bibliothèque Jellyfin pointant directement sur un dossier de téléchargement), on retombe sur le déplacement direct des torrents. Idem si l'*arr est injoignable — une erreur d'API n'interrompt jamais le traitement.
 

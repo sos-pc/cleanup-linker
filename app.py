@@ -107,6 +107,17 @@ JELLYFIN_DELEGATE_TO_ARR = os.getenv("JELLYFIN_DELEGATE_TO_ARR", "false").lower(
     "yes",
 )
 
+# Supprimer une série entière ou un film depuis Jellyfin retire aussi l'entrée
+# de Sonarr/Radarr, au lieu de seulement la dé-monitorer. Sans ça la fiche reste
+# indéfiniment dans la liste, à 0 fichier, en affichant ses épisodes manquants.
+# Ne concerne QUE les conteneurs Series et Movie : supprimer une saison ou un
+# épisode d'une série qu'on garde ne doit évidemment pas retirer la série.
+# Désactivé par défaut — c'est plus fort qu'un dé-monitorage, et irréversible :
+# on perd l'historique, le profil de qualité, les tags et le monitoring.
+JELLYFIN_ARR_DELETE_CONTAINERS = os.getenv(
+    "JELLYFIN_ARR_DELETE_CONTAINERS", "false"
+).lower() in ("1", "true", "yes")
+
 # Extensions indexées. Un fichier dont l'extension manque ici est invisible pour
 # tout le service : ni webhook ni /cleanup ne pourront déplacer son torrent.
 # Configurable pour ne plus dépendre d'un rebuild — la casse et le point initial
@@ -1108,6 +1119,20 @@ def _delegate_sonarr(paths: list[str], item_type: str, dry_run: bool) -> dict[st
         return None
 
     sid, titre = series["id"], series.get("title", "?")
+
+    # Série entière : on retire la fiche plutôt que de la vider. Sonarr émet
+    # alors un seul SeriesDelete, que /webhook résout par préfixe de dossier —
+    # au lieu d'un EpisodeFileDelete par épisode, tous sur le même torrent.
+    if item_type == "Series" and JELLYFIN_ARR_DELETE_CONTAINERS:
+        action = f"Sonarr : série '{titre}' supprimée de Sonarr avec ses fichiers"
+        if dry_run:
+            log.info("  [DRY RUN] %s", action)
+            return {"arr": "sonarr", "series": titre, "supprimee": True, "dry_run": True}
+        _arr_request("DELETE", SONARR_URL, SONARR_API_KEY,
+                     f"series/{sid}", params={"deleteFiles": "true"})
+        log.info("  ✓ %s", action)
+        return {"arr": "sonarr", "series": titre, "supprimee": True}
+
     targets = [
         f
         for f in (
@@ -1169,6 +1194,18 @@ def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
 
     mid, titre = movie["id"], movie.get("title", "?")
     file_id = (movie.get("movieFile") or {}).get("id")
+
+    # Un film est un conteneur à lui seul : le supprimer de Jellyfin veut dire
+    # qu'on n'en veut plus, pas qu'on attend une meilleure version.
+    if JELLYFIN_ARR_DELETE_CONTAINERS:
+        action = f"Radarr : film '{titre}' supprimé de Radarr avec ses fichiers"
+        if dry_run:
+            log.info("  [DRY RUN] %s", action)
+            return {"arr": "radarr", "movie": titre, "supprime": True, "dry_run": True}
+        _arr_request("DELETE", RADARR_URL, RADARR_API_KEY,
+                     f"movie/{mid}", params={"deleteFiles": "true"})
+        log.info("  ✓ %s", action)
+        return {"arr": "radarr", "movie": titre, "supprime": True}
 
     action = f"Radarr '{titre}' : dé-monitoré" + (
         f", fichier {file_id} supprimé" if file_id else ", aucun fichier référencé"
