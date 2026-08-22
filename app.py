@@ -431,6 +431,22 @@ def qbit_get_categories(s: requests.Session) -> dict[str, str]:
     return result
 
 
+def torrent_root(t: dict[str, Any]) -> str:
+    """
+    Emplacement réel des données d'un torrent.
+
+    `content_path` fait foi : le champ `name` est le nom d'affichage du torrent,
+    qui diffère du dossier sur le disque dès que le .torrent porte un titre
+    différent de son contenu. Sur l'installation de référence, 308 torrents sur
+    3269 (9,4 %) sont dans ce cas — reconstruire le chemin avec save_path + name
+    les rendait introuvables, donc non indexés et faussement orphelins.
+    """
+    cp = (t.get("content_path") or "").rstrip("/")
+    if cp:
+        return cp
+    return f"{t.get('save_path', '').rstrip('/')}/{t.get('name', '')}"
+
+
 def qbit_get_torrents(s: requests.Session) -> list[dict[str, Any]]:
     """Retourne la liste complète des torrents avec hash, save_path, name, category."""
     r = s.get(f"{QBIT_URL}/api/v2/torrents/info", timeout=30)
@@ -598,11 +614,10 @@ def sync_db() -> None:
     files_scanned = 0
 
     for t in torrents:
-        save_path = t.get("save_path", "").rstrip("/")
         name = t.get("name", "")
         hash_ = t.get("hash", "")
         category = t.get("category", "")
-        root_path = f"{save_path}/{name}"
+        root_path = torrent_root(t)
 
         updates, count = scan_torrent_files(root_path, hash_, name, category)
         for inode, infos in updates.items():
@@ -1274,9 +1289,7 @@ def move_torrents_for_path(
                     safe_to_move.append(t)
                     continue
 
-                save_path = torrent_info[0].get("save_path", "").rstrip("/")
-                name = torrent_info[0].get("name", "")
-                root = f"{save_path}/{name}"
+                root = torrent_root(torrent_info[0])
                 still_linked = False
 
                 if check_links:

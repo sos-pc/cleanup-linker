@@ -504,6 +504,8 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
 
+**Emplacement d'un torrent** — Le champ `name` de l'API qBittorrent est un nom d'affichage, qui diffère du dossier réel dès que le `.torrent` porte un titre différent de son contenu. C'est `content_path` qui fait foi, et c'est lui qu'utilise `torrent_root()`. Sur l'installation de référence, 308 torrents sur 3269 sont dans ce cas : reconstruire le chemin avec `save_path + name` les rendait introuvables, donc non indexés — leurs fichiers apparaissaient alors comme n'appartenant à aucun torrent.
+
 **Extensions vidéo** — Par défaut : `.mkv`, `.mp4`, `.avi`, `.ts`, `.m2ts`, `.mov`, `.wmv`, `.flv`, `.iso`, `.m4v`.
 
 Un fichier dont l'extension ne figure pas dans cette liste est **invisible pour tout le service** : son torrent ne sera déplacé ni par un webhook, ni par `/cleanup`, sans message d'erreur explicite — seulement un `Chemin non trouvé en DB` ou un `unresolved`. Si tu constates ça sur un média qui existe bien, vérifie son extension avant tout le reste.
