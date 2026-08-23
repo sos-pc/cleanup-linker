@@ -179,6 +179,7 @@ networks:
 | `DB_PATH` | `/config/db.sqlite` | Chemin de la DB locale |
 | `CROSSSEED_DB` | `/config/crossseed/cross-seed.db` | Chemin de la DB cross-seed |
 | `SYNC_INTERVAL_HOURS` | `12` | Fréquence de resync en heures |
+| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`. `0` désactive |
 | `VIDEO_EXTENSIONS` | voir ci-dessous | Extensions indexées, séparées par des virgules. Le point initial et la casse sont optionnels |
 | `SONARR_URL` | — | URL Sonarr (requis pour `/bootstrap`) |
 | `SONARR_API_KEY` | — | Clé API Sonarr (Settings → General) |

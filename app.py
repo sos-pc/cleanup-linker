@@ -60,6 +60,13 @@ TARGET_CAT = os.getenv("TARGET_CATEGORY", "cleanuparr-unlinked")
 DB_PATH = os.getenv("DB_PATH", "/config/db.sqlite")
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_HOURS", "12")) * 3600
 BACKUP_RETENTION = int(os.getenv("BACKUP_RETENTION", "5"))
+
+# Délai de grâce du /cleanup. Un torrent tout juste terminé est déjà marqué
+# arr_managed par le webhook de grab, mais n'a pas encore de hardlink tant que
+# l'*arr ne l'a pas importé : il ressemble donc à un orphelin sans en être un.
+# Passé ce délai, un torrent toujours sans hardlink l'est réellement.
+# 0 désactive la protection.
+CLEANUP_GRACE_HOURS = int(os.getenv("CLEANUP_GRACE_HOURS", "24"))
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/config/backups")
 
 SONARR_URL = os.getenv("SONARR_URL", "")
@@ -1824,6 +1831,42 @@ def cleanup_orphans():
                 torrents = list(torrents) + crossseeds
                 log.info("Étape 3 (cross-seeds) : +%d en %.2fs",
                          len(crossseeds), time.time() - t3)
+
+        # ── Étape 4 : délai de grâce ─────────────────────────────────────────
+        # Un torrent que l'*arr vient de grab est déjà dans arr_managed — le
+        # webhook a enregistré son downloadId — mais n'a pas encore de hardlink
+        # tant que l'import n'a pas eu lieu. Il coche donc les deux critères
+        # d'orphelin alors qu'il attend simplement d'être importé.
+        if torrents and CLEANUP_GRACE_HOURS > 0:
+            t4 = time.time()
+            limite = time.time() - CLEANUP_GRACE_HOURS * 3600
+            try:
+                with qbit_session() as s:
+                    infos = {x["hash"]: x for x in qbit_get_torrents(s)}
+            except Exception as e:
+                log.error("⚠️ Cleanup interrompu : impossible de dater les torrents (%s)", e)
+                return
+
+            def trop_recent(h: str) -> bool:
+                x = infos.get(h)
+                if not x:
+                    return False
+                quand = x.get("completion_on") or 0
+                if quand <= 0:
+                    quand = x.get("added_on") or 0
+                return quand > limite
+
+            gardes = [t for t in torrents if trop_recent(t["torrent_hash"])]
+            if gardes:
+                torrents = [t for t in torrents if not trop_recent(t["torrent_hash"])]
+                log.info(
+                    "Étape 4 (délai de grâce) : %d torrent(s) épargnés, terminés depuis "
+                    "moins de %dh — import *arr probablement en attente",
+                    len(gardes), CLEANUP_GRACE_HOURS,
+                )
+                for t in gardes[:10]:
+                    log.info("    ⏳ %s", t["torrent_name"])
+            log.info("Étape 4 (délai de grâce) : %.2fs", time.time() - t4)
 
         if not torrents:
             log.info("%sAucun torrent orphelin trouvé.", prefix)
