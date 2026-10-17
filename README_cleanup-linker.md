@@ -312,6 +312,22 @@ qBit → cleanuparr-unlinked
 
 L'identification se fait par **préfixe de chemin**, jamais par titre : le dossier d'une série Sonarr est toujours un ancêtre du chemin de ses épisodes, ce qui donne une correspondance exacte. Le préfixe le plus long gagne si des racines sont imbriquées.
 
+#### Bibliothèque posée sur le dossier de téléchargement
+
+Quand une bibliothèque Jellyfin pointe directement sur un dossier de catégorie qBittorrent — `Films` sur `/data/Multimedia/Films` par exemple — Jellyfin et Radarr désignent le même fichier par deux chemins différents :
+
+```
+Jellyfin : /data/Multimedia/Films/Cypher.2002.Multi.Bluray.Remux....mkv
+Radarr   : /data/Media/Films/Cypher (2002) [tmdbid-10133]/Cypher (2002) ... .mkv
+           └─ même inode : le hardlink créé par Radarr à l'import
+```
+
+Comparer le seul chemin Jellyfin aux dossiers Radarr ne peut pas aboutir. Avant le correctif, la suppression retombait sur le déplacement direct des torrents, et Radarr gardait sa copie, devenue invisible mais toujours `hasFile=true`. Sur l'installation de référence, 4 films sont restés ainsi, soit 90 Go, et aucune suppression de film depuis Jellyfin n'avait jamais été déléguée.
+
+Les chemins supprimés sont donc d'abord complétés par **tous les autres chemins du même inode** connus de la base. Ils y sont encore au moment de l'event, car la sync ne purge un chemin disparu qu'au passage suivant. L'identification par préfixe trouve alors le film par son chemin `/data/Media`.
+
+Un lien n'est retenu que si **son inode sur le disque est toujours celui de la base**. Un fichier remplacé depuis la dernière sync, par un upgrade par exemple, est un autre fichier : une suppression Jellyfin ne doit pas l'emporter. Et quand Radarr détient une autre release que celle supprimée, aucun chemin `/data/Media` ne partage l'inode du fichier supprimé. Rien n'est délégué, et la release de Radarr reste en place.
+
 L'ordre compte : on dé-monitore **avant** de supprimer, sinon l'*arr peut relancer une recherche entre les deux appels et retélécharger ce qu'on vient de retirer.
 
 Le dé-monitorage passe par les endpoints à charge minimale — `episode/monitor`, `series/editor`, `movie/editor` — jamais par un `PUT` sur la ressource, qui exigerait de renvoyer l'objet complet et donc de risquer d'abîmer une fiche sur un champ mal repris.

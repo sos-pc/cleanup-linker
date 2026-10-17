@@ -1233,6 +1233,54 @@ def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
     return {"arr": "radarr", "movie": titre, "file_id": file_id}
 
 
+# Taille des lots de paramètres SQL : sous la limite historique de SQLite (999).
+_SQL_CHUNK = 500
+
+
+def _arr_candidate_paths(paths: list[str]) -> list[str]:
+    """
+    Chemins sous lesquels Sonarr/Radarr peuvent connaître les fichiers supprimés.
+
+    Jellyfin et l'*arr désignent parfois le même fichier par deux chemins. Une
+    bibliothèque posée sur le dossier de téléchargement (/data/Multimedia/Films)
+    voit la copie seedée ; Radarr, lui, connaît le hardlink qu'il a importé
+    (/data/Media/Films/...). Comparer les seuls chemins Jellyfin aux dossiers *arr
+    échoue alors à coup sûr, et l'*arr garde un fichier devenu invisible.
+
+    On y ajoute donc les autres chemins du même inode connus de la base. Ils y
+    sont encore au moment de l'event : la sync ne purge un chemin disparu qu'au
+    passage suivant.
+
+    Un lien n'est retenu que s'il désigne toujours cet inode sur le disque. Un
+    fichier remplacé depuis la dernière sync — upgrade *arr — est un autre
+    fichier, qu'une suppression Jellyfin ne doit pas entraîner.
+    """
+    connus = set(paths)
+    trouves: dict[str, int] = {}
+    with _db_lock:
+        with get_db() as conn:
+            for i in range(0, len(paths), _SQL_CHUNK):
+                lot = paths[i:i + _SQL_CHUNK]
+                ph = ",".join("?" * len(lot))
+                for r in conn.execute(
+                    f"SELECT DISTINCT f2.path, f2.inode FROM files f1 "
+                    f"JOIN files f2 ON f2.inode = f1.inode "
+                    f"WHERE f1.path IN ({ph}) AND f1.stale = 0 AND f2.stale = 0",
+                    lot,
+                ):
+                    if r["path"] not in connus:
+                        trouves[r["path"]] = r["inode"]
+
+    liens = []
+    for chemin, inode in trouves.items():
+        try:
+            if os.stat(chemin).st_ino == inode:
+                liens.append(chemin)
+        except OSError:
+            continue
+    return list(paths) + sorted(liens)
+
+
 def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str, Any] | None:
     """
     Traduit une suppression Jellyfin en action Sonarr/Radarr.
@@ -1241,10 +1289,19 @@ def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str
     alors sur le déplacement direct des torrents.
     """
     try:
+        candidats = _arr_candidate_paths(paths)
+    except Exception as e:
+        log.error("  Résolution des hardlinks impossible, chemins Jellyfin seuls : %s", e)
+        candidats = list(paths)
+    if len(candidats) > len(paths):
+        log.info("  %d autre(s) chemin(s) du même fichier, via l'inode : %s",
+                 len(candidats) - len(paths), candidats[len(paths)])
+
+    try:
         if item_type in ("Series", "Season", "Episode"):
-            return _delegate_sonarr(paths, item_type, dry_run)
+            return _delegate_sonarr(candidats, item_type, dry_run)
         if item_type in ("Movie", "Video"):
-            return _delegate_radarr(paths, dry_run)
+            return _delegate_radarr(candidats, dry_run)
     except Exception as e:
         log.error("  Erreur délégation *arr : %s", e)
     return None
