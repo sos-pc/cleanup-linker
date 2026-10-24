@@ -858,6 +858,10 @@ def jellyfin_fetch_items() -> list[dict[str, Any]]:
                 params={
                     "Recursive": "true",
                     "IncludeItemTypes": "Movie,Episode,Video",
+                    # Par défaut, Jellyfin remplace les films rangés dans une collection
+                    # par la collection elle-même : 189 films sur 1654 manquaient à l'index
+                    # sur l'installation de référence, et leur suppression restait sans effet.
+                    "CollapseBoxSetItems": "false",
                     "Fields": "Path",
                     "EnableTotalRecordCount": "false",
                     "StartIndex": start,
@@ -983,10 +987,11 @@ def _jellyfin_paths_for_item(item_id: str, item_type: str = "") -> list[str]:
     return [r["path"] for r in rows]
 
 
-# Profondeur minimale d'un dossier commun exploitable : ['', 'data', 'Media', 'Séries']
-# En dessous, le préfixe engloberait une racine entière — jamais légitime pour une
-# seule série, et le LIKE ratisserait des torrents sans rapport.
-_MIN_ROOT_DEPTH = 4
+# Profondeur minimale d'un dossier commun exploitable : ['', 'data', 'Media', 'Séries', 'Titre'].
+# Au-dessus, le préfixe engloberait une bibliothèque entière — jamais légitime pour
+# une seule série, et le LIKE ratisserait des torrents sans rapport. Ça arrive quand
+# Jellyfin réunit deux dossiers d'une même bibliothèque sous une seule série.
+_MIN_ROOT_DEPTH = 5
 
 
 def _common_root(paths: list[str]) -> str:
@@ -1531,11 +1536,15 @@ def move_torrents_for_path(
                 return len(safe_to_move)
 
             hashes = "|".join(t["info_hash"] for t in safe_to_move)
-            s.post(
+            # Un refus de qBit (catégorie inconnue, session expirée) ne lève rien de
+            # lui-même : sans ce contrôle, on tracerait des moves jamais faits et on
+            # purgerait leurs lignes de l'index.
+            r = s.post(
                 f"{QBIT_URL}/api/v2/torrents/setCategory",
                 data={"hashes": hashes, "category": TARGET_CAT},
                 timeout=10,
             )
+            r.raise_for_status()
 
             for t in safe_to_move:
                 log.info("  ✓ [%s] %s → %s", t.get("category", "?"), t["name"], TARGET_CAT)
@@ -2069,11 +2078,12 @@ def cleanup_orphans():
         try:
             with qbit_session() as s:
                 hashes = "|".join(t["torrent_hash"] for t in torrents)
-                s.post(
+                r = s.post(
                     f"{QBIT_URL}/api/v2/torrents/setCategory",
                     data={"hashes": hashes, "category": TARGET_CAT},
                     timeout=10,
                 )
+                r.raise_for_status()
                 for t in torrents:
                     log_move(t["torrent_hash"], t["torrent_name"], t["category"], "cleanup")
                 log.info("=== Nettoyage terminé : %d torrents déplacés ===", len(torrents))
@@ -2084,12 +2094,32 @@ def cleanup_orphans():
     return jsonify({"status": "cleanup started"})
 
 
+# Un /cleanup trace tous ses moves juste après un seul setCategory : ses lignes de
+# cleanup_log tombent dans la même poignée de secondes.
+_RESTORE_WINDOW = 300
+
+
 @app.route("/restore", methods=["POST"])
 def restore_last_cleanup():
-    """Remet les torrents déplacés par le dernier /cleanup dans leur catégorie d'origine."""
+    """
+    Remet dans leur catégorie d'origine les torrents déplacés par le dernier /cleanup.
+
+    `since` (timestamp Unix) élargit à tous les moves tracés depuis cette date, quelle
+    qu'en soit la source : webhook, jellyfin ou cleanup.
+
+    Le bornage compte : sans lui, tout ce qui est dans la catégorie cible et figure au
+    journal repartirait. Ça représente des mois de suppressions légitimes, plus les
+    torrents qu'on y laisse seeder pour honorer les trackers.
+    """
     token = request.args.get("token") or request.headers.get("X-Token")
     if not verify_token(token):
         return jsonify({"error": "Unauthorized"}), 401
+
+    since_raw = request.args.get("since")
+    try:
+        since = int(since_raw) if since_raw else None
+    except ValueError:
+        return jsonify({"error": "since doit être un timestamp Unix"}), 400
 
     def run_restore():
         log.info("=== Début de la restauration ===")
@@ -2104,22 +2134,44 @@ def restore_last_cleanup():
                     log.info("Aucun torrent dans la catégorie cible, rien à restaurer.")
                     return
 
-                # Source 1 : cleanup_log
+                # Source 1 : cleanup_log, borné au dernier /cleanup ou à `since`
                 with _db_lock:
                     with get_db() as conn:
-                        log_rows = conn.execute(
-                            "SELECT torrent_hash, torrent_name, original_cat FROM cleanup_log "
-                            "WHERE original_cat != ? ORDER BY moved_at DESC",
-                            (TARGET_CAT,),
-                        ).fetchall()
+                        journal_vide = conn.execute(
+                            "SELECT COUNT(*) FROM cleanup_log"
+                        ).fetchone()[0] == 0
+                        if since is not None:
+                            log.info("Moves tracés depuis %s, toutes sources", datetime.fromtimestamp(since))
+                            log_rows = conn.execute(
+                                "SELECT torrent_hash, torrent_name, original_cat FROM cleanup_log "
+                                "WHERE original_cat != ? AND moved_at >= ? ORDER BY moved_at DESC",
+                                (TARGET_CAT, since),
+                            ).fetchall()
+                        else:
+                            dernier = conn.execute(
+                                "SELECT MAX(moved_at) FROM cleanup_log WHERE source = 'cleanup'"
+                            ).fetchone()[0]
+                            if dernier is None:
+                                log_rows = []
+                                if not journal_vide:
+                                    log.info("Aucun /cleanup au journal : rien à restaurer "
+                                             "(passer since=<timestamp> pour les autres moves).")
+                            else:
+                                log.info("Dernier /cleanup : %s", datetime.fromtimestamp(dernier))
+                                log_rows = conn.execute(
+                                    "SELECT torrent_hash, torrent_name, original_cat FROM cleanup_log "
+                                    "WHERE source = 'cleanup' AND original_cat != ? AND moved_at >= ? "
+                                    "ORDER BY moved_at DESC",
+                                    (TARGET_CAT, dernier - _RESTORE_WINDOW),
+                                ).fetchall()
 
                 hash_to_cat: dict[str, tuple[str, str]] = {}
                 for r in log_rows:
                     if r["torrent_hash"] not in hash_to_cat:
                         hash_to_cat[r["torrent_hash"]] = (r["torrent_name"], r["original_cat"])
 
-                # Source 2 : fallback sur files table
-                if not hash_to_cat:
+                # Source 2 : fallback sur la table files, pour une base sans journal
+                if journal_vide:
                     log.info("cleanup_log vide, fallback sur la table files...")
                     with _db_lock:
                         with get_db() as conn:
@@ -2145,11 +2197,16 @@ def restore_last_cleanup():
                 restored: list[dict[str, str]] = []
                 for cat, cat_torrents in by_cat.items():
                     hashes = "|".join(t["hash"] for t in cat_torrents)
-                    s.post(
-                        f"{QBIT_URL}/api/v2/torrents/setCategory",
-                        data={"hashes": hashes, "category": cat},
-                        timeout=10,
-                    )
+                    try:
+                        rep = s.post(
+                            f"{QBIT_URL}/api/v2/torrents/setCategory",
+                            data={"hashes": hashes, "category": cat},
+                            timeout=10,
+                        )
+                        rep.raise_for_status()
+                    except requests.RequestException as e:
+                        log.error("  ✗ Restauration vers '%s' impossible : %s", cat, e)
+                        continue
                     for t in cat_torrents:
                         log.info("  ↩ Restauré [%s] %s → %s", TARGET_CAT, t["name"], cat)
                         restored.append(t)
@@ -2159,7 +2216,7 @@ def restore_last_cleanup():
             log.error("Erreur lors de la restauration: %s", e)
 
     threading.Thread(target=run_restore, daemon=True).start()
-    return jsonify({"status": "restore started"})
+    return jsonify({"status": "restore started", "since": since})
 
 
 

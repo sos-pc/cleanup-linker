@@ -247,6 +247,8 @@ inode  │ path                                   │ torrent_hash │ jellyfin_
 
 Seul le chemin vu par Jellyfin est tagué — l'inode se charge du reste. À la suppression : `jellyfin_item_id` → inode → tous les hashes → cross-seeds → qBit.
 
+La requête passe `CollapseBoxSetItems=false`. Sans ce paramètre, Jellyfin remplace les films rangés dans une collection par la collection elle-même, et ces films échappent à l'index. Sur l'installation de référence, il en manquait 189 sur 1654, et les supprimer depuis Jellyfin restait sans effet.
+
 ### Plugin Webhook
 
 Tableau de bord → Extensions → Webhook → **Add Generic Destination**
@@ -277,7 +279,7 @@ Supprimer une série entière depuis Jellyfin **n'émet qu'un seul event**, sur 
 
 Une `Series` ou une `Season` étant un dossier, elle n'a pas de ligne dans `files`. On remonte donc à ses fichiers par les colonnes `jellyfin_series_id` / `jellyfin_season_id`, renseignées sur chaque épisode pendant l'indexation (l'API Jellyfin renvoie nativement `SeriesId` et `SeasonId`).
 
-Les chemins retenus sont ensuite ramenés à leur **dossier commun**, traité en une seule passe par la branche préfixe de `move_torrents_for_path` — une seule session qBittorrent au lieu d'une par épisode. Si ce dossier commun remonte trop haut (moins de 4 segments, ce qui engloberait une racine entière), il est rejeté et chaque chemin est traité séparément.
+Les chemins retenus sont ensuite ramenés à leur **dossier commun**, traité en une seule passe par la branche préfixe de `move_torrents_for_path` — une seule session qBittorrent au lieu d'une par épisode. Si ce dossier commun remonte trop haut (moins de 5 segments, c'est-à-dire une bibliothèque entière comme `/data/Media/Séries`), il est rejeté et chaque chemin est traité séparément. C'est le cas quand Jellyfin réunit deux dossiers d'une même bibliothèque sous une seule série : la branche préfixe ratisserait alors toute la bibliothèque.
 
 C'est aussi ici que le garde-fou compte le plus : retirer une bibliothèque de Jellyfin émet le même event `Series`, mais les fichiers restent sur le disque — aucun n'est retenu, aucun torrent n'est déplacé.
 
@@ -401,7 +403,7 @@ Route dédiée `/jellyfin` — le payload Jellyfin n'a pas le même format que c
 | `ItemDeleted` | `Series`, `Season` | Résout via `jellyfin_series_id` / `jellyfin_season_id` → dossier commun → move en une passe |
 | Autre | — | Ignoré |
 
-Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visibles dans `/history` et réversibles via `/restore`.
+Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visibles dans `/history` et réversibles via `/restore?since=…`.
 
 ---
 
@@ -413,7 +415,7 @@ Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visib
 | `/sync?token=...` | POST | Token | Force une resync manuelle immédiate |
 | `/bootstrap?token=...` | POST | Token | Peuple arr_managed depuis l'historique *arr |
 | `/cleanup?token=...` | POST | Token | Déplace les torrents *arr orphelins |
-| `/restore?token=...` | POST | Token | Restaure les torrents après un cleanup raté |
+| `/restore?token=...` | POST | Token | Restaure les torrents du dernier `/cleanup` (param `since` pour élargir) |
 | `/history?token=...` | GET | Token | Historique des moves (param `limit`, défaut 50) |
 | `/stats?token=...` | GET | Token | Statistiques de la DB |
 | `/jellyfin?token=...` | POST | Token | Reçoit les events Jellyfin (param `dry_run`) |
@@ -495,11 +497,21 @@ Chaque entrée contient : `torrent_hash`, `torrent_name`, `original_cat`, `sourc
 
 ## En cas de cleanup raté
 
-Si des torrents ont été déplacés à tort vers `cleanuparr-unlinked`, l'endpoint `/restore` permet de les remettre en place. Il utilise la table `cleanup_log` comme source principale — **il fonctionne donc même après une resync** :
+Si des torrents ont été déplacés à tort vers `cleanuparr-unlinked`, l'endpoint `/restore` permet de les remettre en place. Il utilise la table `cleanup_log` comme source principale — **il fonctionne donc même après une resync**.
+
+Par défaut, il ne touche qu'aux torrents du **dernier `/cleanup`** :
 
 ```bash
 curl -XPOST 'http://192.168.1.111:5001/restore?token=VOTRE_TOKEN'
 ```
+
+Pour défaire aussi les moves venus des webhooks ou de Jellyfin, `since` (timestamp Unix) restaure tout ce qui a été tracé depuis cette date :
+
+```bash
+curl -XPOST "http://192.168.1.111:5001/restore?token=VOTRE_TOKEN&since=$(date -d '2 hours ago' +%s)"
+```
+
+Sans ce bornage, tout ce qui est dans la catégorie cible et figure au journal repartirait : des mois de suppressions légitimes, plus les torrents qu'on y laisse seeder pour honorer les trackers.
 
 Si la DB a déjà été resyncée, utilise le script `restore.py` avec les logs du cleanup :
 
