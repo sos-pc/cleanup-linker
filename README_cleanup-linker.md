@@ -263,12 +263,13 @@ Send All Properties : ✅ obligatoire
 
 Si Jellyfin n'est pas sur le réseau Docker `mediastack`, utilise l'IP de l'hôte (`http://192.168.1.111:5001`) plutôt que le nom de container.
 
-### Les deux garde-fous
+### Les trois garde-fous
 
-`ItemDeleted` ne se déclenche pas seulement sur une suppression volontaire : il part dès qu'un item quitte la base Jellyfin — refresh de métadonnées, réidentification, **retrait d'une bibliothèque**. Dans ces cas les fichiers sont toujours sur le disque.
+`ItemDeleted` ne se déclenche pas seulement sur une suppression volontaire : il part dès qu'un item quitte la base Jellyfin — refresh de métadonnées, réidentification, **retrait d'une bibliothèque**, **changement de bibliothèque**. Dans ces cas le fichier existe toujours, parfois sous un autre nom.
 
 1. **Le hardlink a-t-il vraiment disparu ?** Un `os.stat()` sur le chemin tagué. S'il répond, l'event est ignoré. C'est ce qui empêche un retrait de bibliothèque de balancer toute la collection vers `cleanuparr-unlinked`.
-2. **Le torrent sert-il encore ?** Garde-fou existant, partagé avec Sonarr/Radarr : un pack de saison dont d'autres épisodes sont encore hardlinkés n'est pas déplacé.
+2. **Le fichier a-t-il seulement changé de nom ?** Déplacer un titre vers une autre bibliothèque fait disparaître l'ancien chemin exactement comme une suppression, qu'on ait changé son dossier racine dans Sonarr/Radarr ou sa catégorie dans qBittorrent. L'index ne connaîtra le nouveau chemin qu'à la sync suivante. C'est le compteur de liens de l'inode qui tranche : une suppression le fait baisser, un déplacement le laisse intact. Si `st_nlink` dépasse le nombre de liens connus encore présents, le fichier vit ailleurs et le chemin est ignoré. Quand plus aucun lien connu ne subsiste (torrent et hardlink déplacés tous les deux), l'inode est cherché à l'emplacement actuel des torrents. Si qBittorrent ne répond pas, rien n'est fait. Sans ce garde-fou, avec la délégation activée, une série changée de bibliothèque était supprimée de Sonarr.
+3. **Le torrent sert-il encore ?** Garde-fou existant, partagé avec Sonarr/Radarr : un pack de saison dont d'autres épisodes sont encore hardlinkés n'est pas déplacé.
 
 ### Séries et saisons
 
@@ -535,6 +536,8 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 **Chemin non trouvé en DB** — Si Sonarr/Radarr supprime un fichier importé très récemment (entre deux syncs), le chemin peut ne pas être encore dans la DB locale. La prochaine sync résoudra ce cas. Force une resync manuelle si nécessaire.
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
+
+**Lien apparu depuis la sync** — Un hardlink créé depuis la dernière sync, comme un cross-seed injecté entre-temps, fait passer une vraie suppression Jellyfin pour un déplacement. Elle est ignorée et journalisée comme telle (`⏭ Ignoré : … déplacés`), et il faut alors finir la suppression côté Sonarr/Radarr. C'est le sens prudent : rien n'est supprimé à tort.
 
 **Emplacement d'un torrent** — Le champ `name` de l'API qBittorrent est un nom d'affichage, qui diffère du dossier réel dès que le `.torrent` porte un titre différent de son contenu. C'est `content_path` qui fait foi, et c'est lui qu'utilise `torrent_root()`. Sur l'installation de référence, 308 torrents sur 3269 sont dans ce cas : reconstruire le chemin avec `save_path + name` les rendait introuvables, donc non indexés — leurs fichiers apparaissaient alors comme n'appartenant à aucun torrent.
 
