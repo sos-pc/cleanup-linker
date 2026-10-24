@@ -1281,6 +1281,120 @@ def _arr_candidate_paths(paths: list[str]) -> list[str]:
     return list(paths) + sorted(liens)
 
 
+def _locate_inode(inode: int, hashes: set[str]) -> str | None:
+    """
+    Cherche un lien vers l'inode dans les torrents qui le portaient, là où ils
+    sont maintenant : un changement de catégorie qBittorrent déplace leurs données,
+    et l'index ne le saura qu'à la sync suivante.
+
+    Lève une exception si qBittorrent ne répond pas : l'appelant doit pouvoir
+    distinguer « introuvable » de « impossible à vérifier ».
+    """
+    if not hashes:
+        return None
+    with qbit_session() as s:
+        r = s.get(
+            f"{QBIT_URL}/api/v2/torrents/info",
+            params={"hashes": "|".join(sorted(hashes))},
+            timeout=10,
+        )
+        r.raise_for_status()
+        torrents = r.json()
+
+    for t in torrents:
+        racine = torrent_root(t)
+        if os.path.isfile(racine):
+            fichiers: list[str] = [racine]
+        else:
+            fichiers = [
+                os.path.join(dossier, nom)
+                for dossier, _, noms in os.walk(racine)
+                for nom in noms
+                if os.path.splitext(nom)[1].lower() in VIDEO_EXTENSIONS
+            ]
+        for f in fichiers:
+            try:
+                if os.lstat(f).st_ino == inode:
+                    return f
+            except OSError:
+                continue
+    return None
+
+
+def _moved_paths(paths: list[str]) -> set[str]:
+    """
+    Parmi des chemins disparus du disque, ceux dont le fichier existe encore ailleurs.
+
+    Changer un titre de bibliothèque Jellyfin fait disparaître l'ancien chemin
+    exactement comme une suppression, que le dossier ait été déplacé par
+    Sonarr/Radarr ou les données par un changement de catégorie qBittorrent.
+    Jellyfin émet le même ItemDeleted, et l'index ne connaîtra le nouveau chemin
+    qu'à la sync suivante. Traité comme une suppression, l'event retirerait le
+    titre de l'*arr ou enverrait ses torrents à la corbeille.
+
+    Seul le compteur de liens de l'inode distingue les deux cas : une suppression
+    le fait baisser, un déplacement le laisse intact. Si st_nlink dépasse le nombre
+    de liens connus encore présents, un lien est apparu ailleurs depuis la sync :
+    le fichier vit sous un autre nom.
+
+    Quand aucun lien connu ne subsiste — torrent et hardlink *arr déplacés tous les
+    deux —, on cherche l'inode à l'emplacement actuel des torrents. Si qBittorrent
+    ne répond pas, le doute profite au fichier : le chemin est rendu comme déplacé
+    et rien n'est fait.
+    """
+    disparus_par_inode: dict[int, list[str]] = {}
+    connus: dict[int, set[str]] = {}
+    hashes: dict[int, set[str]] = {}
+    with _db_lock:
+        with get_db() as conn:
+            for i in range(0, len(paths), _SQL_CHUNK):
+                lot = paths[i:i + _SQL_CHUNK]
+                ph = ",".join("?" * len(lot))
+                for r in conn.execute(
+                    f"SELECT f1.path AS disparu, f2.inode, f2.path, f2.torrent_hash "
+                    f"FROM files f1 JOIN files f2 ON f2.inode = f1.inode "
+                    f"WHERE f1.path IN ({ph}) AND f1.stale = 0 AND f2.stale = 0",
+                    lot,
+                ):
+                    inode = r["inode"]
+                    disparus = disparus_par_inode.setdefault(inode, [])
+                    if r["disparu"] not in disparus:
+                        disparus.append(r["disparu"])
+                    connus.setdefault(inode, set()).add(r["path"])
+                    if r["torrent_hash"]:
+                        hashes.setdefault(inode, set()).add(r["torrent_hash"])
+
+    # lstat : on compte des hardlinks, un lien symbolique n'en est pas un.
+    deplaces: set[str] = set()
+    for inode, chemins in connus.items():
+        presents = []
+        for chemin in chemins:
+            try:
+                if os.lstat(chemin).st_ino == inode:
+                    presents.append(chemin)
+            except OSError:
+                continue
+
+        sonde = presents[0] if presents else None
+        if sonde is None:
+            try:
+                sonde = _locate_inode(inode, hashes.get(inode, set()))
+            except Exception as e:
+                log.warning("  qBit injoignable, inode %d présumé déplacé : %s", inode, e)
+                deplaces.update(disparus_par_inode[inode])
+                continue
+            if sonde is None:
+                continue  # plus aucun lien nulle part : vraie suppression
+
+        try:
+            liens = os.lstat(sonde).st_nlink
+        except OSError:
+            continue
+        if liens > len(presents):
+            deplaces.update(disparus_par_inode[inode])
+    return deplaces
+
+
 def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str, Any] | None:
     """
     Traduit une suppression Jellyfin en action Sonarr/Radarr.
@@ -1658,6 +1772,20 @@ def jellyfin_webhook():
             len(paths),
         )
         return jsonify({"status": "ignored", "reason": "file still on disk"})
+
+    # Un chemin disparu peut avoir seulement changé de nom : titre déplacé vers une
+    # autre bibliothèque. Le fichier existe encore, il ne faut rien supprimer.
+    deplaces = _moved_paths(disparus)
+    if deplaces:
+        disparus = [p for p in disparus if p not in deplaces]
+        if not disparus:
+            log.info(
+                "  ⏭ Ignoré : les %d chemin(s) disparus ont été déplacés, pas supprimés "
+                "(changement de bibliothèque)",
+                len(deplaces),
+            )
+            return jsonify({"status": "ignored", "reason": "file moved"})
+        log.info("  %d chemin(s) déplacés, pas supprimés : ignorés", len(deplaces))
 
     if len(disparus) < len(paths):
         log.info(
