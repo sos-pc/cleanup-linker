@@ -207,7 +207,8 @@ Method  : POST
 Triggers: ✅ On File Delete
           ✅ On Episode File Delete For Upgrade
           ✅ On Series Delete
-          ✅ On Import Complete
+          ✅ On File Upgrade
+          ✅ On Import Complete    ← indispensable : indexe chaque import sans attendre la sync
 ```
 
 ### Radarr — Settings → Connect → + → Webhook
@@ -216,7 +217,7 @@ Triggers: ✅ On File Delete
 Name    : cleanup-linker
 URL     : http://cleanup-linker:5000/webhook?token=VOTRE_TOKEN
 Method  : POST
-Triggers: ✅ On File Import
+Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans attendre la sync
           ✅ On File Upgrade
           ✅ On Movie Delete
           ✅ On Movie File Delete
@@ -380,7 +381,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | `EpisodeFileDelete` | Suppression manuelle d'un épisode | Move vers cleanuparr-unlinked |
 | `EpisodeFileDeleteForUpgrade` | Remplacement par meilleure qualité | Move vers cleanuparr-unlinked |
 | `SeriesDelete` | Suppression d'une série entière | Move vers cleanuparr-unlinked |
-| `Download` isUpgrade=false | Import normal | Marqué arr_managed, ignoré sinon |
+| `Download` (On Import Complete) | Import normal | Marqué arr_managed, fichiers importés indexés tout de suite |
 | `Test` | Test webhook | Répond OK |
 
 ### Radarr
@@ -390,7 +391,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | `MovieFileDelete` | Suppression manuelle d'un film | Move vers cleanuparr-unlinked |
 | `MovieFileDeleteForUpgrade` | Remplacement par meilleure qualité | Move vers cleanuparr-unlinked |
 | `MovieDelete` | Suppression d'un film entier | Move vers cleanuparr-unlinked |
-| `Download` isUpgrade=false | Import normal | Marqué arr_managed, ignoré sinon |
+| `Download` isUpgrade=false | Import normal | Marqué arr_managed, fichier importé indexé tout de suite |
 | `Test` | Test webhook | Répond OK |
 
 ### Jellyfin
@@ -545,7 +546,16 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 
 ## Limites connues
 
-**Chemin non trouvé en DB** — Si Sonarr/Radarr supprime un fichier importé très récemment (entre deux syncs), le chemin peut ne pas être encore dans la DB locale. La prochaine sync résoudra ce cas. Force une resync manuelle si nécessaire.
+**Chemin non trouvé en DB** — La sync ne passe que toutes les 12 h. Pour qu'un fichier supprimé peu après son import soit retrouvé, l'event `Download` de Sonarr/Radarr l'indexe tout de suite. Cleanup-linker rattache alors le fichier importé au torrent dont il est un hardlink, à partir de son inode et du `downloadId`.
+
+Le message reste possible dans trois cas :
+- **Import non signalé :** le webhook ne coche pas « On Import Complete » (Sonarr) ou « On File Import » (Radarr).
+- **Fichier hors import :** copie manuelle, ou copie au lieu d'un hardlink.
+- **qBittorrent injoignable** au moment de l'import.
+
+La suppression ne déplace alors rien. Le torrent devenu orphelin attend le prochain `/cleanup`.
+
+Côté Jellyfin, un média ajouté depuis la dernière sync reste `unresolved` : son `ItemId` n'est connu qu'à l'indexation suivante. `/jellyfin/index` force cette indexation.
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
 
