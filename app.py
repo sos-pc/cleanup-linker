@@ -594,6 +594,19 @@ def scan_torrent_files(
 
 # ── Sync principale ──────────────────────────────────────────────────────────
 
+# Partagée avec index_import : un fichier indexé à l'import doit porter exactement
+# la même ligne que celle que la sync suivante écrira.
+_UPSERT_FILES = """
+    INSERT INTO files (inode, path, torrent_hash, torrent_name, category, stale, updated_at)
+    VALUES (?, ?, ?, ?, ?, 0, strftime('%s','now'))
+    ON CONFLICT(path, torrent_hash) DO UPDATE SET
+        inode = excluded.inode,
+        torrent_name = excluded.torrent_name,
+        category = excluded.category,
+        stale = 0,
+        updated_at = strftime('%s','now')
+"""
+
 
 def sync_db() -> None:
     """
@@ -688,18 +701,7 @@ def sync_db() -> None:
             conn.execute("UPDATE files SET stale = 1")
 
             # Insère les nouvelles rows (ou met à jour si (path, torrent_hash) existe)
-            conn.executemany(
-                """INSERT INTO files (inode, path, torrent_hash, torrent_name, category, stale, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 0, strftime('%s','now'))
-                   ON CONFLICT(path, torrent_hash) DO UPDATE SET
-                       inode = excluded.inode,
-                       torrent_name = excluded.torrent_name,
-                       category = excluded.category,
-                       stale = 0,
-                       updated_at = strftime('%s','now')
-                """,
-                rows,
-            )
+            conn.executemany(_UPSERT_FILES, rows)
 
             # Purge les rows stale (plus présentes sur le filesystem)
             stale_count = conn.execute("SELECT COUNT(*) FROM files WHERE stale = 1").fetchone()[0]
@@ -1605,6 +1607,100 @@ def _check_hardlinks_active(root: str, inodes_to_ignore: list[int]) -> bool:
 # ── Validation des payloads webhook ──────────────────────────────────────────
 
 
+# ── Indexation à l'import ────────────────────────────────────────────────────
+
+
+def _imported_paths(data: dict[str, Any]) -> list[str]:
+    """Chemins des fichiers qu'un event Download de Sonarr/Radarr vient d'importer."""
+    files = [data[k] for k in ("episodeFile", "movieFile") if isinstance(data.get(k), dict)]
+    files += [f for f in data.get("episodeFiles") or [] if isinstance(f, dict)]
+    folder = ((data.get("movie") or {}).get("folderPath") or "").rstrip("/")
+
+    paths: list[str] = []
+    for f in files:
+        path = f.get("path")
+        if not path and folder and f.get("relativePath"):
+            path = f"{folder}/{f['relativePath']}"
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def index_import(data: dict[str, Any]) -> int:
+    """
+    Indexe tout de suite les fichiers d'un import *arr, sans attendre la sync.
+
+    Un fichier importé puis supprimé avant la sync suivante n'avait aucune ligne
+    dans `files` : la suppression tombait sur « Chemin non trouvé en DB » et le
+    torrent restait dans sa catégorie (5 cas en trois jours sur l'installation de
+    référence). L'event donne le chemin importé et le hash du torrent ; l'inode
+    relie l'un à l'autre.
+
+    On ne retient que ce que la sync aurait trouvé : un hardlink sous /data/Media
+    d'un fichier du torrent. Une copie, qui a son propre inode, n'est pas rattachée.
+
+    Retourne le nombre de lignes écrites. Ne lève jamais : un échec ici ne doit pas
+    faire échouer le webhook, et la sync suivante rattrapera.
+    """
+    download_id = (data.get("downloadId") or "").lower().strip()
+    paths = [p for p in _imported_paths(data) if p.startswith("/data/Media/")]
+    if not download_id or not paths:
+        return 0
+
+    try:
+        with qbit_session() as s:
+            r = s.get(
+                f"{QBIT_URL}/api/v2/torrents/info",
+                params={"hashes": download_id},
+                timeout=10,
+            )
+            r.raise_for_status()
+            infos = r.json()
+        if not infos:
+            log.info("  Import non indexé : torrent %s absent de qBittorrent", download_id[:8])
+            return 0
+        t = infos[0]
+
+        racine = torrent_root(t)
+        if os.path.isfile(racine):
+            fichiers = [racine]
+        else:
+            fichiers = [
+                os.path.join(dossier, nom)
+                for dossier, _, noms in os.walk(racine)
+                for nom in noms
+                if os.path.splitext(nom)[1].lower() in VIDEO_EXTENSIONS
+            ]
+        seed_par_inode: dict[int, str] = {}
+        for f in fichiers:
+            try:
+                seed_par_inode.setdefault(os.lstat(f).st_ino, f)
+            except OSError:
+                continue
+
+        rows: list[tuple[int, str, str, str, str]] = []
+        for path in paths:
+            try:
+                inode = os.lstat(path).st_ino
+            except OSError:
+                continue
+            seed = seed_par_inode.get(inode)
+            if not seed:
+                log.info("  Import non indexé : %s n'est pas un hardlink du torrent", path)
+                continue
+            for p in (path, seed):
+                rows.append((inode, p, t["hash"], t.get("name", ""), t.get("category", "")))
+
+        if rows:
+            with _db_lock:
+                with get_db() as conn:
+                    conn.executemany(_UPSERT_FILES, rows)
+        return len(rows)
+    except Exception as e:
+        log.error("  Indexation de l'import impossible, la sync rattrapera : %s", e)
+        return 0
+
+
 def _validate_webhook_payload(data: Any) -> tuple[bool, str]:
     """Valide la structure minimale d'un payload webhook Sonarr/Radarr."""
     if not isinstance(data, dict):
@@ -1685,9 +1781,12 @@ def webhook():
             return jsonify({"moved": n, "path": path})
 
     elif event == "Download":
+        # Le fichier importé est indexé tout de suite : une suppression qui
+        # suivrait avant la prochaine sync doit pouvoir le retrouver.
+        indexed = index_import(data)
         if not is_upgrade:
-            log.info("Import simple ignoré")
-            return jsonify({"status": "ignored", "reason": "not an upgrade"})
+            log.info("Import simple : %d ligne(s) indexée(s)", indexed)
+            return jsonify({"status": "indexed", "rows": indexed})
 
         log.info("Upgrade détecté (event Download)")
         moved = 0
@@ -1699,7 +1798,7 @@ def webhook():
                     log.info("Fichier remplacé: %s", path)
                     moved += move_torrents_for_path(path)
 
-        return jsonify({"moved": moved, "event": "DownloadUpgrade"})
+        return jsonify({"moved": moved, "event": "DownloadUpgrade", "rows": indexed})
 
     return jsonify({"status": "ignored", "event": event})
 
