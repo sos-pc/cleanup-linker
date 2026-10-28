@@ -212,12 +212,15 @@ networks:
 Name    : cleanup-linker
 URL     : http://cleanup-linker:5000/webhook?token=VOTRE_TOKEN
 Method  : POST
-Triggers: ✅ On File Delete
-          ✅ On Episode File Delete For Upgrade
+Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans attendre la sync
+          ✅ On File Upgrade      ← signale le fichier remplacé, une fois le nouveau en place
           ✅ On Series Delete
-          ✅ On File Upgrade
-          ✅ On Import Complete    ← indispensable : indexe chaque import sans attendre la sync
+          ✅ On Episode File Delete
+          ❌ On Episode File Delete For Upgrade   ← laisser décoché (voir Limites connues)
+          ❌ On Import Complete   ← inutile : doublon de On File Import
 ```
+
+Dans Sonarr, « On File Upgrade » n'envoie rien si « On File Import » n'est pas coché : c'est un filtre de cet event. Et « On Import Complete » ne dit pas quels fichiers un upgrade a remplacés.
 
 ### Radarr — Settings → Connect → + → Webhook
 
@@ -226,10 +229,10 @@ Name    : cleanup-linker
 URL     : http://cleanup-linker:5000/webhook?token=VOTRE_TOKEN
 Method  : POST
 Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans attendre la sync
-          ✅ On File Upgrade
+          ✅ On File Upgrade      ← signale le fichier remplacé, une fois le nouveau en place
           ✅ On Movie Delete
           ✅ On Movie File Delete
-          ✅ On Movie File Delete For Upgrade
+          ❌ On Movie File Delete For Upgrade   ← laisser décoché (voir Limites connues)
 ```
 
 ---
@@ -387,9 +390,11 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | Event | Déclencheur | Action |
 |---|---|---|
 | `EpisodeFileDelete` | Suppression manuelle d'un épisode | Move vers cleanuparr-unlinked |
-| `EpisodeFileDeleteForUpgrade` | Remplacement par meilleure qualité | Move vers cleanuparr-unlinked |
 | `SeriesDelete` | Suppression d'une série entière | Move vers cleanuparr-unlinked |
-| `Download` (On Import Complete) | Import normal | Marqué arr_managed, fichiers importés indexés tout de suite |
+| `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
+| `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
+| `Download` avec `episodeFiles` | On Import Complete, s'il est coché | Fichiers importés indexés |
+| `EpisodeFileDelete` deleteReason=upgrade | On Episode File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
 | `Test` | Test webhook | Répond OK |
 
 ### Radarr
@@ -397,9 +402,10 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | Event | Déclencheur | Action |
 |---|---|---|
 | `MovieFileDelete` | Suppression manuelle d'un film | Move vers cleanuparr-unlinked |
-| `MovieFileDeleteForUpgrade` | Remplacement par meilleure qualité | Move vers cleanuparr-unlinked |
 | `MovieDelete` | Suppression d'un film entier | Move vers cleanuparr-unlinked |
-| `Download` isUpgrade=false | Import normal | Marqué arr_managed, fichier importé indexé tout de suite |
+| `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
+| `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
+| `MovieFileDelete` deleteReason=upgrade | On Movie File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
 | `Test` | Test webhook | Répond OK |
 
 ### Jellyfin
@@ -557,7 +563,7 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 **Chemin non trouvé en DB** — La sync ne passe que toutes les 12 h. Pour qu'un fichier supprimé peu après son import soit retrouvé, l'event `Download` de Sonarr/Radarr l'indexe tout de suite. Cleanup-linker rattache alors le fichier importé au torrent dont il est un hardlink, à partir de son inode et du `downloadId`.
 
 Le message reste possible dans trois cas :
-- **Import non signalé :** le webhook ne coche pas « On Import Complete » (Sonarr) ou « On File Import » (Radarr).
+- **Import non signalé :** le webhook ne coche pas « On File Import ».
 - **Fichier hors import :** copie manuelle, ou copie au lieu d'un hardlink.
 - **qBittorrent injoignable** au moment de l'import.
 
@@ -567,7 +573,7 @@ Côté Jellyfin, un média ajouté depuis la dernière sync reste `unresolved` :
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
 
-**Upgrade vers la même release** — Les events « Delete For Upgrade » arrivent avant l'import du nouveau fichier. Si cross-seed a déjà indexé le nouveau torrent à ce moment-là, il porte le même nom que l'ancien : les deux font partie du lot et partent ensemble en corbeille, et l'import échoue. En pratique, le nouveau torrent n'a qu'une minute ou deux. Décocher « On Movie File Delete For Upgrade » (Radarr) et « On Episode File Delete For Upgrade » (Sonarr) ferme cette course, à condition de garder « On Upgrade » : l'ancien fichier est alors traité par l'event d'import (`isUpgrade`, `deletedFiles`), une fois le nouveau en place.
+**Upgrade vers la même release** — Pendant un upgrade, Sonarr et Radarr suppriment l'ancien fichier, puis créent le hardlink du nouveau. « Delete For Upgrade » part entre les deux. Une même release prise sur un autre tracker partage les fichiers de l'ancien torrent. Si cross-seed l'a déjà enregistrée, elle porte le même nom : elle entre dans le lot, les deux torrents partent en corbeille avec les fichiers, et l'import échoue. « On File Upgrade » part après le hardlink. Le nouveau fichier est alors indexé d'abord, puis la vérification des hardlinks garde les deux torrents. C'est pourquoi la configuration ci-dessus laisse « Delete For Upgrade » décoché. Dans Sonarr, cela suppose « On File Import » coché : sans lui, plus rien ne signalerait les fichiers remplacés, et l'ancien torrent resterait hors de la corbeille.
 
 **Lien apparu depuis la sync** — Un hardlink créé depuis la dernière sync, comme un cross-seed injecté entre-temps, fait passer une vraie suppression Jellyfin pour un déplacement. Elle est ignorée et journalisée comme telle (`⏭ Ignoré : … déplacés`), et il faut alors finir la suppression côté Sonarr/Radarr. C'est le sens prudent : rien n'est supprimé à tort.
 
