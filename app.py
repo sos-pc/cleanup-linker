@@ -472,6 +472,40 @@ def qbit_get_torrents(s: requests.Session) -> list[dict[str, Any]]:
     return r.json()
 
 
+def _shared_content(
+    hashes: set[str], torrents: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """
+    Torrents du lot `hashes` dont les données sont aussi celles d'un torrent hors du
+    lot, associés à ce torrent.
+
+    Une même release prise sur deux trackers atterrit au même endroit : le second
+    torrent réutilise les fichiers du premier. Changer la catégorie de l'un fait
+    déplacer ces fichiers par ATM — la corbeille a son propre dossier — et l'autre
+    reste en seed sur du vide. C'est arrivé sur un upgrade Radarr vers la même
+    release : l'ancien torrent est parti en corbeille avec le fichier du nouveau.
+    Le jumeau peut dater d'après la dernière sync, d'où la lecture de qBit plutôt
+    que de l'index.
+    """
+    lot = {h.lower() for h in hashes}
+    par_racine: dict[str, list[dict[str, Any]]] = {}
+    for t in torrents:
+        par_racine.setdefault(torrent_root(t), []).append(t)
+
+    partages: dict[str, dict[str, Any]] = {}
+    for t in torrents:
+        h = t.get("hash", "").lower()
+        if h not in lot:
+            continue
+        autre = next(
+            (o for o in par_racine[torrent_root(t)] if o.get("hash", "").lower() not in lot),
+            None,
+        )
+        if autre is not None:
+            partages[h] = autre
+    return partages
+
+
 # ── Backup DB ─────────────────────────────────────────────────────────────────
 
 
@@ -1499,19 +1533,17 @@ def move_torrents_for_path(
 
     try:
         with qbit_session() as s:
+            qbit_torrents = qbit_get_torrents(s)
+            infos = {x["hash"].lower(): x for x in qbit_torrents}
             safe_to_move: list[dict[str, Any]] = []
 
             for t in all_torrents:
-                torrent_info = s.get(
-                    f"{QBIT_URL}/api/v2/torrents/info",
-                    params={"hashes": t["info_hash"]},
-                    timeout=10,
-                ).json()
+                torrent_info = infos.get(t["info_hash"].lower())
                 if not torrent_info:
                     safe_to_move.append(t)
                     continue
 
-                root = torrent_root(torrent_info[0])
+                root = torrent_root(torrent_info)
                 still_linked = False
 
                 if check_links:
@@ -1522,8 +1554,16 @@ def move_torrents_for_path(
                 else:
                     safe_to_move.append(t)
 
+            partages = _shared_content({t["info_hash"] for t in safe_to_move}, qbit_torrents)
+            for t in safe_to_move:
+                autre = partages.get(t["info_hash"].lower())
+                if autre:
+                    log.info("  ⏭ [%s] %s ignoré (fichiers partagés avec [%s] %s)",
+                             t.get("category", "?"), t["name"], autre.get("category", "?"), autre.get("name", "?"))
+            safe_to_move = [t for t in safe_to_move if t["info_hash"].lower() not in partages]
+
             if not safe_to_move:
-                log.info("  → Aucun torrent à déplacer (tous ont des hardlinks actifs)")
+                log.info("  → Aucun torrent à déplacer (hardlinks actifs ou fichiers partagés)")
                 return 0
 
             if dry_run:
@@ -2161,6 +2201,23 @@ def cleanup_orphans():
                     log.info("    ⏳ %s", t["torrent_name"])
             log.info("Étape 4 (délai de grâce) : %.2fs", time.time() - t4)
 
+        # ── Étape 5 : fichiers partagés ──────────────────────────────────────
+        # Un orphelin peut occuper le même emplacement qu'un torrent qui, lui,
+        # sert encore : le déplacer emporterait ses fichiers (_shared_content).
+        if torrents:
+            try:
+                with qbit_session() as s:
+                    partages = _shared_content({t["torrent_hash"] for t in torrents}, qbit_get_torrents(s))
+            except Exception as e:
+                log.error("⚠️ Cleanup interrompu : impossible de vérifier les fichiers partagés (%s)", e)
+                return
+            for t in torrents:
+                autre = partages.get(t["torrent_hash"].lower())
+                if autre:
+                    log.info("  ⏭ [%s] %s ignoré (fichiers partagés avec [%s] %s)",
+                             t["category"], t["torrent_name"], autre.get("category", "?"), autre.get("name", "?"))
+            torrents = [t for t in torrents if t["torrent_hash"].lower() not in partages]
+
         if not torrents:
             log.info("%sAucun torrent orphelin trouvé.", prefix)
             return
@@ -2282,10 +2339,21 @@ def restore_last_cleanup():
                     for r in file_rows:
                         hash_to_cat[r["torrent_hash"]] = (r["torrent_name"], r["category"])
 
+                # Même garde-fou qu'à l'aller : remettre un torrent dans sa catégorie
+                # déplace ses fichiers, au détriment d'un jumeau resté en corbeille.
+                partages = _shared_content(
+                    {h for h in hash_to_cat if h in in_target}, all_torrents
+                )
+
                 # Regroupe par catégorie d'origine
                 by_cat: dict[str, list[dict[str, str]]] = {}
                 for h, (name, cat) in hash_to_cat.items():
                     if h not in in_target:
+                        continue
+                    autre = partages.get(h.lower())
+                    if autre:
+                        log.info("  ⏭ [%s] %s non restauré (fichiers partagés avec [%s] %s)",
+                                 TARGET_CAT, name, autre.get("category", "?"), autre.get("name", "?"))
                         continue
                     by_cat.setdefault(cat, []).append({"hash": h, "name": name})
 

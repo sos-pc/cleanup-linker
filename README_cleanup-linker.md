@@ -84,16 +84,24 @@ Contient dans `client_searchee` tous les torrents présents dans qBit avec leur 
    → trouve les cross-seeds (même nom, hash différent)
         │
         ▼
-6. qBit API : setCategory(tous les hashes, "cleanuparr-unlinked")
+6. qBit API : écarte tout torrent dont l'emplacement
+   sert aussi à un torrent hors du lot
         │
         ▼
-7. DB locale : DELETE WHERE inode = ?
+7. qBit API : setCategory(tous les hashes, "cleanuparr-unlinked")
         │
         ▼
-8. cleanuparr prend le relais selon sa propre logique
+8. DB locale : DELETE WHERE inode = ?
+        │
+        ▼
+9. cleanuparr prend le relais selon sa propre logique
 ```
 
 Le webhook marque également le `downloadId` de chaque event dans la table `arr_managed` — ce qui garantit que les futurs `/cleanup` ne toucheront jamais les torrents ajoutés manuellement.
+
+L'étape 6 protège les **torrents jumeaux**. Une même release prise sur deux trackers atterrit au même endroit, et le second torrent réutilise les fichiers du premier. La corbeille a son propre dossier : y passer l'un fait déplacer ces fichiers par ATM, et l'autre reste en seed sur du vide. C'est arrivé sur un upgrade Radarr vers la même release : la suppression de l'ancien fichier a envoyé l'ancien torrent en corbeille, avec le fichier que le nouveau allait importer.
+
+Le jumeau peut être plus récent que la dernière sync. Le contrôle lit donc la liste qBittorrent au moment du move, et compare les `content_path`. Un torrent écarté reste en place et le log l'indique (`⏭ … fichiers partagés avec …`). Les deux partiront ensemble au `/cleanup` suivant, une fois indexés. `/cleanup` et `/restore` appliquent le même contrôle.
 
 ### Sync automatique
 
@@ -558,6 +566,8 @@ La suppression ne déplace alors rien. Le torrent devenu orphelin attend le proc
 Côté Jellyfin, un média ajouté depuis la dernière sync reste `unresolved` : son `ItemId` n'est connu qu'à l'indexation suivante. `/jellyfin/index` force cette indexation.
 
 **Torrents multi-saisons** — Certains torrents qBit regroupent plusieurs saisons sous un même nom de dossier. L'association inode peut être incomplète dans ces cas.
+
+**Upgrade vers la même release** — Les events « Delete For Upgrade » arrivent avant l'import du nouveau fichier. Si cross-seed a déjà indexé le nouveau torrent à ce moment-là, il porte le même nom que l'ancien : les deux font partie du lot et partent ensemble en corbeille, et l'import échoue. En pratique, le nouveau torrent n'a qu'une minute ou deux. Décocher « On Movie File Delete For Upgrade » (Radarr) et « On Episode File Delete For Upgrade » (Sonarr) ferme cette course, à condition de garder « On Upgrade » : l'ancien fichier est alors traité par l'event d'import (`isUpgrade`, `deletedFiles`), une fois le nouveau en place.
 
 **Lien apparu depuis la sync** — Un hardlink créé depuis la dernière sync, comme un cross-seed injecté entre-temps, fait passer une vraie suppression Jellyfin pour un déplacement. Elle est ignorée et journalisée comme telle (`⏭ Ignoré : … déplacés`), et il faut alors finir la suppression côté Sonarr/Radarr. C'est le sens prudent : rien n'est supprimé à tort.
 
