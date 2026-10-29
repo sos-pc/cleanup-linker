@@ -189,9 +189,9 @@ networks:
 | `SYNC_INTERVAL_HOURS` | `12` | Fréquence de resync en heures |
 | `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`. `0` désactive |
 | `VIDEO_EXTENSIONS` | voir ci-dessous | Extensions indexées, séparées par des virgules. Le point initial et la casse sont optionnels |
-| `SONARR_URL` | — | URL Sonarr (requis pour `/bootstrap`) |
+| `SONARR_URL` | — | URL Sonarr (requis pour `/bootstrap` et l'assistant d'import) |
 | `SONARR_API_KEY` | — | Clé API Sonarr (Settings → General) |
-| `RADARR_URL` | — | URL Radarr (requis pour `/bootstrap`) |
+| `RADARR_URL` | — | URL Radarr (requis pour `/bootstrap` et l'assistant d'import) |
 | `RADARR_API_KEY` | — | Clé API Radarr (Settings → General) |
 | `JELLYFIN_URL` | — | URL Jellyfin. Vide = suppressions Jellyfin désactivées |
 | `JELLYFIN_API_KEY` | — | Clé API Jellyfin (Tableau de bord → Clés API) |
@@ -201,6 +201,8 @@ networks:
 | `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série/saison, qui compte légitimement beaucoup de fichiers |
 | `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit la suppression en action Sonarr/Radarr au lieu de déplacer les torrents directement |
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
+| `IMPORT_ASSIST_DRY_RUN` | `true` | Assistant d'import en simulation : il journalise ce qu'il ferait, sans agir |
+| `IMPORT_ASSIST_INTERVAL_MINUTES` | `30` | Fréquence de passage de l'assistant d'import. `0` désactive le passage régulier |
 
 ---
 
@@ -218,6 +220,7 @@ Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans
           ✅ On Episode File Delete
           ❌ On Episode File Delete For Upgrade   ← laisser décoché (voir Limites connues)
           ❌ On Import Complete   ← inutile : doublon de On File Import
+          ✅ On Manual Interaction Required   ← facultatif : passage immédiat de l'assistant d'import
 ```
 
 Dans Sonarr, « On File Upgrade » n'envoie rien si « On File Import » n'est pas coché : c'est un filtre de cet event. Et « On Import Complete » ne dit pas quels fichiers un upgrade a remplacés.
@@ -233,6 +236,7 @@ Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans
           ✅ On Movie Delete
           ✅ On Movie File Delete
           ❌ On Movie File Delete For Upgrade   ← laisser décoché (voir Limites connues)
+          ✅ On Manual Interaction Required   ← facultatif : passage immédiat de l'assistant d'import
 ```
 
 ---
@@ -383,6 +387,43 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 
 ---
 
+## Assistant d'import
+
+Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file, à l'état `importBlocked`. L'*arr attend une intervention, et tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. L'assistant passe régulièrement sur ces téléchargements bloqués, et règle ceux qui peuvent l'être sans risque.
+
+**Simulation par défaut** : il journalise ce qu'il ferait (`[SIMULATION] ✓ …`), sans rien changer. `IMPORT_ASSIST_DRY_RUN=false` le fait agir.
+
+### Règle 1 : déjà importé, mais resté coincé
+
+Chaque vidéo du torrent a déjà un hardlink dans le dossier du média du grab. La comparaison se fait par inode, sans aucun nom de fichier, et les échantillons ne comptent pas. Cas typiques :
+- un pack « S01 » qui n'apporte qu'une partie de la saison TVDB, comme une partie Netflix d'un anime. L'*arr a importé ce qu'il contenait, mais attend les épisodes manquants et garde le téléchargement ;
+- un import fait à la main, sans rattacher le téléchargement.
+
+L'assistant :
+1. passe le torrent dans la catégorie après import de son client, celle que l'*arr aurait posée lui-même. Le torrent sort de la file et continue de seeder ;
+2. pour Sonarr, lance la recherche des épisodes que la release devait apporter et qui manquent encore, s'ils sont surveillés et déjà diffusés.
+
+Il ne fait rien si :
+- une seule vidéo manque dans la bibliothèque, ou n'y figure que sous un autre média ;
+- le torrent est incomplet ou absent de qBittorrent ;
+- le client n'a pas de catégorie après import, ou si celle-ci a un autre dossier que la catégorie actuelle : la règle ne déplace jamais rien sur le disque ;
+- il a déjà agi sur ce téléchargement dans les dernières 24 h.
+
+Rien n'est importé ni supprimé. Chaque verdict est journalisé une fois par jour, et se relit avec `/assist/history` :
+
+```
+INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : 12/12 vidéo(s) déjà dans la bibliothèque → [seed] Séries animation, recherche de 12 épisode(s) manquant(s)
+INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
+```
+
+### Déclenchement
+
+- Un passage régulier, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (30 par défaut, `0` le désactive).
+- `POST /assist?token=…` lance un passage tout de suite et renvoie les verdicts. `&dry_run=false` agit même si le service est en simulation ; `&dry_run=true` simule même s'il est actif.
+- L'event « On Manual Interaction Required » de Sonarr ou Radarr, s'il est coché dans le webhook, déclenche un passage immédiat.
+
+---
+
 ## Événements gérés
 
 ### Sonarr
@@ -395,6 +436,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `Download` avec `episodeFiles` | On Import Complete, s'il est coché | Fichiers importés indexés |
 | `EpisodeFileDelete` deleteReason=upgrade | On Episode File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
+| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required, s'il est coché) | Passage immédiat de l'assistant d'import |
 | `Test` | Test webhook | Répond OK |
 
 ### Radarr
@@ -406,6 +448,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 | `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `MovieFileDelete` deleteReason=upgrade | On Movie File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
+| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required, s'il est coché) | Passage immédiat de l'assistant d'import |
 | `Test` | Test webhook | Répond OK |
 
 ### Jellyfin
@@ -434,6 +477,8 @@ Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visib
 | `/history?token=...` | GET | Token | Historique des moves (param `limit`, défaut 50) |
 | `/stats?token=...` | GET | Token | Statistiques de la DB |
 | `/jellyfin?token=...` | POST | Token | Reçoit les events Jellyfin (param `dry_run`) |
+| `/assist?token=...` | POST | Token | Lance un passage de l'assistant d'import et renvoie ses verdicts (param `dry_run`) |
+| `/assist/history?token=...` | GET | Token | Derniers verdicts de l'assistant d'import (param `limit`, défaut 50) |
 | `/jellyfin/index?token=...` | POST | Token | Force la réindexation Jellyfin |
 | `/health` | GET | Non | Healthcheck |
 

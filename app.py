@@ -18,6 +18,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -73,6 +74,12 @@ SONARR_URL = os.getenv("SONARR_URL", "")
 SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 RADARR_URL = os.getenv("RADARR_URL", "")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
+
+# Assistant d'import : passe régulièrement sur les téléchargements bloqués des
+# files Sonarr/Radarr. Simulation par défaut — il journalise ce qu'il ferait,
+# sans rien changer. 0 minute désactive le passage régulier (/assist reste utilisable).
+IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").lower() in ("1", "true", "yes")
+IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "30")) * 60
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -215,6 +222,18 @@ def init_db() -> None:
                     torrents_count INTEGER,
                     duration_s     REAL
                 );
+
+                CREATE TABLE IF NOT EXISTS assist_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    download_id TEXT    NOT NULL,
+                    arr         TEXT,
+                    title       TEXT,
+                    decision    TEXT,
+                    details     TEXT,
+                    dry_run     INTEGER,
+                    at          INTEGER DEFAULT (strftime('%s','now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_assist_dl ON assist_log(download_id);
             """)
             # Migration : si l'ancienne table files a UNIQUE(path), on la recrée
             # Détecte si la contrainte unique est sur path seul
@@ -1741,6 +1760,279 @@ def index_import(data: dict[str, Any]) -> int:
         return 0
 
 
+# ── Assistant d'import ───────────────────────────────────────────────────────
+
+# Un téléchargement dans cet état n'avancera plus seul : l'*arr a tenté l'import
+# et attend une intervention. Ceux en cours de téléchargement ou d'import ne
+# sont jamais touchés.
+_ASSIST_STATES = {"importBlocked"}
+# Un même verdict n'est journalisé qu'une fois par jour, et une action réelle
+# n'est jamais rejouée dans ce délai.
+_ASSIST_REPEAT = 24 * 3600
+_SAMPLE_RE = re.compile(r"(^|[\W_])samples?([\W_]|$)", re.IGNORECASE)
+_assist_started = threading.Event()
+_assist_lock = threading.Lock()
+
+
+def _assist_arrs() -> list[tuple[str, str, str]]:
+    """(nom, URL, clé) des *arr configurés."""
+    return [
+        (nom, url, cle)
+        for nom, url, cle in (
+            ("sonarr", SONARR_URL, SONARR_API_KEY),
+            ("radarr", RADARR_URL, RADARR_API_KEY),
+        )
+        if url and cle
+    ]
+
+
+def _torrent_videos(t: dict[str, Any]) -> list[str]:
+    """Vidéos d'un torrent, échantillons exclus : aucun *arr ne les importe."""
+    racine = torrent_root(t)
+    if os.path.isfile(racine):
+        fichiers = [racine]
+    else:
+        fichiers = [os.path.join(d, n) for d, _, noms in os.walk(racine) for n in noms]
+    return [
+        f
+        for f in fichiers
+        if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
+        and not _SAMPLE_RE.search(os.path.basename(f) if f == racine else os.path.relpath(f, racine))
+    ]
+
+
+def _media_inodes(dossier: str) -> set[tuple[int, int]]:
+    """(device, inode) des vidéos d'un dossier de série ou de film."""
+    vus: set[tuple[int, int]] = set()
+    for d, _, noms in os.walk(dossier):
+        for n in noms:
+            if os.path.splitext(n)[1].lower() not in VIDEO_EXTENSIONS:
+                continue
+            try:
+                st = os.stat(os.path.join(d, n))
+            except OSError:
+                continue
+            vus.add((st.st_dev, st.st_ino))
+    return vus
+
+
+def _imported_category(clients: list[dict[str, Any]], nom: str) -> str:
+    """Catégorie après import du client *arr : celle qu'il aurait posée lui-même."""
+    for c in clients:
+        if c.get("name") != nom:
+            continue
+        for f in c.get("fields") or []:
+            # tvImportedCategory (Sonarr), movieImportedCategory (Radarr)
+            if f.get("name", "").endswith("ImportedCategory") and f.get("value"):
+                return f["value"]
+    return ""
+
+
+def _assist_seen(download_id: str, decision: str, dry_run: bool) -> bool:
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                "SELECT 1 FROM assist_log WHERE download_id = ? AND decision = ? "
+                "AND dry_run = ? AND at > ?",
+                (download_id, decision, int(dry_run), int(time.time()) - _ASSIST_REPEAT),
+            ).fetchone() is not None
+
+
+def _assist_record(download_id: str, arr: str, title: str, decision: str,
+                   details: str, dry_run: bool) -> None:
+    with _db_lock:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO assist_log (download_id, arr, title, decision, details, dry_run) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (download_id, arr, title, decision, details, int(dry_run)),
+            )
+
+
+def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> list[dict[str, Any]]:
+    """
+    Un passage de l'assistant d'import sur les files Sonarr/Radarr.
+
+    Règle 1 — déjà importé mais coincé : chaque vidéo du torrent a déjà un hardlink
+    dans le dossier du média. C'est le cas d'un pack « S01 » qui n'apporte qu'une
+    partie d'une saison TVDB (l'*arr attend les épisodes manquants et garde le
+    téléchargement), ou d'un import fait à la main sans son téléchargement.
+    Le torrent passe dans la catégorie après import de son client, ce qui le sort
+    de la file : tant qu'il y restait, l'*arr refusait les releases des épisodes
+    manquants, que Sonarr cherche alors.
+
+    La correspondance se fait par inode, sans aucun nom de fichier. Rien n'est
+    importé, rien n'est supprimé, rien ne bouge sur le disque.
+    Retourne un verdict par téléchargement bloqué.
+    """
+    dry_run = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
+    if not _assist_lock.acquire(blocking=False):
+        log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
+        return []
+    try:
+        try:
+            with qbit_session() as s:
+                torrents = {t["hash"].lower(): t for t in qbit_get_torrents(s)}
+                r = s.get(f"{QBIT_URL}/api/v2/torrents/categories", timeout=10)
+                r.raise_for_status()
+                categories = {
+                    nom: (info.get("savePath") or "").rstrip("/") for nom, info in r.json().items()
+                }
+        except Exception as e:
+            log.error("Assistant d'import : qBittorrent injoignable (%s)", e)
+            return []
+
+        ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run}
+        verdicts: list[dict[str, Any]] = []
+        nouveaux = 0
+        for arr, url, cle in _assist_arrs():
+            try:
+                for verdict, nouveau in _assist_arr(arr, url, cle, ctx):
+                    verdicts.append(verdict)
+                    nouveaux += nouveau
+            except Exception as e:
+                log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
+        if nouveaux:
+            log.info(
+                "=== Assistant d'import%s (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
+                " [SIMULATION]" if dry_run else "", source, len(verdicts), nouveaux,
+            )
+        return verdicts
+    finally:
+        _assist_lock.release()
+
+
+def _assist_arr(arr: str, url: str, cle: str, ctx: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
+    """Verdicts pour les téléchargements bloqués d'un *arr. Un téléchargement = plusieurs lignes de file."""
+    # Sans les éléments « inconnus » : quand Sonarr et Radarr partagent une
+    # catégorie, chacun liste les téléchargements de l'autre, sans média.
+    file = _arr_request("GET", url, cle, "queue", params={"page": 1, "pageSize": 1000}) or {}
+    bloques: dict[str, list[dict[str, Any]]] = {}
+    for r in file.get("records") or []:
+        if r.get("downloadId") and r.get("trackedDownloadState") in _ASSIST_STATES:
+            bloques.setdefault(r["downloadId"].lower(), []).append(r)
+    if not bloques:
+        return []
+    clients = _arr_request("GET", url, cle, "downloadclient") or []
+    dossiers: dict[int, tuple[str, set[tuple[int, int]]]] = {}
+    return [
+        _assist_download(arr, url, cle, dl, records, clients, dossiers, ctx)
+        for dl, records in bloques.items()
+    ]
+
+
+def _assist_download(
+    arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]],
+    clients: list[dict[str, Any]], dossiers: dict[int, tuple[str, set[tuple[int, int]]]],
+    ctx: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Applique la règle 1 à un téléchargement. Retourne (verdict, journalisé maintenant)."""
+    dry_run = ctx["dry_run"]
+    titre = records[0].get("title") or dl
+    prefix = "[SIMULATION] " if dry_run else ""
+    verdict: dict[str, Any] = {"arr": arr, "download_id": dl, "title": titre}
+
+    def ecarte(raison: str) -> tuple[dict[str, Any], bool]:
+        verdict.update(decision="ignored", reason=raison)
+        decision = f"ignored:{raison}"
+        if _assist_seen(dl, decision, dry_run):
+            return verdict, False
+        _assist_record(dl, arr, titre, decision, raison, dry_run)
+        log.info("  ⏭ %s[%s] %s : %s", prefix, arr, titre, raison)
+        return verdict, True
+
+    t = ctx["torrents"].get(dl)
+    if not t:
+        return ecarte("absent de qBittorrent")
+    if (t.get("progress") or 0) < 1:
+        return ecarte("téléchargement incomplet")
+
+    cle_media, route = ("seriesId", "series") if arr == "sonarr" else ("movieId", "movie")
+    medias = {r.get(cle_media) for r in records}
+    if len(medias) != 1 or None in medias:
+        return ecarte("média inconnu ou multiple")
+    media_id = medias.pop()
+    if media_id not in dossiers:
+        dossier = (_arr_request("GET", url, cle, f"{route}/{media_id}") or {}).get("path") or ""
+        dossiers[media_id] = (dossier, _media_inodes(dossier) if os.path.isdir(dossier) else set())
+    _, inodes = dossiers[media_id]
+
+    # Chaque vidéo doit avoir un hardlink dans le dossier du média du grab — pas
+    # ailleurs dans la bibliothèque : un torrent rangé sous une autre série
+    # n'est pas « importé » pour celle-ci.
+    videos = _torrent_videos(t)
+    if not videos:
+        return ecarte("aucune vidéo dans le torrent")
+    lies = 0
+    for v in videos:
+        try:
+            st = os.stat(v)
+        except OSError:
+            continue
+        lies += (st.st_dev, st.st_ino) in inodes
+    if lies < len(videos):
+        return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
+
+    categorie = _imported_category(clients, records[0].get("downloadClient") or "")
+    if not categorie:
+        return ecarte("pas de catégorie après import sur le client")
+    if categorie not in ctx["categories"]:
+        return ecarte(f"catégorie {categorie} absente de qBittorrent")
+    if t.get("auto_tmm") and ctx["categories"][categorie] != (t.get("save_path") or "").rstrip("/"):
+        # Garde-fou : la règle ne doit rien déplacer sur le disque.
+        return ecarte(f"la catégorie {categorie} a un autre dossier")
+    if not dry_run and _assist_seen(dl, "seed", False):
+        return ecarte("déjà traité dans les dernières 24 h, toujours dans la file")
+
+    # Épisodes que la release devait apporter et qui manquent encore.
+    manquants: list[int] = []
+    attendus = {r.get("episodeId") for r in records if r.get("episodeId")}
+    if arr == "sonarr" and attendus:
+        maintenant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        manquants = [
+            e["id"]
+            for e in _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
+            if e["id"] in attendus and e.get("monitored") and not e.get("hasFile")
+            and (e.get("airDateUtc") or "9999") <= maintenant
+        ]
+    resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
+    if manquants:
+        resume += f", recherche de {len(manquants)} épisode(s) manquant(s)"
+    verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants))
+
+    if dry_run:
+        if _assist_seen(dl, "seed", True):
+            return verdict, False
+        _assist_record(dl, arr, titre, "seed", resume, True)
+        log.info("  %s✓ [%s] %s : %s", prefix, arr, titre, resume)
+        return verdict, True
+
+    with qbit_session() as s:
+        r = s.post(f"{QBIT_URL}/api/v2/torrents/setCategory",
+                   data={"hashes": dl, "category": categorie}, timeout=10)
+        r.raise_for_status()
+    if manquants:
+        _arr_request("POST", url, cle, "command", json={"name": "EpisodeSearch", "episodeIds": manquants})
+    _assist_record(dl, arr, titre, "seed", resume, False)
+    log.info("  ✓ [%s] %s : %s", arr, titre, resume)
+    return verdict, True
+
+
+def import_assist_loop() -> None:
+    """Passage régulier de l'assistant d'import. Un seul par process (cf. sync_loop)."""
+    if IMPORT_ASSIST_INTERVAL <= 0 or not _assist_arrs() or _assist_started.is_set():
+        return
+    _assist_started.set()
+    # Laisse la première sync démarrer avant de solliciter qBit et les *arr.
+    time.sleep(120)
+    while True:
+        try:
+            run_import_assist(source="passage régulier")
+        except Exception as e:
+            log.error("Erreur assistant d'import : %s", e)
+        time.sleep(IMPORT_ASSIST_INTERVAL)
+
+
 def _validate_webhook_payload(data: Any) -> tuple[bool, str]:
     """Valide la structure minimale d'un payload webhook Sonarr/Radarr."""
     if not isinstance(data, dict):
@@ -1839,6 +2131,12 @@ def webhook():
                     moved += move_torrents_for_path(path)
 
         return jsonify({"moved": moved, "event": "DownloadUpgrade", "rows": indexed})
+
+    elif event == "ManualInteractionRequired":
+        # L'*arr signale un import bloqué : l'assistant passe tout de suite, sans
+        # attendre son passage régulier.
+        threading.Thread(target=run_import_assist, kwargs={"source": "webhook"}, daemon=True).start()
+        return jsonify({"status": "assist started"})
 
     return jsonify({"status": "ignored", "event": event})
 
@@ -2499,6 +2797,41 @@ def bootstrap_arr_managed():
     return jsonify({"status": "bootstrap started", "dry_run": dry_run})
 
 
+@app.route("/assist", methods=["POST"])
+def import_assist():
+    """Lance un passage de l'assistant d'import et renvoie ses verdicts (param dry_run)."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    if not _assist_arrs():
+        return jsonify({"error": "SONARR_URL / RADARR_URL non configurés"}), 503
+    raw = request.args.get("dry_run")
+    dry_run = IMPORT_ASSIST_DRY_RUN if raw is None else raw.lower() in ("1", "true", "yes")
+    verdicts = run_import_assist(dry_run=dry_run, source="manuel")
+    return jsonify({"dry_run": dry_run, "verdicts": verdicts})
+
+
+@app.route("/assist/history")
+def import_assist_history():
+    """Derniers verdicts de l'assistant d'import, simulation comprise."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        limit = min(int(request.args.get("limit", 50)), 500)
+    except (ValueError, TypeError):
+        limit = 50
+    with _db_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, download_id, arr, title, decision, details, dry_run, "
+                "datetime(at, 'unixepoch') as at "
+                "FROM assist_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/history")
 def history():
     """Historique des derniers moves effectués par cleanup-linker."""
@@ -2570,10 +2903,12 @@ def create_app() -> Flask:
     """Factory pour gunicorn : `gunicorn 'app:create_app()'`."""
     init_db()
     threading.Thread(target=sync_loop, daemon=True).start()
+    threading.Thread(target=import_assist_loop, daemon=True).start()
     return app
 
 
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=sync_loop, daemon=True).start()
+    threading.Thread(target=import_assist_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
