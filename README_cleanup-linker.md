@@ -202,7 +202,7 @@ networks:
 | `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit la suppression en action Sonarr/Radarr au lieu de déplacer les torrents directement |
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Assistant d'import en simulation : il journalise ce qu'il ferait, sans agir |
-| `IMPORT_ASSIST_INTERVAL_MINUTES` | `30` | Fréquence de passage de l'assistant d'import. `0` désactive le passage régulier |
+| `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Passage de renfort de l'assistant d'import, pour les events manqués. `0` le désactive |
 
 ---
 
@@ -220,7 +220,7 @@ Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans
           ✅ On Episode File Delete
           ❌ On Episode File Delete For Upgrade   ← laisser décoché (voir Limites connues)
           ❌ On Import Complete   ← inutile : doublon de On File Import
-          ✅ On Manual Interaction Required   ← facultatif : passage immédiat de l'assistant d'import
+          ✅ On Manual Interaction Required   ← déclenche l'assistant d'import
 ```
 
 Dans Sonarr, « On File Upgrade » n'envoie rien si « On File Import » n'est pas coché : c'est un filtre de cet event. Et « On Import Complete » ne dit pas quels fichiers un upgrade a remplacés.
@@ -236,7 +236,7 @@ Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans
           ✅ On Movie Delete
           ✅ On Movie File Delete
           ❌ On Movie File Delete For Upgrade   ← laisser décoché (voir Limites connues)
-          ✅ On Manual Interaction Required   ← facultatif : passage immédiat de l'assistant d'import
+          ✅ On Manual Interaction Required   ← déclenche l'assistant d'import
 ```
 
 ---
@@ -389,7 +389,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 
 ## Assistant d'import
 
-Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file, à l'état `importBlocked`. L'*arr attend une intervention, et tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. L'assistant passe régulièrement sur ces téléchargements bloqués, et règle ceux qui peuvent l'être sans risque.
+Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file, à l'état `importBlocked`. L'*arr attend une intervention, et tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. Dès que l'*arr signale un blocage, l'assistant examine les téléchargements bloqués, et règle ceux qui peuvent l'être sans risque.
 
 **Simulation par défaut** : il journalise ce qu'il ferait (`[SIMULATION] ✓ …`), sans rien changer. `IMPORT_ASSIST_DRY_RUN=false` le fait agir.
 
@@ -418,9 +418,11 @@ INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265
 
 ### Déclenchement
 
-- Un passage régulier, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (30 par défaut, `0` le désactive).
-- `POST /assist?token=…` lance un passage tout de suite et renvoie les verdicts. `&dry_run=false` agit même si le service est en simulation ; `&dry_run=true` simule même s'il est actif.
-- L'event « On Manual Interaction Required » de Sonarr ou Radarr, s'il est coché dans le webhook, déclenche un passage immédiat.
+- **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
+- **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués.
+- **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts. `&dry_run=false` agit même si le service est en simulation ; `&dry_run=true` simule même s'il est actif.
+
+Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lance.
 
 ---
 
@@ -436,7 +438,7 @@ INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `Download` avec `episodeFiles` | On Import Complete, s'il est coché | Fichiers importés indexés |
 | `EpisodeFileDelete` deleteReason=upgrade | On Episode File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
-| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required, s'il est coché) | Passage immédiat de l'assistant d'import |
+| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required) | Passage de l'assistant d'import sous deux minutes |
 | `Test` | Test webhook | Répond OK |
 
 ### Radarr
@@ -448,7 +450,7 @@ INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265
 | `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `MovieFileDelete` deleteReason=upgrade | On Movie File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
-| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required, s'il est coché) | Passage immédiat de l'assistant d'import |
+| `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required) | Passage de l'assistant d'import sous deux minutes |
 | `Test` | Test webhook | Répond OK |
 
 ### Jellyfin

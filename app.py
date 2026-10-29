@@ -15,6 +15,7 @@ Améliorations v4 :
 
 from __future__ import annotations
 
+import fcntl
 import hmac
 import logging
 import os
@@ -75,11 +76,13 @@ SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 RADARR_URL = os.getenv("RADARR_URL", "")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 
-# Assistant d'import : passe régulièrement sur les téléchargements bloqués des
-# files Sonarr/Radarr. Simulation par défaut — il journalise ce qu'il ferait,
-# sans rien changer. 0 minute désactive le passage régulier (/assist reste utilisable).
+# Assistant d'import : traite les téléchargements bloqués des files Sonarr/Radarr,
+# dès l'event « Manual Interaction Required ». Simulation par défaut — il
+# journalise ce qu'il ferait, sans rien changer. Le passage régulier n'est qu'un
+# renfort : l'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie à
+# son redémarrage. 0 minute le désactive (/assist reste utilisable).
 IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").lower() in ("1", "true", "yes")
-IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "30")) * 60
+IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -1769,9 +1772,43 @@ _ASSIST_STATES = {"importBlocked"}
 # Un même verdict n'est journalisé qu'une fois par jour, et une action réelle
 # n'est jamais rejouée dans ce délai.
 _ASSIST_REPEAT = 24 * 3600
+# L'*arr émet l'event juste avant de rafraîchir sa file : le passage attend
+# qu'elle affiche l'état « importBlocked ». Les events reçus entre-temps se
+# regroupent dans ce même passage.
+_ASSIST_EVENT_DELAY = 120
+# Attente maximale du verrou quand un autre passage tourne déjà.
+_ASSIST_LOCK_WAIT = 30
 _SAMPLE_RE = re.compile(r"(^|[\W_])samples?([\W_]|$)", re.IGNORECASE)
 _assist_started = threading.Event()
-_assist_lock = threading.Lock()
+_assist_timer_lock = threading.Lock()
+_assist_timer: threading.Timer | None = None
+
+
+@contextmanager
+def _assist_exclusive(attente: float):
+    """
+    Un seul passage à la fois, entre tous les process : le passage régulier
+    tourne dans le maître gunicorn, les events et /assist dans les workers.
+    Rend False si le verrou n'est pas libéré dans le délai.
+    """
+    fd = os.open(DB_PATH + ".assist.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fin = time.time() + attente
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= fin:
+                    yield False
+                    return
+                time.sleep(1)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _assist_arrs() -> list[tuple[str, str, str]]:
@@ -1866,10 +1903,10 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
     Retourne un verdict par téléchargement bloqué.
     """
     dry_run = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
-    if not _assist_lock.acquire(blocking=False):
-        log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
-        return []
-    try:
+    with _assist_exclusive(_ASSIST_LOCK_WAIT) as libre:
+        if not libre:
+            log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
+            return []
         try:
             with qbit_session() as s:
                 torrents = {t["hash"].lower(): t for t in qbit_get_torrents(s)}
@@ -1898,8 +1935,32 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
                 " [SIMULATION]" if dry_run else "", source, len(verdicts), nouveaux,
             )
         return verdicts
-    finally:
-        _assist_lock.release()
+
+
+def schedule_import_assist(source: str = "webhook") -> bool:
+    """
+    Programme un passage dans _ASSIST_EVENT_DELAY secondes. Les events suivants
+    se regroupent dans ce passage : False s'il était déjà programmé.
+    """
+    global _assist_timer
+    with _assist_timer_lock:
+        if _assist_timer is not None and _assist_timer.is_alive():
+            return False
+        _assist_timer = threading.Timer(_ASSIST_EVENT_DELAY, _run_scheduled_assist, kwargs={"source": source})
+        _assist_timer.daemon = True
+        _assist_timer.start()
+        return True
+
+
+def _run_scheduled_assist(source: str) -> None:
+    global _assist_timer
+    # Libéré avant le passage : un event reçu pendant qu'il tourne en programme un autre.
+    with _assist_timer_lock:
+        _assist_timer = None
+    try:
+        run_import_assist(source=source)
+    except Exception as e:
+        log.error("Erreur assistant d'import : %s", e)
 
 
 def _assist_arr(arr: str, url: str, cle: str, ctx: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
@@ -2019,7 +2080,12 @@ def _assist_download(
 
 
 def import_assist_loop() -> None:
-    """Passage régulier de l'assistant d'import. Un seul par process (cf. sync_loop)."""
+    """
+    Passage de renfort de l'assistant d'import, pour les events manqués : service
+    arrêté, webhook non coché, *arr redémarré. Un seul par process (cf. sync_loop).
+    Le premier passage, deux minutes après le démarrage, rattrape les blocages
+    survenus pendant un arrêt.
+    """
     if IMPORT_ASSIST_INTERVAL <= 0 or not _assist_arrs() or _assist_started.is_set():
         return
     _assist_started.set()
@@ -2027,7 +2093,7 @@ def import_assist_loop() -> None:
     time.sleep(120)
     while True:
         try:
-            run_import_assist(source="passage régulier")
+            run_import_assist(source="passage de renfort")
         except Exception as e:
             log.error("Erreur assistant d'import : %s", e)
         time.sleep(IMPORT_ASSIST_INTERVAL)
@@ -2133,10 +2199,10 @@ def webhook():
         return jsonify({"moved": moved, "event": "DownloadUpgrade", "rows": indexed})
 
     elif event == "ManualInteractionRequired":
-        # L'*arr signale un import bloqué : l'assistant passe tout de suite, sans
-        # attendre son passage régulier.
-        threading.Thread(target=run_import_assist, kwargs={"source": "webhook"}, daemon=True).start()
-        return jsonify({"status": "assist started"})
+        # L'*arr vient de bloquer un import : titre non reconnu, grab rattaché par
+        # ID, ou épisodes attendus manquants. Passage de l'assistant sous deux minutes.
+        programme = schedule_import_assist("webhook")
+        return jsonify({"status": "assist scheduled" if programme else "assist already scheduled"})
 
     return jsonify({"status": "ignored", "event": event})
 
