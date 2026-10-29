@@ -15,7 +15,6 @@ Améliorations v4 :
 
 from __future__ import annotations
 
-import fcntl
 import hmac
 import logging
 import os
@@ -81,7 +80,8 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 # journalise ce qu'il ferait, sans rien changer. Le passage régulier n'est qu'un
 # renfort : l'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie à
 # son redémarrage. 0 minute le désactive (/assist reste utilisable).
-IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").lower() in ("1", "true", "yes")
+# Seuls 0/false/no font agir : une valeur mal saisie garde la simulation.
+IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
@@ -1778,7 +1778,16 @@ _ASSIST_REPEAT = 24 * 3600
 _ASSIST_EVENT_DELAY = 120
 # Attente maximale du verrou quand un autre passage tourne déjà.
 _ASSIST_LOCK_WAIT = 30
+# Sonarr lance une recherche d'indexeur par épisode (EpisodeSearchCommand) :
+# au-delà de ce nombre, la recherche est laissée à la main pour ne pas inonder
+# les trackers — une saison d'anime TVDB peut compter des centaines d'épisodes.
+_ASSIST_MAX_SEARCH = 25
+# Sonarr renvoie une ligne de file par épisode : la file est lue par pages.
+_ASSIST_QUEUE_PAGE = 1000
+# Un échantillon porte « sample » dans son nom ET reste petit : un épisode
+# intitulé « Free Sample » compte bien parmi les vidéos à retrouver.
 _SAMPLE_RE = re.compile(r"(^|[\W_])samples?([\W_]|$)", re.IGNORECASE)
+_SAMPLE_MAX_BYTES = 300 * 1024 * 1024
 _assist_started = threading.Event()
 _assist_timer_lock = threading.Lock()
 _assist_timer: threading.Timer | None = None
@@ -1791,6 +1800,8 @@ def _assist_exclusive(attente: float):
     tourne dans le maître gunicorn, les events et /assist dans les workers.
     Rend False si le verrou n'est pas libéré dans le délai.
     """
+    import fcntl  # POSIX seulement : importé ici pour que le module se charge ailleurs
+
     fd = os.open(DB_PATH + ".assist.lock", os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fin = time.time() + attente
@@ -1823,34 +1834,31 @@ def _assist_arrs() -> list[tuple[str, str, str]]:
     ]
 
 
-def _torrent_videos(t: dict[str, Any]) -> list[str]:
-    """Vidéos d'un torrent, échantillons exclus : aucun *arr ne les importe."""
+def _torrent_videos(t: dict[str, Any]) -> list[str] | None:
+    """
+    Vidéos d'un torrent, échantillons exclus : aucun *arr ne les importe.
+    None si ses données sont introuvables sur le disque.
+    """
     racine = torrent_root(t)
     if os.path.isfile(racine):
         fichiers = [racine]
-    else:
+    elif os.path.isdir(racine):
         fichiers = [os.path.join(d, n) for d, _, noms in os.walk(racine) for n in noms]
-    return [
-        f
-        for f in fichiers
-        if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
-        and not _SAMPLE_RE.search(os.path.basename(f) if f == racine else os.path.relpath(f, racine))
-    ]
-
-
-def _media_inodes(dossier: str) -> set[tuple[int, int]]:
-    """(device, inode) des vidéos d'un dossier de série ou de film."""
-    vus: set[tuple[int, int]] = set()
-    for d, _, noms in os.walk(dossier):
-        for n in noms:
-            if os.path.splitext(n)[1].lower() not in VIDEO_EXTENSIONS:
-                continue
-            try:
-                st = os.stat(os.path.join(d, n))
-            except OSError:
-                continue
-            vus.add((st.st_dev, st.st_ino))
-    return vus
+    else:
+        return None
+    videos: list[str] = []
+    for f in fichiers:
+        if os.path.splitext(f)[1].lower() not in VIDEO_EXTENSIONS:
+            continue
+        nom = os.path.basename(f) if f == racine else os.path.relpath(f, racine)
+        try:
+            petit = os.path.getsize(f) < _SAMPLE_MAX_BYTES
+        except OSError:
+            petit = False
+        if petit and _SAMPLE_RE.search(nom):
+            continue
+        videos.append(f)
+    return videos
 
 
 def _imported_category(clients: list[dict[str, Any]], nom: str) -> str:
@@ -1886,7 +1894,7 @@ def _assist_record(download_id: str, arr: str, title: str, decision: str,
             )
 
 
-def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> list[dict[str, Any]]:
+def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> list[dict[str, Any]] | None:
     """
     Un passage de l'assistant d'import sur les files Sonarr/Radarr.
 
@@ -1900,13 +1908,28 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
 
     La correspondance se fait par inode, sans aucun nom de fichier. Rien n'est
     importé, rien n'est supprimé, rien ne bouge sur le disque.
-    Retourne un verdict par téléchargement bloqué.
+    Retourne un verdict par téléchargement bloqué, ou None si un autre passage
+    tournait déjà.
     """
     dry_run = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
     with _assist_exclusive(_ASSIST_LOCK_WAIT) as libre:
         if not libre:
             log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
+            return None
+
+        # Les files d'abord : sans téléchargement bloqué, inutile de lister qBit.
+        bloques: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
+        for arr, url, cle in _assist_arrs():
+            try:
+                par_dl = _assist_blocked(url, cle)
+            except Exception as e:
+                log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
+                continue
+            if par_dl:
+                bloques.append((arr, url, cle, par_dl))
+        if not bloques:
             return []
+
         try:
             with qbit_session() as s:
                 torrents = {t["hash"].lower(): t for t in qbit_get_torrents(s)}
@@ -1922,13 +1945,24 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
         ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run}
         verdicts: list[dict[str, Any]] = []
         nouveaux = 0
-        for arr, url, cle in _assist_arrs():
+        for arr, url, cle, par_dl in bloques:
             try:
-                for verdict, nouveau in _assist_arr(arr, url, cle, ctx):
-                    verdicts.append(verdict)
-                    nouveaux += nouveau
+                clients = _arr_request("GET", url, cle, "downloadclient") or []
             except Exception as e:
                 log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
+                continue
+            inodes_par_media: dict[int, set[int]] = {}
+            for dl, records in par_dl.items():
+                try:
+                    verdict, nouveau = _assist_download(arr, url, cle, dl, records, clients, inodes_par_media, ctx)
+                except Exception as e:
+                    # Un téléchargement en erreur n'empêche pas de traiter les suivants.
+                    titre = records[0].get("title") or dl
+                    log.error("Assistant d'import : [%s] %s en erreur (%s)", arr, titre, e)
+                    verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "error", "reason": str(e)}
+                    nouveau = False
+                verdicts.append(verdict)
+                nouveaux += nouveau
         if nouveaux:
             log.info(
                 "=== Assistant d'import%s (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
@@ -1963,28 +1997,28 @@ def _run_scheduled_assist(source: str) -> None:
         log.error("Erreur assistant d'import : %s", e)
 
 
-def _assist_arr(arr: str, url: str, cle: str, ctx: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
-    """Verdicts pour les téléchargements bloqués d'un *arr. Un téléchargement = plusieurs lignes de file."""
-    # Sans les éléments « inconnus » : quand Sonarr et Radarr partagent une
-    # catégorie, chacun liste les téléchargements de l'autre, sans média.
-    file = _arr_request("GET", url, cle, "queue", params={"page": 1, "pageSize": 1000}) or {}
+def _assist_blocked(url: str, cle: str) -> dict[str, list[dict[str, Any]]]:
+    """Lignes de file des téléchargements bloqués d'un *arr, regroupées par téléchargement."""
     bloques: dict[str, list[dict[str, Any]]] = {}
-    for r in file.get("records") or []:
-        if r.get("downloadId") and r.get("trackedDownloadState") in _ASSIST_STATES:
-            bloques.setdefault(r["downloadId"].lower(), []).append(r)
-    if not bloques:
-        return []
-    clients = _arr_request("GET", url, cle, "downloadclient") or []
-    dossiers: dict[int, tuple[str, set[tuple[int, int]]]] = {}
-    return [
-        _assist_download(arr, url, cle, dl, records, clients, dossiers, ctx)
-        for dl, records in bloques.items()
-    ]
+    page, lues = 1, 0
+    while True:
+        # Sans les éléments « inconnus » : quand Sonarr et Radarr partagent une
+        # catégorie, chacun liste les téléchargements de l'autre, sans média.
+        rep = _arr_request("GET", url, cle, "queue",
+                           params={"page": page, "pageSize": _ASSIST_QUEUE_PAGE}) or {}
+        lot = rep.get("records") or []
+        for r in lot:
+            if r.get("downloadId") and r.get("trackedDownloadState") in _ASSIST_STATES:
+                bloques.setdefault(r["downloadId"].lower(), []).append(r)
+        lues += len(lot)
+        if not lot or lues >= (rep.get("totalRecords") or 0):
+            return bloques
+        page += 1
 
 
 def _assist_download(
     arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]],
-    clients: list[dict[str, Any]], dossiers: dict[int, tuple[str, set[tuple[int, int]]]],
+    clients: list[dict[str, Any]], inodes_par_media: dict[int, set[int]],
     ctx: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     """Applique la règle 1 à un téléchargement. Retourne (verdict, journalisé maintenant)."""
@@ -2013,30 +2047,35 @@ def _assist_download(
     if len(medias) != 1 or None in medias:
         return ecarte("média inconnu ou multiple")
     media_id = medias.pop()
-    if media_id not in dossiers:
+    if media_id not in inodes_par_media:
         dossier = (_arr_request("GET", url, cle, f"{route}/{media_id}") or {}).get("path") or ""
-        dossiers[media_id] = (dossier, _media_inodes(dossier) if os.path.isdir(dossier) else set())
-    _, inodes = dossiers[media_id]
+        inodes_par_media[media_id] = set(scan_video_files(dossier)) if dossier else set()
+    inodes = inodes_par_media[media_id]
 
     # Chaque vidéo doit avoir un hardlink dans le dossier du média du grab — pas
     # ailleurs dans la bibliothèque : un torrent rangé sous une autre série
     # n'est pas « importé » pour celle-ci.
     videos = _torrent_videos(t)
+    if videos is None:
+        return ecarte("données du torrent introuvables sur le disque")
     if not videos:
         return ecarte("aucune vidéo dans le torrent")
     lies = 0
     for v in videos:
         try:
-            st = os.stat(v)
+            lies += os.stat(v).st_ino in inodes
         except OSError:
             continue
-        lies += (st.st_dev, st.st_ino) in inodes
     if lies < len(videos):
         return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
     categorie = _imported_category(clients, records[0].get("downloadClient") or "")
     if not categorie:
         return ecarte("pas de catégorie après import sur le client")
+    if categorie == t.get("category"):
+        # Changer de catégorie ne sortirait pas le torrent de la file : l'action
+        # serait rejouée chaque jour, recherche comprise.
+        return ecarte(f"déjà dans la catégorie après import {categorie}")
     if categorie not in ctx["categories"]:
         return ecarte(f"catégorie {categorie} absente de qBittorrent")
     if t.get("auto_tmm") and ctx["categories"][categorie] != (t.get("save_path") or "").rstrip("/"):
@@ -2056,10 +2095,15 @@ def _assist_download(
             if e["id"] in attendus and e.get("monitored") and not e.get("hasFile")
             and (e.get("airDateUtc") or "9999") <= maintenant
         ]
+    recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH else []
     resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
-    if manquants:
-        resume += f", recherche de {len(manquants)} épisode(s) manquant(s)"
-    verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants))
+    if recherche:
+        resume += f", recherche de {len(recherche)} épisode(s) manquant(s)"
+    elif manquants:
+        resume += (f", {len(manquants)} épisodes manquants : trop pour une recherche "
+                   "automatique, à lancer depuis Sonarr")
+    verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants),
+                   search=bool(recherche))
 
     if dry_run:
         if _assist_seen(dl, "seed", True):
@@ -2072,10 +2116,19 @@ def _assist_download(
         r = s.post(f"{QBIT_URL}/api/v2/torrents/setCategory",
                    data={"hashes": dl, "category": categorie}, timeout=10)
         r.raise_for_status()
-    if manquants:
-        _arr_request("POST", url, cle, "command", json={"name": "EpisodeSearch", "episodeIds": manquants})
+    # Tracé dès que le torrent a changé de catégorie : il a quitté la file, le
+    # prochain passage ne le reverra pas.
     _assist_record(dl, arr, titre, "seed", resume, False)
     log.info("  ✓ [%s] %s : %s", arr, titre, resume)
+    if recherche:
+        try:
+            _arr_request("POST", url, cle, "command", json={"name": "EpisodeSearch", "episodeIds": recherche})
+        except Exception as e:
+            verdict["search"] = False
+            _assist_record(dl, arr, titre, "search-failed",
+                           f"recherche de {len(recherche)} épisode(s) non lancée : {e}", False)
+            log.error("  ⚠ [%s] %s : recherche des épisodes manquants non lancée (%s), "
+                      "à lancer depuis Sonarr", arr, titre, e)
     return verdict, True
 
 
@@ -2872,8 +2925,11 @@ def import_assist():
     if not _assist_arrs():
         return jsonify({"error": "SONARR_URL / RADARR_URL non configurés"}), 503
     raw = request.args.get("dry_run")
-    dry_run = IMPORT_ASSIST_DRY_RUN if raw is None else raw.lower() in ("1", "true", "yes")
+    # Seuls 0/false/no font agir : une valeur mal saisie reste une simulation.
+    dry_run = IMPORT_ASSIST_DRY_RUN if raw is None else raw.strip().lower() not in ("0", "false", "no")
     verdicts = run_import_assist(dry_run=dry_run, source="manuel")
+    if verdicts is None:
+        return jsonify({"dry_run": dry_run, "error": "un autre passage est en cours, réessayer dans un instant"}), 409
     return jsonify({"dry_run": dry_run, "verdicts": verdicts})
 
 
