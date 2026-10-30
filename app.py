@@ -79,25 +79,28 @@ RADARR_URL = os.getenv("RADARR_URL", "")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 
 # Assistant d'import : traite les téléchargements bloqués des files Sonarr/Radarr,
-# dès l'event « Manual Interaction Required ». Simulation par défaut — il
-# journalise ce qu'il ferait, sans rien changer. Le passage régulier n'est qu'un
-# renfort : l'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie à
-# son redémarrage. 0 minute le désactive (/assist reste utilisable).
-# Seuls 0/false/no font agir : une valeur mal saisie garde la simulation.
+# dès l'event « Manual Interaction Required ». Chaque règle a sa propre
+# simulation, active par défaut : elle journalise ce qu'elle ferait, sans rien
+# changer. Celle-ci est la simulation de la règle 1 (débloquer la file). Le
+# passage régulier n'est qu'un renfort : l'*arr n'émet l'event qu'une fois par
+# téléchargement, et l'oublie à son redémarrage. 0 minute le désactive (/assist
+# reste utilisable). Seuls 0/false/no font agir : une valeur mal saisie garde la
+# simulation.
 IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
 
-# Règle 4 de l'assistant : un pack de saison partiel est remplacé par un pack
-# complet, cherché dans Prowlarr. Sa propre simulation, indépendante de celle de
-# la règle 1, et dans les mêmes conditions : seuls 0/false/no font agir.
+# Règle 4 de l'assistant (pack incomplet) : un pack de saison partiel est
+# remplacé par un pack complet, cherché dans Prowlarr. Sa propre simulation,
+# dans les mêmes conditions. Le filet après import remplace la recherche
+# d'épisodes de la règle 1 : il n'agit que si la règle 1 agit aussi.
 # Sans Prowlarr, la règle se contente de signaler les packs partiels.
 IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
 
-# Règle 5 de l'assistant : accorde chaque saison demandée dans Seerr (numérotée
-# comme TMDB) avec la saison TVDB que Sonarr surveille. Simulation propre, dans
-# les mêmes conditions. Sans Seerr, la règle ne fait rien.
+# Règle 5 de l'assistant (bonne saison) : accorde chaque saison demandée dans
+# Seerr (numérotée comme TMDB) avec la saison TVDB que Sonarr surveille.
+# Simulation propre, dans les mêmes conditions. Sans Seerr, la règle ne fait rien.
 IMPORT_ASSIST_ACCORD_DRY_RUN = os.getenv("IMPORT_ASSIST_ACCORD_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 SEERR_URL = os.getenv("SEERR_URL", "").rstrip("/")
 SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
@@ -252,7 +255,8 @@ def init_db() -> None:
                     decision    TEXT,
                     details     TEXT,
                     dry_run     INTEGER,
-                    at          INTEGER DEFAULT (strftime('%s','now'))
+                    at          INTEGER DEFAULT (strftime('%s','now')),
+                    rule        INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_assist_dl ON assist_log(download_id);
 
@@ -347,6 +351,16 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_media_hash "
                 "ON files(torrent_hash) WHERE path LIKE '/data/Media/%'"
             )
+            # Règle de l'assistant qui a rendu chaque verdict. Pour les verdicts
+            # d'avant, elle se déduit de la décision.
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(assist_log)").fetchall()]
+            if "rule" not in cols:
+                conn.execute("ALTER TABLE assist_log ADD COLUMN rule INTEGER")
+                conn.execute(
+                    "UPDATE assist_log SET rule = CASE WHEN decision LIKE 'accord-%' THEN 5 "
+                    "WHEN decision LIKE 'pack-%' THEN 4 ELSE 1 END"
+                )
+                log.info("Colonne 'rule' ajoutée à la table assist_log")
     log.info("DB initialisée")
 
 
@@ -1824,6 +1838,29 @@ _SAMPLE_MAX_BYTES = 300 * 1024 * 1024
 _assist_started = threading.Event()
 _assist_timer_lock = threading.Lock()
 _assist_timer: threading.Timer | None = None
+# Nom de chaque règle, dans les logs et dans /assist/history : on y lit quelle
+# règle a fait quoi.
+_REGLES = {1: "débloquer la file", 4: "pack incomplet", 5: "bonne saison"}
+
+
+def _regle(n: int) -> str:
+    return f"règle {n} · {_REGLES[n]}"
+
+
+def _assist_log(regle: int, signe: str, arr: str, titre: str, details: str, dry_run: bool) -> None:
+    """Une ligne de log de l'assistant, au nom de la règle qui l'écrit."""
+    log.info("  %s%s [%s] [%s] %s : %s", "[SIMULATION] " if dry_run else "", signe, _regle(regle), arr, titre, details)
+
+
+def _assist_modes() -> str:
+    """Ce que fait chaque règle avec la configuration actuelle : agir, simuler, ou rien."""
+    def mode(simulation: bool) -> str:
+        return "en simulation" if simulation else "ACTIVE"
+    sonarr = bool(SONARR_URL and SONARR_API_KEY)
+    r4 = (mode(IMPORT_ASSIST_PACK_DRY_RUN) if sonarr and PROWLARR_URL and PROWLARR_API_KEY
+          else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
+    r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
+    return f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(4)} {r4}, {_regle(5)} {r5}"
 
 
 @contextmanager
@@ -1921,13 +1958,13 @@ def _assist_seen(download_id: str, decision: str, dry_run: bool) -> bool:
 
 
 def _assist_record(download_id: str, arr: str, title: str, decision: str,
-                   details: str, dry_run: bool) -> None:
+                   details: str, dry_run: bool, regle: int) -> None:
     with _db_lock:
         with get_db() as conn:
             conn.execute(
-                "INSERT INTO assist_log (download_id, arr, title, decision, details, dry_run) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (download_id, arr, title, decision, details, int(dry_run)),
+                "INSERT INTO assist_log (download_id, arr, title, decision, details, dry_run, rule) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (download_id, arr, title, decision, details, int(dry_run), regle),
             )
 
 
@@ -1950,14 +1987,18 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
     demandée qui correspond à une autre saison TVDB n'a plus d'épisodes à chercher.
     Retourne un verdict par téléchargement bloqué et par désaccord de saison, ou
     None si un autre passage tournait déjà.
+
+    `dry_run` : None, chaque règle suit son interrupteur ; True simule toutes les
+    règles (aperçu) ; False fait agir la règle 1, les autres suivant le leur.
     """
+    apercu = dry_run is True
     dry_run = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
     with _assist_exclusive(_ASSIST_LOCK_WAIT) as libre:
         if not libre:
             log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
             return None
 
-        verdicts_accord, ecartees = run_accord(dry_run)
+        verdicts_accord, ecartees = run_accord(apercu)
 
         # Les files d'abord : sans téléchargement bloqué, inutile de lister qBit.
         bloques: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
@@ -1984,7 +2025,8 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
             log.error("Assistant d'import : qBittorrent injoignable (%s)", e)
             return verdicts_accord
 
-        ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run, "ecartees": ecartees}
+        ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run, "apercu": apercu,
+               "ecartees": ecartees}
         verdicts: list[dict[str, Any]] = list(verdicts_accord)
         nouveaux = 0
         for arr, url, cle, par_dl in bloques:
@@ -2000,15 +2042,16 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
                 except Exception as e:
                     # Un téléchargement en erreur n'empêche pas de traiter les suivants.
                     titre = records[0].get("title") or dl
-                    log.error("Assistant d'import : [%s] %s en erreur (%s)", arr, titre, e)
+                    log.error("  ⚠ [%s] [%s] %s en erreur (%s)", _regle(1), arr, titre, e)
                     verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "error", "reason": str(e)}
                     nouveau = False
                 verdicts.append(verdict)
                 nouveaux += nouveau
         if nouveaux:
+            # Chaque ligne au-dessus dit sa règle, et si elle n'est qu'une simulation.
             log.info(
-                "=== Assistant d'import%s (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
-                " [SIMULATION]" if dry_run else "", source, len(verdicts) - len(verdicts_accord), nouveaux,
+                "=== Assistant d'import (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
+                source, len(verdicts) - len(verdicts_accord), nouveaux,
             )
         return verdicts
 
@@ -2069,16 +2112,17 @@ def _assist_download(
     """Applique la règle 1 à un téléchargement. Retourne (verdict, journalisé maintenant)."""
     dry_run = ctx["dry_run"]
     titre = records[0].get("title") or dl
-    prefix = "[SIMULATION] " if dry_run else ""
     verdict: dict[str, Any] = {"arr": arr, "download_id": dl, "title": titre}
 
-    def ecarte(raison: str) -> tuple[dict[str, Any], bool]:
+    def ecarte(raison: str, regle: int = 1, simulation: bool | None = None) -> tuple[dict[str, Any], bool]:
+        # La règle 4 finit ses remplacements ici, avec sa propre simulation.
+        simulation = dry_run if simulation is None else simulation
         verdict.update(decision="ignored", reason=raison)
         decision = f"ignored:{raison}"
-        if _assist_seen(dl, decision, dry_run):
+        if _assist_seen(dl, decision, simulation):
             return verdict, False
-        _assist_record(dl, arr, titre, decision, raison, dry_run)
-        log.info("  ⏭ %s[%s] %s : %s", prefix, arr, titre, raison)
+        _assist_record(dl, arr, titre, decision, raison, simulation, regle)
+        _assist_log(regle, "⏭", arr, titre, raison, simulation)
         return verdict, True
 
     t = ctx["torrents"].get(dl)
@@ -2163,8 +2207,8 @@ def _assist_download(
             pack, note = _pack_after_import(url, cle, media_id, dl, titre, records, episodes,
                                             manquants, videos, clients)
         except Exception as e:
-            note = f"recherche d'un pack complet impossible : {e}"
-            log.error("  ⚠ [%s] %s : %s", arr, titre, note)
+            note = f"règle 4 : recherche d'un pack complet impossible : {e}"
+            log.error("  ⚠ [%s] [%s] %s : %s", _regle(4), arr, titre, note)
     # Un remplacement déjà lancé compte, même si la règle 4 est repassée en simulation.
     remplace = pack is not None and (bool(pack.get("deja")) or not IMPORT_ASSIST_PACK_DRY_RUN)
     if remplace and not dry_run and not pack.get("deja"):
@@ -2172,13 +2216,13 @@ def _assist_download(
             _qbit_add(pack, pack["category"], t)
             _pack_register(media_id, pack["season"], dl, pack, "import", pack["episodes"])
         except Exception as e:
-            remplace, note = False, f"ajout du pack complet {pack['title']} impossible : {e}"
-            log.error("  ⚠ [%s] %s : %s", arr, titre, note)
+            remplace, note = False, f"règle 4 : ajout du pack complet {pack['title']} impossible : {e}"
+            log.error("  ⚠ [%s] [%s] %s : %s", _regle(4), arr, titre, note)
 
     recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH and not remplace else []
     resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
     if remplace:
-        resume += f", pack complet {pack['title']} à la place des {len(manquants)} épisode(s) manquant(s)"
+        resume += f", règle 4 : pack complet {pack['title']} à la place des {len(manquants)} épisode(s) manquant(s)"
     elif recherche:
         resume += f", recherche de {len(recherche)} épisode(s) manquant(s)"
     elif manquants:
@@ -2196,8 +2240,8 @@ def _assist_download(
     if dry_run:
         if deja_vu:
             return verdict, False
-        _assist_record(dl, arr, titre, "seed", resume, True)
-        log.info("  %s✓ [%s] %s : %s", prefix, arr, titre, resume)
+        _assist_record(dl, arr, titre, "seed", resume, True, 1)
+        _assist_log(1, "✓", arr, titre, resume, True)
         return verdict, True
 
     with qbit_session() as s:
@@ -2206,17 +2250,17 @@ def _assist_download(
         r.raise_for_status()
     # Tracé dès que le torrent a changé de catégorie : il a quitté la file, le
     # prochain passage ne le reverra pas.
-    _assist_record(dl, arr, titre, "seed", resume, False)
-    log.info("  ✓ [%s] %s : %s", arr, titre, resume)
+    _assist_record(dl, arr, titre, "seed", resume, False, 1)
+    _assist_log(1, "✓", arr, titre, resume, False)
     if recherche:
         try:
             _arr_request("POST", url, cle, "command", json={"name": "EpisodeSearch", "episodeIds": recherche})
         except Exception as e:
             verdict["search"] = False
             _assist_record(dl, arr, titre, "search-failed",
-                           f"recherche de {len(recherche)} épisode(s) non lancée : {e}", False)
-            log.error("  ⚠ [%s] %s : recherche des épisodes manquants non lancée (%s), "
-                      "à lancer depuis Sonarr", arr, titre, e)
+                           f"recherche de {len(recherche)} épisode(s) non lancée : {e}", False, 1)
+            log.error("  ⚠ [%s] [%s] %s : recherche des épisodes manquants non lancée (%s), "
+                      "à lancer depuis Sonarr", _regle(1), arr, titre, e)
     return verdict, True
 
 
@@ -2230,6 +2274,7 @@ def import_assist_loop() -> None:
     if IMPORT_ASSIST_INTERVAL <= 0 or not _assist_arrs() or _assist_started.is_set():
         return
     _assist_started.set()
+    log.info("Assistant d'import : %s", _assist_modes())
     # Laisse la première sync démarrer avant de solliciter qBit et les *arr.
     time.sleep(120)
     while True:
@@ -2299,8 +2344,8 @@ def _run_pack_check(serie_id: int, saison: int, dl: str, titre: str) -> None:
     try:
         check_pack_grab(serie_id, saison, dl, titre)
     except Exception as e:
-        log.error("Règle 4 : vérification de %s en erreur (%s)", titre, e)
-        _assist_record(dl, "sonarr", titre, "pack-error", str(e), IMPORT_ASSIST_PACK_DRY_RUN)
+        log.error("  ⚠ [%s] [sonarr] %s : vérification en erreur (%s)", _regle(4), titre, e)
+        _assist_record(dl, "sonarr", titre, "pack-error", str(e), IMPORT_ASSIST_PACK_DRY_RUN, 4)
 
 
 def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
@@ -2319,13 +2364,12 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
     dry_run = IMPORT_ASSIST_PACK_DRY_RUN if dry_run is None else dry_run
     dl = dl.lower()
     url, cle = SONARR_URL, SONARR_API_KEY
-    prefix = "[SIMULATION] " if dry_run else ""
     verdict: dict[str, Any] = {"arr": "sonarr", "download_id": dl, "title": titre, "stage": "grab"}
 
     def fin(decision: str, details: str, signe: str = "⏭") -> dict[str, Any]:
         verdict.update(decision=decision, reason=details)
-        _assist_record(dl, "sonarr", titre, decision, details, dry_run)
-        log.info("  %s%s [sonarr] %s : %s", prefix, signe, titre, details)
+        _assist_record(dl, "sonarr", titre, decision, details, dry_run, 4)
+        _assist_log(4, signe, "sonarr", titre, details, dry_run)
         return verdict
 
     if saison == 0:
@@ -2373,7 +2417,7 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
         arrete = True
         # Tracé tout de suite : si le service redémarre pendant la recherche, le
         # passage de renfort relance le torrent.
-        _assist_record(dl, "sonarr", titre, "pack-stopped", resume, False)
+        _assist_record(dl, "sonarr", titre, "pack-stopped", resume, False, 4)
     try:
         with _pack_slots:
             cand, ecartes = _pack_candidate(url, cle, serie, saison, episodes, voulus, ref, profil, {dl})
@@ -2399,7 +2443,7 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
             details += " (pas blacklisté : absent de la file Sonarr)"
     except Exception as e:
         details += f" (blacklist Sonarr impossible : {e})"
-        log.error("Règle 4 : blacklist de %s impossible (%s)", titre, e)
+        log.error("  ⚠ [%s] [sonarr] %s : blacklist impossible (%s)", _regle(4), titre, e)
     if not _pack_trash(t):
         details += " (laissé arrêté dans sa catégorie : son dossier est aussi celui d'un autre torrent)"
     return fin("pack-replace", details, "✓")
@@ -2474,10 +2518,11 @@ def _pack_finish(
     place des fichiers du pack partiel — de ceux-là seulement : un épisode remplacé
     entre-temps par autre chose n'est pas touché. Le pack partiel, qui n'a plus de
     fichier dans la bibliothèque, part ensuite en corbeille par l'event d'upgrade.
+    Suit la simulation de la règle 4 seule, sauf aperçu.
     """
-    dry_run = ctx["dry_run"] or IMPORT_ASSIST_PACK_DRY_RUN
+    dry_run = ctx["apercu"] or IMPORT_ASSIST_PACK_DRY_RUN
     if not dry_run and _assist_seen(dl, "pack-reimport", False):
-        return ecarte("remplacement déjà lancé dans les dernières 24 h, toujours dans la file")
+        return ecarte("remplacement déjà lancé dans les dernières 24 h, toujours dans la file", 4, dry_run)
     serie_id = remplacement["series_id"]
     ancien = ctx["torrents"].get(remplacement["old_hash"])
     inodes_ancien: set[int] = set()
@@ -2488,7 +2533,7 @@ def _pack_finish(
             continue
     if not inodes_ancien:
         # Retiré de qBittorrent, ou arrêté au grab avant d'avoir rien téléchargé.
-        return ecarte("règle 4 : aucun fichier du pack partiel à remplacer, import à finir à la main")
+        return ecarte("aucun fichier du pack partiel à remplacer, import à finir à la main", 4, dry_run)
 
     prevus = set(json.loads(remplacement["episodes"] or "[]"))
     chemins = {f["id"]: f.get("path") for f in
@@ -2525,20 +2570,20 @@ def _pack_finish(
             "downloadId": dl.upper(),
         })
     if not entrees:
-        return ecarte("règle 4 : rien à remplacer, les épisodes restants ne viennent pas du pack partiel")
+        return ecarte("rien à remplacer, les épisodes restants ne viennent pas du pack partiel", 4, dry_run)
 
     resume = f"pack complet de remplacement : {len(entrees)} vidéo(s) importée(s) à la place du pack partiel"
     verdict.update(decision="pack-reimport", files=len(entrees))
     if dry_run:
         if _assist_seen(dl, "pack-reimport", True):
             return verdict, False
-        _assist_record(dl, "sonarr", titre, "pack-reimport", resume, True)
-        log.info("  [SIMULATION] ✓ [sonarr] %s : %s", titre, resume)
+        _assist_record(dl, "sonarr", titre, "pack-reimport", resume, True, 4)
+        _assist_log(4, "✓", "sonarr", titre, resume, True)
         return verdict, True
     # « copy » : hardlink depuis le torrent, qui continue de seeder.
     _arr_request("POST", url, cle, "command", json={"name": "ManualImport", "importMode": "copy", "files": entrees})
-    _assist_record(dl, "sonarr", titre, "pack-reimport", resume, False)
-    log.info("  ✓ [sonarr] %s : %s", titre, resume)
+    _assist_record(dl, "sonarr", titre, "pack-reimport", resume, False, 4)
+    _assist_log(4, "✓", "sonarr", titre, resume, False)
     return verdict, True
 
 
@@ -2569,10 +2614,10 @@ def _pack_recover() -> int:
                 details = "vérification interrompue : torrent relancé"
             else:
                 details = "vérification interrompue : torrent déjà reparti ou retiré"
-            _assist_record(dl, "sonarr", titre, "pack-resumed", details, False)
-            log.info("  ↻ [sonarr] %s : %s", titre, details)
+            _assist_record(dl, "sonarr", titre, "pack-resumed", details, False, 4)
+            _assist_log(4, "↻", "sonarr", titre, details, False)
         except Exception as e:
-            log.error("Règle 4 : relance de %s impossible (%s)", titre, e)
+            log.error("  ⚠ [%s] [sonarr] %s : relance impossible (%s)", _regle(4), titre, e)
     return relances
 
 
@@ -2897,7 +2942,7 @@ def _qbit_restart(dl: str) -> None:
     try:
         _qbit_post("start", {"hashes": dl})
     except Exception as e:
-        log.error("Règle 4 : relance de %s impossible (%s), à relancer depuis qBittorrent", dl, e)
+        log.error("  ⚠ [%s] torrent %s : relance impossible (%s), à relancer depuis qBittorrent", _regle(4), dl, e)
 
 
 def _qbit_add(cand: dict[str, Any], categorie: str, ref: dict[str, Any]) -> None:
@@ -3089,20 +3134,21 @@ def _season_for_request(tmdb_eps: list[dict[str, Any]], par_saison: dict[int, li
     return None, f"aucune saison TVDB de {n} épisode{'s' if n > 1 else ''} ne correspond"
 
 
-def run_accord(dry_run: bool) -> tuple[list[dict[str, Any]], dict[int, set[int]]]:
+def run_accord(apercu: bool) -> tuple[list[dict[str, Any]], dict[int, set[int]]]:
     """
-    Règle 5, sur les demandes Seerr récentes. Retourne (verdicts, saisons écartées
+    Règle 5, sur les demandes Seerr récentes. Elle suit sa propre simulation, sauf
+    aperçu (`apercu`), qui simule tout. Retourne (verdicts, saisons écartées
     par série Sonarr) : la règle 1 ne compte plus les épisodes de ces saisons parmi
     les manquants, même en simulation.
     """
     if not (SEERR_URL and SEERR_API_KEY and SONARR_URL and SONARR_API_KEY):
         return [], {}
-    dry = dry_run or IMPORT_ASSIST_ACCORD_DRY_RUN
+    dry = apercu or IMPORT_ASSIST_ACCORD_DRY_RUN
     url, cle = SONARR_URL, SONARR_API_KEY
     try:
         demandes = _seerr_tv_requests(time.time() - _ACCORD_WINDOW_DAYS * 86400)
     except Exception as e:
-        log.error("Règle 5 : Seerr injoignable ou réponse inattendue (%s)", e)
+        log.error("  ⚠ [%s] Seerr injoignable ou réponse inattendue (%s)", _regle(5), e)
         return [], {}
     # Plusieurs fiches Seerr peuvent viser la même série TVDB : Monster et Lizzie Borden.
     par_tvdb: dict[int, list[dict[str, Any]]] = {}
@@ -3115,7 +3161,7 @@ def run_accord(dry_run: bool) -> tuple[list[dict[str, Any]], dict[int, set[int]]
         try:
             verdicts += _accord_series(url, cle, tvdb, liste, dry, ecartees)
         except Exception as e:
-            log.error("Règle 5 : série TVDB %s en erreur (%s)", tvdb, e)
+            log.error("  ⚠ [%s] [sonarr] série TVDB %s en erreur (%s)", _regle(5), tvdb, e)
             verdicts.append({"arr": "sonarr", "download_id": f"tvdb-{tvdb}", "title": f"série TVDB {tvdb}",
                              "decision": "error", "reason": str(e)})
     return verdicts, ecartees
@@ -3159,8 +3205,8 @@ def _accord_series(url: str, cle: str, tvdb: int, demandes: list[dict[str, Any]]
         if cible is None:
             verdict.update(decision="accord-unknown", reason=detail)
             if not _assist_seen(cle_journal, "accord-unknown", dry):
-                _assist_record(cle_journal, "sonarr", titre, "accord-unknown", detail, dry)
-                log.info("  %s⏭ [sonarr] %s : %s", "[SIMULATION] " if dry else "", titre, detail)
+                _assist_record(cle_journal, "sonarr", titre, "accord-unknown", detail, dry, 5)
+                _assist_log(5, "⏭", "sonarr", titre, detail, dry)
             verdicts.append(verdict)
             continue
         resume, ecartee = _accord_apply(url, cle, serie, par_saison, demandee, cible, demandee not in voulues,
@@ -3173,8 +3219,8 @@ def _accord_series(url: str, cle: str, tvdb: int, demandes: list[dict[str, Any]]
                        season=cible)
         verdicts.append(verdict)
         if not _assist_seen(cle_journal, "accord-fix", dry):
-            _assist_record(cle_journal, "sonarr", titre, "accord-fix", verdict["reason"], dry)
-            log.info("  %s✓ [sonarr] %s : %s", "[SIMULATION] " if dry else "", titre, verdict["reason"])
+            _assist_record(cle_journal, "sonarr", titre, "accord-fix", verdict["reason"], dry, 5)
+            _assist_log(5, "✓", "sonarr", titre, verdict["reason"], dry)
     return verdicts
 
 
@@ -4075,17 +4121,20 @@ def import_assist():
     if not _assist_arrs():
         return jsonify({"error": "SONARR_URL / RADARR_URL non configurés"}), 503
     raw = request.args.get("dry_run")
-    # Seuls 0/false/no font agir : une valeur mal saisie reste une simulation.
-    dry_run = IMPORT_ASSIST_DRY_RUN if raw is None else raw.strip().lower() not in ("0", "false", "no")
+    # Sans paramètre, chaque règle suit son interrupteur. Seuls 0/false/no font
+    # agir : une valeur mal saisie simule toutes les règles.
+    dry_run = None if raw is None else raw.strip().lower() not in ("0", "false", "no")
     verdicts = run_import_assist(dry_run=dry_run, source="manuel")
+    # dry_run : la simulation de la règle 1 ; chaque verdict des autres règles dit la sienne au journal.
+    regle_1 = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
     if verdicts is None:
-        return jsonify({"dry_run": dry_run, "error": "un autre passage est en cours, réessayer dans un instant"}), 409
-    return jsonify({"dry_run": dry_run, "verdicts": verdicts})
+        return jsonify({"dry_run": regle_1, "error": "un autre passage est en cours, réessayer dans un instant"}), 409
+    return jsonify({"dry_run": regle_1, "verdicts": verdicts})
 
 
 @app.route("/assist/history")
 def import_assist_history():
-    """Derniers verdicts de l'assistant d'import, simulation comprise."""
+    """Derniers verdicts de l'assistant d'import, simulation comprise (params limit, rule)."""
     token = request.args.get("token") or request.headers.get("X-Token")
     if not verify_token(token):
         return jsonify({"error": "Unauthorized"}), 401
@@ -4093,15 +4142,21 @@ def import_assist_history():
         limit = min(int(request.args.get("limit", 50)), 500)
     except (ValueError, TypeError):
         limit = 50
+    try:
+        regle = int(request.args["rule"]) if "rule" in request.args else None
+    except ValueError:
+        return jsonify({"error": "rule : numéro de règle attendu (%s)" % ", ".join(map(str, _REGLES))}), 400
     with _db_lock:
         with get_db() as conn:
             rows = conn.execute(
-                "SELECT id, download_id, arr, title, decision, details, dry_run, "
+                "SELECT id, download_id, arr, title, decision, details, dry_run, rule, "
                 "datetime(at, 'unixepoch') as at "
-                "FROM assist_log ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "FROM assist_log WHERE ? IS NULL OR rule = ? ORDER BY id DESC LIMIT ?",
+                (regle, regle, limit),
             ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([
+        {**dict(r), "rule": _regle(r["rule"]) if r["rule"] in _REGLES else r["rule"]} for r in rows
+    ])
 
 
 @app.route("/history")
