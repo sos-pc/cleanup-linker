@@ -204,6 +204,7 @@ networks:
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Règle 1 de l'assistant d'import (débloquer la file) en simulation : elle journalise ce qu'elle ferait, sans agir. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Passage de renfort de l'assistant d'import, pour les events manqués. `0` le désactive |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (pack incomplet) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
+| `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
 | `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (bonne saison : accorder la demande Seerr et la saison Sonarr) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
@@ -457,7 +458,7 @@ Un pack complet doit :
 - être un pack de la même saison, ni multi-saisons, ni « Part » ;
 - porter le même titre de série que le pack partiel. Une série d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases nomment chacune « S01 ». Ainsi, « Monster: The Lizzie Borden Story » est la saison 4 de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer, qui a 10 épisodes au lieu de 8. Le « S01 complet » serait une autre histoire que celle demandée ;
 - avoir une qualité autorisée par le profil de la série, au moins aussi bonne que celle du pack partiel ;
-- avoir un score de formats au moins égal : une release française n'est jamais remplacée par une release qui ne l'est pas ;
+- avoir un score de formats d'au moins 50 (`IMPORT_ASSIST_PACK_MIN_SCORE`), même s'il est moins bien noté que le pack partiel : mieux vaut une saison sans trou. Avec le profil actuel, une release qui porte du français fait au moins 55 (MULTi 55, VOSTFR 80, VF 110, MULTi VFF 195). Une release sans français part de -20 et gagne 10 par format technique (Atmos, Dolby Vision, HDR…) : un pack anglais reste sous le seuil. Le bonus que le profil donne aux packs ne compte pas, puisque le partiel et ses remplaçants en ont tous. Si le pack partiel est lui-même sous 50, son propre score sert de seuil ;
 - avoir au moins 3 sources et un lien `.torrent`. Un magnet n'a pas de liste de fichiers à lire avant d'être ajouté.
 
 Les mieux classés passent d'abord : score, puis qualité, puis sources. Seuls les `.torrent` des 4 premiers sont lus, car chaque lecture passe par un tracker.
@@ -468,11 +469,13 @@ Garde-fous :
 - **Dossier partagé :** un pack complet publié sous le même nom de dossier que le partiel en partage les fichiers. Le partiel reste alors arrêté dans sa catégorie, parce que la corbeille a son propre dossier : ATM y emporterait les fichiers de l'autre.
 - **Vérification interrompue :** si le service redémarre pendant la recherche, le passage de renfort relance le torrent arrêté, passé 30 minutes.
 
-**Après l'import, en filet.** Un pack partiel peut quand même être importé : pris pendant un arrêt du service, magnet sans liste de fichiers au grab, ou torrent privé trop entamé. La règle 1 le trouve alors bloqué dans la file. Au lieu de lancer la recherche des épisodes manquants un à un, l'assistant ajoute un pack complet, choisi de la même façon. Une fois ce pack téléchargé, Sonarr importe seul les épisodes manquants, mais refuse de remplacer ceux du pack partiel, faute de les améliorer. L'assistant les importe alors à la main, en hardlink, à la place des fichiers du pack partiel — et de ceux-là seulement : un épisode remplacé entre-temps par une autre release n'est pas touché. Le pack partiel, qui n'a plus de fichier dans la bibliothèque, part en corbeille par l'event d'upgrade.
+**Après l'import, en filet.** Un pack partiel peut quand même être importé : pris pendant un arrêt du service, magnet sans liste de fichiers au grab, ou torrent privé trop entamé. La règle 1 le trouve alors bloqué dans la file. Au lieu de lancer la recherche des épisodes manquants un à un, l'assistant ajoute un pack complet, choisi de la même façon. Une fois ce pack téléchargé, Sonarr importe seul les épisodes manquants, mais refuse de remplacer ceux du pack partiel, faute de les améliorer. L'assistant les importe alors à la main, en hardlink, à la place des fichiers du pack partiel — et de ceux-là seulement : un épisode remplacé entre-temps par une autre release n'est pas touché. Le pack partiel, qui n'a plus de fichier dans la bibliothèque, part en corbeille par l'event d'upgrade. Si le pack complet est moins bien noté que le partiel, il ne fait que combler les trous : les épisodes du partiel, meilleurs, restent en place.
+
+**Fin du remplacement.** Une fois chaque épisode prévu pourvu, le pack complet sort de la file de Sonarr en passant dans la catégorie après import, comme avec la règle 1. Ses éventuelles autres vidéos, pour des épisodes déjà mieux pourvus, restent en seed.
 
 La règle 4 a **sa propre simulation**, active par défaut et indépendante des autres règles : `IMPORT_ASSIST_PACK_DRY_RUN=false` la fait agir. Seul le filet après import dépend aussi de la règle 1 : il remplace la recherche d'épisodes de celle-ci, et n'agit donc que si elle agit. Elle demande « On Grab » coché dans le webhook de Sonarr. Sans `PROWLARR_URL` et `PROWLARR_API_KEY`, elle signale les packs partiels sans y toucher. La saison 0 (épisodes spéciaux) n'est pas traitée.
 
-Verdicts : `pack-ok`, `pack-partial` (pack gardé), `pack-replace`, `pack-reimport` (fin d'un remplacement après import), `pack-skipped` et `pack-error`. `pack-stopped` et `pack-resumed` tracent l'arrêt d'un torrent et sa relance.
+Verdicts : `pack-ok`, `pack-partial` (pack gardé), `pack-replace`, `pack-reimport` (import à la main des épisodes du partiel), `pack-done` (remplacement terminé, pack complet sorti de la file), `pack-skipped` et `pack-error`. `pack-stopped` et `pack-resumed` tracent l'arrêt d'un torrent et sa relance.
 
 ```
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01.MULTi.VFF.1080p.WEBRiP.EAC3.2.0.x265-T3KASHi (C411, 15 sources, score 195)

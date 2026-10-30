@@ -95,6 +95,12 @@ IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360"))
 # d'épisodes de la règle 1 : il n'agit que si la règle 1 agit aussi.
 # Sans Prowlarr, la règle se contente de signaler les packs partiels.
 IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+# Mieux vaut une saison sans trou, même moins bien notée : un pack complet est
+# pris s'il atteint ce score de formats, sans le bonus que le profil donne aux
+# packs. Avec le profil actuel, une release qui porte du français fait au moins
+# 55, une release sans français au plus 40 environ. Si le pack partiel est
+# lui-même plus bas, c'est son score qui sert de seuil.
+IMPORT_ASSIST_PACK_MIN_SCORE = int(os.getenv("IMPORT_ASSIST_PACK_MIN_SCORE", "50"))
 PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
 
@@ -2104,6 +2110,25 @@ def _assist_blocked(url: str, cle: str) -> dict[str, list[dict[str, Any]]]:
         page += 1
 
 
+def _seed_obstacle(categorie: str, t: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """
+    Ce qui empêche de sortir un torrent de la file en le passant dans la catégorie
+    après import de son client, ou "" si rien ne l'empêche.
+    """
+    if not categorie:
+        return "pas de catégorie après import sur le client"
+    if categorie == t.get("category"):
+        # Changer de catégorie ne sortirait pas le torrent de la file : l'action
+        # serait rejouée chaque jour, recherche comprise.
+        return f"déjà dans la catégorie après import {categorie}"
+    if categorie not in ctx["categories"]:
+        return f"catégorie {categorie} absente de qBittorrent"
+    if t.get("auto_tmm") and ctx["categories"][categorie] != (t.get("save_path") or "").rstrip("/"):
+        # Garde-fou : l'assistant ne doit rien déplacer sur le disque.
+        return f"la catégorie {categorie} a un autre dossier"
+    return ""
+
+
 def _assist_download(
     arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]],
     clients: list[dict[str, Any]], inodes_par_media: dict[int, set[int]],
@@ -2155,26 +2180,18 @@ def _assist_download(
             lies += os.stat(v).st_ino in inodes
         except OSError:
             continue
+    categorie = _imported_category(clients, records[0].get("downloadClient") or "")
     if lies < len(videos):
         # Règle 4 : le pack complet ajouté à la place d'un pack partiel n'importe
         # seul que les épisodes manquants. Le remplacement se termine ici.
         remplacement = _pack_replacement(dl) if arr == "sonarr" else None
         if remplacement:
-            return _pack_finish(url, cle, dl, titre, inodes, remplacement, ctx, verdict, ecarte)
+            return _pack_finish(url, cle, dl, titre, inodes, remplacement, ctx, verdict, ecarte, t, categorie)
         return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
-    categorie = _imported_category(clients, records[0].get("downloadClient") or "")
-    if not categorie:
-        return ecarte("pas de catégorie après import sur le client")
-    if categorie == t.get("category"):
-        # Changer de catégorie ne sortirait pas le torrent de la file : l'action
-        # serait rejouée chaque jour, recherche comprise.
-        return ecarte(f"déjà dans la catégorie après import {categorie}")
-    if categorie not in ctx["categories"]:
-        return ecarte(f"catégorie {categorie} absente de qBittorrent")
-    if t.get("auto_tmm") and ctx["categories"][categorie] != (t.get("save_path") or "").rstrip("/"):
-        # Garde-fou : la règle ne doit rien déplacer sur le disque.
-        return ecarte(f"la catégorie {categorie} a un autre dossier")
+    obstacle = _seed_obstacle(categorie, t, ctx)
+    if obstacle:
+        return ecarte(obstacle)
     if not dry_run and _assist_seen(dl, "seed", False):
         return ecarte("déjà traité dans les dernières 24 h, toujours dans la file")
     # Simulation déjà journalisée : la recherche d'un pack complet n'est pas refaite.
@@ -2221,7 +2238,10 @@ def _assist_download(
 
     recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH and not remplace else []
     resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
-    if remplace:
+    if remplace and pack.get("combler"):
+        resume += (f", règle 4 : pack complet {pack['title']} pour combler les {len(manquants)} épisode(s) "
+                   "manquant(s), moins bien noté : les épisodes déjà là restent")
+    elif remplace:
         resume += f", règle 4 : pack complet {pack['title']} à la place des {len(manquants)} épisode(s) manquant(s)"
     elif recherche:
         resume += f", recherche de {len(recherche)} épisode(s) manquant(s)"
@@ -2425,8 +2445,9 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
             if arrete:
                 _qbit_post("start", {"hashes": dl})
             return fin("pack-partial", f"{resume}, aucun pack complet trouvé{_ecarts(ecartes)} : on le garde", "⚠")
+        moins = f", moins bien noté que le partiel ({ref['score']}) mais complet" if cand["score"] < ref["score"] else ""
         details = (f"{resume} → remplacé par {cand['title']} ({cand['indexer']}, "
-                   f"{cand['seeders']} sources, score {cand['score']})")
+                   f"{cand['seeders']} sources, score {cand['score']}{moins})")
         verdict["replacement"] = cand["title"]
         if dry_run:
             return fin("pack-replace", details, "✓")
@@ -2503,13 +2524,16 @@ def _pack_after_import(
         cand, ecartes = _pack_candidate(url, cle, serie, saison, de_la_saison, a_couvrir, ref, profil, {dl})
     if cand is None:
         return None, f"règle 4 : aucun pack complet trouvé{_ecarts(ecartes)}"
-    cand.update(season=saison, episodes=a_couvrir, category=categorie)
+    # Moins bien noté que le partiel, il ne fait que combler les trous : les
+    # épisodes déjà importés gardent leur meilleure version.
+    combler = cand["score"] < ref["score"]
+    cand.update(season=saison, episodes=set(manquants) if combler else a_couvrir, category=categorie, combler=combler)
     return cand, ""
 
 
 def _pack_finish(
     url: str, cle: str, dl: str, titre: str, inodes_media: set[int], remplacement: sqlite3.Row,
-    ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any,
+    ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any, t: dict[str, Any], categorie: str,
 ) -> tuple[dict[str, Any], bool]:
     """
     Règle 4, fin du remplacement. Le pack complet est téléchargé : Sonarr a importé
@@ -2518,22 +2542,31 @@ def _pack_finish(
     place des fichiers du pack partiel — de ceux-là seulement : un épisode remplacé
     entre-temps par autre chose n'est pas touché. Le pack partiel, qui n'a plus de
     fichier dans la bibliothèque, part ensuite en corbeille par l'event d'upgrade.
-    Suit la simulation de la règle 4 seule, sauf aperçu.
+    Un pack complet moins bien noté n'a été prévu que pour les trous : les épisodes
+    du partiel, meilleurs, restent.
+
+    Quand chaque épisode prévu a son fichier, le pack complet sort de la file par
+    la catégorie après import, comme le ferait la règle 1 : ses autres vidéos
+    (épisodes déjà mieux pourvus) restent en seed. Suit la simulation de la
+    règle 4 seule, sauf aperçu.
     """
     dry_run = ctx["apercu"] or IMPORT_ASSIST_PACK_DRY_RUN
     if not dry_run and _assist_seen(dl, "pack-reimport", False):
         return ecarte("remplacement déjà lancé dans les dernières 24 h, toujours dans la file", 4, dry_run)
     serie_id = remplacement["series_id"]
-    ancien = ctx["torrents"].get(remplacement["old_hash"])
+    # Au grab, le partiel a été arrêté avant d'avoir rien apporté : seuls les trous
+    # comptent. Après l'import, ses épisodes se reconnaissent à ses inodes.
     inodes_ancien: set[int] = set()
-    for v in (_torrent_videos(ancien) or []) if ancien else []:
-        try:
-            inodes_ancien.add(os.stat(v).st_ino)
-        except OSError:
-            continue
-    if not inodes_ancien:
-        # Retiré de qBittorrent, ou arrêté au grab avant d'avoir rien téléchargé.
-        return ecarte("aucun fichier du pack partiel à remplacer, import à finir à la main", 4, dry_run)
+    if remplacement["stage"] != "grab":
+        ancien = ctx["torrents"].get(remplacement["old_hash"])
+        for v in (_torrent_videos(ancien) or []) if ancien else []:
+            try:
+                inodes_ancien.add(os.stat(v).st_ino)
+            except OSError:
+                continue
+        if not inodes_ancien:
+            # Retiré de qBittorrent : ses épisodes ne se reconnaissent plus.
+            return ecarte("aucun fichier du pack partiel à remplacer, import à finir à la main", 4, dry_run)
 
     prevus = set(json.loads(remplacement["episodes"] or "[]"))
     chemins = {f["id"]: f.get("path") for f in
@@ -2549,6 +2582,22 @@ def _pack_finish(
             return os.stat(chemin).st_ino in inodes_ancien
         except OSError:
             return False
+
+    restants = {i for i in prevus if du_partiel(i)}
+    if not restants:
+        # Remplacement terminé : le pack complet sort de la file.
+        obstacle = _seed_obstacle(categorie, t, ctx)
+        if obstacle:
+            return ecarte(f"remplacement terminé, mais {obstacle}", 4, dry_run)
+        resume = f"remplacement terminé : les {len(prevus)} épisode(s) prévu(s) sont en place → {categorie}"
+        verdict.update(decision="pack-done", category=categorie)
+        if _assist_seen(dl, "pack-done", dry_run):
+            return verdict, False
+        if not dry_run:
+            _qbit_post("setCategory", {"hashes": dl, "category": categorie})
+        _assist_record(dl, "sonarr", titre, "pack-done", resume, dry_run, 4)
+        _assist_log(4, "✓", "sonarr", titre, resume, dry_run)
+        return verdict, True
 
     entrees: list[dict[str, Any]] = []
     propositions = _arr_request("GET", url, cle, "manualimport", timeout=300,
@@ -2570,7 +2619,8 @@ def _pack_finish(
             "downloadId": dl.upper(),
         })
     if not entrees:
-        return ecarte("rien à remplacer, les épisodes restants ne viennent pas du pack partiel", 4, dry_run)
+        return ecarte(f"{len(restants)} épisode(s) prévu(s) sans fichier importable du pack complet : "
+                      "import à finir à la main", 4, dry_run)
 
     resume = f"pack complet de remplacement : {len(entrees)} vidéo(s) importée(s) à la place du pack partiel"
     verdict.update(decision="pack-reimport", files=len(entrees))
@@ -2666,7 +2716,11 @@ def _pack_coverage(url: str, cle: str, serie_id: int, saison: int,
 
 
 def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any]:
-    """Qualités autorisées par le profil, et leur rang : l'ordre du profil, de la moins bonne à la meilleure."""
+    """
+    Qualités autorisées par le profil, et leur rang : l'ordre du profil, de la
+    moins bonne à la meilleure. Plus le bonus que le profil donne aux packs
+    eux-mêmes : score des formats dont une condition porte sur le type de release.
+    """
     profil = (_arr_request("GET", url, cle, f"qualityprofile/{profil_id}") or {}) if profil_id else {}
     autorisees: set[int] = set()
     rangs: dict[int, int] = {}
@@ -2678,7 +2732,21 @@ def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any
             rangs[qid] = rang
             if item.get("allowed"):
                 autorisees.add(qid)
-    return {"autorisees": autorisees, "rangs": rangs}
+    notes = {f.get("format"): f.get("score") or 0 for f in profil.get("formatItems") or [] if f.get("score")}
+    formats = (_arr_request("GET", url, cle, "customformat") or []) if notes else []
+    bonus_pack = {f["id"]: notes[f["id"]] for f in formats if f.get("id") in notes and any(
+        c.get("implementation") == "ReleaseTypeSpecification" for c in f.get("specifications") or [])}
+    return {"autorisees": autorisees, "rangs": rangs, "bonus_pack": bonus_pack}
+
+
+def _score_hors_pack(p: dict[str, Any], profil: dict[str, Any]) -> int:
+    """
+    Score de formats d'une release lue par /parse, sans le bonus de pack : le pack
+    partiel et ses remplaçants en sont tous, il ne départage rien, et ne doit pas
+    faire passer le seuil à une release sans français.
+    """
+    bonus = sum(profil["bonus_pack"].get(f.get("id"), 0) for f in p.get("customFormats") or [])
+    return (p.get("customFormatScore") or 0) - bonus
 
 
 def _series_title_key(titre: str) -> str:
@@ -2697,7 +2765,7 @@ def _release_ref(url: str, cle: str, titre: str, profil: dict[str, Any]) -> dict
         "series_title": _series_title_key(info.get("seriesTitle") or ""),
         "season": info.get("seasonNumber"),
         "season_pack": bool(info.get("fullSeason") or info.get("isPartialSeason")) and not info.get("isMultiSeason"),
-        "score": p.get("customFormatScore") or 0,
+        "score": _score_hors_pack(p, profil),
         "rang": profil["rangs"].get(qid, -1),
     }
 
@@ -2725,8 +2793,10 @@ def _pack_candidate(
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """
     Cherche dans Prowlarr un pack de la saison qui apporte tous les épisodes à
-    couvrir, sans rien perdre : qualité autorisée par le profil et au moins aussi
-    bonne, score de formats au moins égal (le français reste le français).
+    couvrir. Mieux vaut une saison sans trou : son score de formats peut être plus
+    bas que celui du pack partiel, tant qu'il atteint IMPORT_ASSIST_PACK_MIN_SCORE
+    (le français reste le français), ou le score du partiel s'il est plus bas.
+    Sa qualité est autorisée par le profil, et au moins aussi bonne.
 
     Il doit aussi porter le même titre de série que le pack partiel. Une série
     d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases
@@ -2746,6 +2816,7 @@ def _pack_candidate(
     with qbit_session() as s:
         deja = exclus | {t["hash"].lower() for t in qbit_get_torrents(s)}
 
+    seuil = min(ref["score"], IMPORT_ASSIST_PACK_MIN_SCORE)
     candidats: list[tuple[int, int, int, dict[str, Any]]] = []
     vus: set[tuple[str, Any]] = set()
     autres_titres: set[str] = set()
@@ -2775,8 +2846,8 @@ def _pack_candidate(
             autres_titres.add(titre_serie)
             continue
         qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
-        score, rang = p.get("customFormatScore") or 0, profil["rangs"].get(qid, -1)
-        if qid not in profil["autorisees"] or score < ref["score"] or rang < ref["rang"]:
+        score, rang = _score_hors_pack(p, profil), profil["rangs"].get(qid, -1)
+        if qid not in profil["autorisees"] or rang < ref["rang"] or score < seuil:
             continue
         candidats.append((score, rang, r.get("seeders") or 0, r))
     ecartes: list[str] = []
