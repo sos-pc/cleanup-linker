@@ -203,6 +203,9 @@ networks:
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Assistant d'import en simulation : il journalise ce qu'il ferait, sans agir. Seuls `0`, `false` ou `no` le font agir |
 | `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Passage de renfort de l'assistant d'import, pour les events manqués. `0` le désactive |
+| `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (packs de saison partiels) en simulation, indépendamment de la règle 1. Seuls `0`, `false` ou `no` la font agir |
+| `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
+| `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
 
 ---
 
@@ -221,6 +224,7 @@ Triggers: ✅ On File Import       ← indispensable : indexe chaque import sans
           ❌ On Episode File Delete For Upgrade   ← laisser décoché (voir Limites connues)
           ❌ On Import Complete   ← inutile : doublon de On File Import
           ✅ On Manual Interaction Required   ← déclenche l'assistant d'import
+          ✅ On Grab              ← règle 4 : vérifie chaque pack de saison dès son grab
 ```
 
 Dans Sonarr, « On File Upgrade » n'envoie rien si « On File Import » n'est pas coché : c'est un filtre de cet event. Et « On Import Complete » ne dit pas quels fichiers un upgrade a remplacés.
@@ -416,13 +420,54 @@ INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2
 INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 ```
 
+### Règle 4 : pack de saison partiel
+
+Sonarr prend tout pack « S01 » pour la saison entière. Un pack qui n'en contient qu'une partie passe donc pour complet : une moitié de saison TVDB, comme une partie Netflix d'un anime, ou une « Part 1 ». Un vrai pack complet est ensuite refusé à chaque recherche, parce qu'il n'améliore pas les épisodes déjà là.
+
+**Au grab.** Dès que Sonarr prend un pack de saison, l'assistant lit sa liste de fichiers dans qBittorrent, qui a le `.torrent` dès le grab. Chaque vidéo passe par le parseur de Sonarr, celui qui servira à l'import. S'il manque au pack des épisodes diffusés, surveillés et sans fichier, l'assistant :
+1. arrête le torrent, avant qu'il ait eu le temps de télécharger ;
+2. cherche un pack complet de la saison dans Prowlarr ;
+3. s'il en trouve un, l'ajoute dans qBittorrent, dans la catégorie du client Sonarr et sous le titre de sa release : Sonarr le reconnaît par ce titre et l'importe comme les siens ;
+4. blackliste ensuite le pack partiel depuis la file de Sonarr, sans le supprimer du client ni relancer de recherche, puis le met en corbeille, arrêté : à peine entamé, il n'a rien à seeder.
+
+Sans pack complet, le pack partiel repart : mieux vaut une demi-saison que rien.
+
+Un pack complet doit :
+- apporter tous les épisodes manquants, d'après la liste des fichiers de son `.torrent` ;
+- être un pack de la même saison, ni multi-saisons, ni « Part » ;
+- porter le même titre de série que le pack partiel. Une série d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases nomment chacune « S01 ». Ainsi, « Monster: The Lizzie Borden Story » est la saison 4 de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer, qui a 10 épisodes au lieu de 8. Le « S01 complet » serait une autre histoire que celle demandée ;
+- avoir une qualité autorisée par le profil de la série, au moins aussi bonne que celle du pack partiel ;
+- avoir un score de formats au moins égal : une release française n'est jamais remplacée par une release qui ne l'est pas ;
+- avoir au moins 3 sources et un lien `.torrent`. Un magnet n'a pas de liste de fichiers à lire avant d'être ajouté.
+
+Les mieux classés passent d'abord : score, puis qualité, puis sources. Seuls les `.torrent` des 4 premiers sont lus, car chaque lecture passe par un tracker.
+
+Garde-fous :
+- **Hit-and-run :** un torrent privé déjà téléchargé à plus de 2 % n'est jamais arrêté. On le laisse finir, et la règle reprend après l'import.
+- **Pas de boucle :** au plus 2 remplacements par saison et par semaine. Au-delà, la saison revient à la main.
+- **Dossier partagé :** un pack complet publié sous le même nom de dossier que le partiel en partage les fichiers. Le partiel reste alors arrêté dans sa catégorie, parce que la corbeille a son propre dossier : ATM y emporterait les fichiers de l'autre.
+- **Vérification interrompue :** si le service redémarre pendant la recherche, le passage de renfort relance le torrent arrêté, passé 30 minutes.
+
+**Après l'import, en filet.** Un pack partiel peut quand même être importé : pris pendant un arrêt du service, magnet sans liste de fichiers au grab, ou torrent privé trop entamé. La règle 1 le trouve alors bloqué dans la file. Au lieu de lancer la recherche des épisodes manquants un à un, l'assistant ajoute un pack complet, choisi de la même façon. Une fois ce pack téléchargé, Sonarr importe seul les épisodes manquants, mais refuse de remplacer ceux du pack partiel, faute de les améliorer. L'assistant les importe alors à la main, en hardlink, à la place des fichiers du pack partiel — et de ceux-là seulement : un épisode remplacé entre-temps par une autre release n'est pas touché. Le pack partiel, qui n'a plus de fichier dans la bibliothèque, part en corbeille par l'event d'upgrade.
+
+La règle 4 a **sa propre simulation**, active par défaut et indépendante de la règle 1 : `IMPORT_ASSIST_PACK_DRY_RUN=false` la fait agir. Elle demande « On Grab » coché dans le webhook de Sonarr. Sans `PROWLARR_URL` et `PROWLARR_API_KEY`, elle signale les packs partiels sans y toucher. La saison 0 (épisodes spéciaux) n'est pas traitée.
+
+Verdicts : `pack-ok`, `pack-partial` (pack gardé), `pack-replace`, `pack-reimport` (fin d'un remplacement après import), `pack-skipped` et `pack-error`. `pack-stopped` et `pack-resumed` tracent l'arrêt d'un torrent et sa relance.
+
+```
+INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01.MULTi.VFF.1080p.WEBRiP.EAC3.2.0.x265-T3KASHi (C411, 15 sources, score 195)
+INFO   [SIMULATION] ⏭ [sonarr] Ranma ep 15-21 : pas un pack de saison
+```
+
 ### Déclenchement
 
 - **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
 - **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués.
 - **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts. `&dry_run=false` agit même si le service est en simulation ; `&dry_run=true` simule même s'il est actif. Seules les valeurs `0`, `false` et `no` font agir : une valeur mal saisie reste une simulation.
 
-Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lance. Pendant un passage, `/assist` répond `409`.
+Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lance. Pendant un passage, `/assist` répond `409`. Un passage programmé par un event qui trouve le verrou pris est reprogrammé, au lieu d'être perdu : une recherche de pack complet peut tenir le verrou plusieurs minutes.
+
+La règle 4 a son propre déclenchement au grab : l'event « On Grab » de Sonarr lance tout de suite la vérification du pack, en arrière-plan, sans attendre de passage.
 
 Limite : le passage programmé par un event vit dans le worker gunicorn qui a reçu l'event. Si ce worker redémarre dans les deux minutes, le passage est perdu, et le téléchargement attend le passage de renfort suivant.
 
@@ -441,6 +486,7 @@ Limite : le passage programmé par un event vit dans le worker gunicorn qui a re
 | `Download` avec `episodeFiles` | On Import Complete, s'il est coché | Fichiers importés indexés |
 | `EpisodeFileDelete` deleteReason=upgrade | On Episode File Delete For Upgrade, s'il est coché | Move vers cleanuparr-unlinked, avant l'import du nouveau fichier |
 | `ManualInteractionRequired` | Import bloqué (On Manual Interaction Required) | Passage de l'assistant d'import sous deux minutes |
+| `Grab` | Release prise (On Grab) | Marqué arr_managed ; pour un pack de saison, vérification de la règle 4 en arrière-plan |
 | `Test` | Test webhook | Répond OK |
 
 ### Radarr

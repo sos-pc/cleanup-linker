@@ -15,7 +15,9 @@ Améliorations v4 :
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -23,6 +25,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +86,14 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 # Seuls 0/false/no font agir : une valeur mal saisie garde la simulation.
 IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
+
+# Règle 4 de l'assistant : un pack de saison partiel est remplacé par un pack
+# complet, cherché dans Prowlarr. Sa propre simulation, indépendante de celle de
+# la règle 1, et dans les mêmes conditions : seuls 0/false/no font agir.
+# Sans Prowlarr, la règle se contente de signaler les packs partiels.
+IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
+PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -237,6 +248,21 @@ def init_db() -> None:
                     at          INTEGER DEFAULT (strftime('%s','now'))
                 );
                 CREATE INDEX IF NOT EXISTS idx_assist_dl ON assist_log(download_id);
+
+                -- Remplacements réels d'un pack partiel par un pack complet (règle 4).
+                CREATE TABLE IF NOT EXISTS pack_replace (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    series_id  INTEGER NOT NULL,
+                    season     INTEGER NOT NULL,
+                    old_hash   TEXT    NOT NULL,
+                    new_hash   TEXT    NOT NULL,
+                    new_title  TEXT,
+                    stage      TEXT,
+                    episodes   TEXT,
+                    at         INTEGER DEFAULT (strftime('%s','now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_pack_new ON pack_replace(new_hash);
+                CREATE INDEX IF NOT EXISTS idx_pack_old ON pack_replace(old_hash);
             """)
             # Migration : si l'ancienne table files a UNIQUE(path), on la recrée
             # Détecte si la contrainte unique est sur path seul
@@ -1141,7 +1167,7 @@ def _jellyfin_paths_by_metadata(data: dict[str, Any], max_paths: int) -> list[st
 
 
 def _arr_request(
-    method: str, base_url: str, api_key: str, endpoint: str, **kwargs: Any
+    method: str, base_url: str, api_key: str, endpoint: str, timeout: float = 30, **kwargs: Any
 ) -> Any:
     """Appel à l'API v3 d'un *arr. Retourne le JSON, ou None si corps vide."""
     session = _create_retry_session()
@@ -1150,7 +1176,7 @@ def _arr_request(
             method,
             f"{base_url.rstrip('/')}/api/v3/{endpoint}",
             headers={"X-Api-Key": api_key},
-            timeout=30,
+            timeout=timeout,
             **kwargs,
         )
         r.raise_for_status()
@@ -1861,16 +1887,20 @@ def _torrent_videos(t: dict[str, Any]) -> list[str] | None:
     return videos
 
 
-def _imported_category(clients: list[dict[str, Any]], nom: str) -> str:
-    """Catégorie après import du client *arr : celle qu'il aurait posée lui-même."""
+def _client_field(clients: list[dict[str, Any]], nom: str, champs: tuple[str, ...]) -> str:
+    """Valeur du premier de ces champs renseigné sur le client *arr nommé."""
     for c in clients:
         if c.get("name") != nom:
             continue
         for f in c.get("fields") or []:
-            # tvImportedCategory (Sonarr), movieImportedCategory (Radarr)
-            if f.get("name", "").endswith("ImportedCategory") and f.get("value"):
+            if f.get("name") in champs and f.get("value"):
                 return f["value"]
     return ""
+
+
+def _imported_category(clients: list[dict[str, Any]], nom: str) -> str:
+    """Catégorie après import du client *arr : celle qu'il aurait posée lui-même."""
+    return _client_field(clients, nom, ("tvImportedCategory", "movieImportedCategory"))
 
 
 def _assist_seen(download_id: str, decision: str, dry_run: bool) -> bool:
@@ -1992,7 +2022,10 @@ def _run_scheduled_assist(source: str) -> None:
     with _assist_timer_lock:
         _assist_timer = None
     try:
-        run_import_assist(source=source)
+        if run_import_assist(source=source) is None:
+            # Un autre passage tenait le verrou — une recherche de pack peut durer
+            # plusieurs minutes. Il a pu lire la file avant ce blocage : on repasse.
+            schedule_import_assist(source)
     except Exception as e:
         log.error("Erreur assistant d'import : %s", e)
 
@@ -2067,6 +2100,11 @@ def _assist_download(
         except OSError:
             continue
     if lies < len(videos):
+        # Règle 4 : le pack complet ajouté à la place d'un pack partiel n'importe
+        # seul que les épisodes manquants. Le remplacement se termine ici.
+        remplacement = _pack_replacement(dl) if arr == "sonarr" else None
+        if remplacement:
+            return _pack_finish(url, cle, dl, titre, inodes, remplacement, ctx, verdict, ecarte)
         return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
     categorie = _imported_category(clients, records[0].get("downloadClient") or "")
@@ -2083,30 +2121,57 @@ def _assist_download(
         return ecarte(f"la catégorie {categorie} a un autre dossier")
     if not dry_run and _assist_seen(dl, "seed", False):
         return ecarte("déjà traité dans les dernières 24 h, toujours dans la file")
+    # Simulation déjà journalisée : la recherche d'un pack complet n'est pas refaite.
+    deja_vu = dry_run and _assist_seen(dl, "seed", True)
 
     # Épisodes que la release devait apporter et qui manquent encore.
     manquants: list[int] = []
+    episodes: list[dict[str, Any]] = []
     attendus = {r.get("episodeId") for r in records if r.get("episodeId")}
     if arr == "sonarr" and attendus:
-        maintenant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        manquants = [
-            e["id"]
-            for e in _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
-            if e["id"] in attendus and e.get("monitored") and not e.get("hasFile")
-            and (e.get("airDateUtc") or "9999") <= maintenant
-        ]
-    recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH else []
+        episodes = _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
+        voulus = _episodes_wanted(episodes)
+        manquants = [e["id"] for e in episodes if e["id"] in attendus and e["id"] in voulus]
+
+    # Règle 4, filet après import : un pack de saison qui n'a pas tout apporté est
+    # remplacé par un pack complet, plutôt que de chercher ses épisodes un à un.
+    pack: dict[str, Any] | None = None
+    note = ""
+    if manquants and not deja_vu:
+        try:
+            pack, note = _pack_after_import(url, cle, media_id, dl, titre, records, episodes,
+                                            manquants, videos, clients)
+        except Exception as e:
+            note = f"recherche d'un pack complet impossible : {e}"
+            log.error("  ⚠ [%s] %s : %s", arr, titre, note)
+    # Un remplacement déjà lancé compte, même si la règle 4 est repassée en simulation.
+    remplace = pack is not None and (bool(pack.get("deja")) or not IMPORT_ASSIST_PACK_DRY_RUN)
+    if remplace and not dry_run and not pack.get("deja"):
+        try:
+            _qbit_add(pack, pack["category"], t)
+            _pack_register(media_id, pack["season"], dl, pack, "import", pack["episodes"])
+        except Exception as e:
+            remplace, note = False, f"ajout du pack complet {pack['title']} impossible : {e}"
+            log.error("  ⚠ [%s] %s : %s", arr, titre, note)
+
+    recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH and not remplace else []
     resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
-    if recherche:
+    if remplace:
+        resume += f", pack complet {pack['title']} à la place des {len(manquants)} épisode(s) manquant(s)"
+    elif recherche:
         resume += f", recherche de {len(recherche)} épisode(s) manquant(s)"
     elif manquants:
         resume += (f", {len(manquants)} épisodes manquants : trop pour une recherche "
                    "automatique, à lancer depuis Sonarr")
+    if note:
+        resume += f" ({note})"
+    elif pack is not None and not remplace:
+        resume += f" (règle 4 en simulation : remplacerait par le pack complet {pack['title']})"
     verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants),
-                   search=bool(recherche))
+                   search=bool(recherche), pack=pack["title"] if remplace else None)
 
     if dry_run:
-        if _assist_seen(dl, "seed", True):
+        if deja_vu:
             return verdict, False
         _assist_record(dl, arr, titre, "seed", resume, True)
         log.info("  %s✓ [%s] %s : %s", prefix, arr, titre, resume)
@@ -2146,10 +2211,767 @@ def import_assist_loop() -> None:
     time.sleep(120)
     while True:
         try:
+            if SONARR_URL and SONARR_API_KEY:
+                _pack_recover()
             run_import_assist(source="passage de renfort")
         except Exception as e:
             log.error("Erreur assistant d'import : %s", e)
         time.sleep(IMPORT_ASSIST_INTERVAL)
+
+
+# ── Assistant d'import, règle 4 : packs de saison partiels ──────────────────
+#
+# Sonarr prend tout « S01 » pour la saison entière. Un pack qui n'en contient
+# qu'une partie (une moitié de saison TVDB, une « Part 1 ») passe donc pour
+# complet, et un vrai pack complet est ensuite refusé : il n'améliore pas les
+# épisodes déjà là. La règle lit la liste des fichiers dès le grab ; s'il manque
+# des épisodes, le torrent est arrêté avant d'avoir téléchargé et remplacé par un
+# pack complet trouvé dans Prowlarr. Après import, elle sert de filet.
+
+# Un torrent privé déjà entamé n'est jamais arrêté (hit-and-run) : au-delà de
+# cette part téléchargée, on le laisse finir et la règle reprend après l'import.
+_PACK_STOP_MAX_PROGRESS = 0.02
+# Un magnet n'a pas encore sa liste de fichiers au grab : délai d'attente.
+_PACK_METADATA_WAIT = 120
+# Sources minimum d'un pack candidat.
+_PACK_MIN_SEEDERS = 3
+# .torrent lus au plus par recherche : chaque lecture passe par un tracker.
+_PACK_MAX_TORRENTS = 4
+# Remplacements réels au plus par saison sur la période : au-delà, la saison
+# tourne en rond (numérotation, releases mal nommées) et revient à la main.
+_PACK_MAX_ATTEMPTS = 2
+_PACK_ATTEMPTS_WINDOW = 7 * 24 * 3600
+# Au-delà, un pack n'est pas analysé : chaque vidéo coûte un /parse à Sonarr.
+_PACK_MAX_FILES = 300
+_PACK_TORRENT_MAX_BYTES = 20 * 1024 * 1024
+# Un torrent arrêté par une vérification restée sans verdict (service redémarré
+# pendant la recherche) est relancé par le passage de renfort, passé ce délai.
+_PACK_RECOVER_AFTER = 1800
+# Recherches Prowlarr simultanées par process : l'arrêt du torrent, lui, n'attend pas.
+_pack_slots = threading.BoundedSemaphore(2)
+
+
+def schedule_pack_check(data: dict[str, Any]) -> bool:
+    """
+    Lance la vérification d'un grab Sonarr de pack de saison, en arrière-plan.
+    False si le grab n'en est pas un : film, épisode seul, plusieurs saisons.
+    """
+    serie = data.get("series") if isinstance(data.get("series"), dict) else {}
+    release = data.get("release") if isinstance(data.get("release"), dict) else {}
+    episodes = [e for e in data.get("episodes") or [] if isinstance(e, dict)]
+    saisons = {e.get("seasonNumber") for e in episodes}
+    titre = release.get("releaseTitle") or ""
+    dl = (data.get("downloadId") or "").lower().strip()
+    if not (SONARR_URL and SONARR_API_KEY) or not serie.get("id") or not dl or not titre:
+        return False
+    if len(episodes) < 2 or len(saisons) != 1 or None in saisons:
+        return False
+    if (data.get("downloadClientType") or "").lower() != "qbittorrent":
+        return False
+    threading.Thread(target=_run_pack_check, args=(serie["id"], saisons.pop(), dl, titre), daemon=True).start()
+    return True
+
+
+def _run_pack_check(serie_id: int, saison: int, dl: str, titre: str) -> None:
+    try:
+        check_pack_grab(serie_id, saison, dl, titre)
+    except Exception as e:
+        log.error("Règle 4 : vérification de %s en erreur (%s)", titre, e)
+        _assist_record(dl, "sonarr", titre, "pack-error", str(e), IMPORT_ASSIST_PACK_DRY_RUN)
+
+
+def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
+                    dry_run: bool | None = None) -> dict[str, Any]:
+    """
+    Règle 4, au grab : le pack apporte-t-il tous les épisodes attendus de la saison ?
+
+    La liste des fichiers vient de qBittorrent, qui a le .torrent dès le grab ;
+    chaque vidéo passe par le parseur de Sonarr, celui qui servira à l'import.
+    S'il manque des épisodes, le torrent est arrêté tout de suite, puis remplacé
+    par un pack complet trouvé dans Prowlarr : le complet est ajouté d'abord, puis
+    le partiel est blacklisté (sans suppression ni nouvelle recherche) et part en
+    corbeille, arrêté. Sans pack complet, le partiel repart : mieux vaut une
+    demi-saison que rien.
+    """
+    dry_run = IMPORT_ASSIST_PACK_DRY_RUN if dry_run is None else dry_run
+    dl = dl.lower()
+    url, cle = SONARR_URL, SONARR_API_KEY
+    prefix = "[SIMULATION] " if dry_run else ""
+    verdict: dict[str, Any] = {"arr": "sonarr", "download_id": dl, "title": titre, "stage": "grab"}
+
+    def fin(decision: str, details: str, signe: str = "⏭") -> dict[str, Any]:
+        verdict.update(decision=decision, reason=details)
+        _assist_record(dl, "sonarr", titre, decision, details, dry_run)
+        log.info("  %s%s [sonarr] %s : %s", prefix, signe, titre, details)
+        return verdict
+
+    if saison == 0:
+        return fin("pack-skipped", "saison 0 (épisodes spéciaux) : non traitée")
+    serie = _arr_request("GET", url, cle, f"series/{serie_id}") or {}
+    profil = _quality_profile(url, cle, serie.get("qualityProfileId"))
+    ref = _release_ref(url, cle, titre, profil)
+    if not ref["season_pack"]:
+        return fin("pack-skipped", "pas un pack de saison")
+    t, fichiers = _qbit_torrent_files(dl, _PACK_METADATA_WAIT)
+    if t is None:
+        return fin("pack-skipped", "absent de qBittorrent")
+    if fichiers is None:
+        return fin("pack-skipped", "liste des fichiers inconnue (magnet sans métadonnées) : "
+                                   "la règle reprendra après l'import")
+    noms = _video_names(fichiers)
+    if len(noms) > _PACK_MAX_FILES:
+        return fin("pack-skipped", f"{len(noms)} vidéos : trop pour être analysées")
+    episodes = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": serie_id}) or []
+                if e.get("seasonNumber") == saison]
+    voulus = _episodes_wanted(episodes)
+    if not voulus:
+        return fin("pack-ok", "aucun épisode manquant dans la saison", "✓")
+    couverts = _pack_coverage(url, cle, serie_id, saison, episodes, noms) & voulus
+    if couverts == voulus:
+        return fin("pack-ok", f"le pack apporte les {len(voulus)} épisodes attendus", "✓")
+    resume = f"pack partiel : {len(couverts)}/{len(voulus)} épisodes attendus de la saison {saison}"
+    if _pack_attempts(serie_id, saison) >= _PACK_MAX_ATTEMPTS:
+        return fin("pack-partial", f"{resume}, limite de remplacements atteinte pour cette saison : "
+                                   "à voir à la main", "⚠")
+    if not (PROWLARR_URL and PROWLARR_API_KEY):
+        # Sans recherche possible, l'arrêter ne servirait à rien.
+        return fin("pack-partial", f"{resume}, Prowlarr non configuré : rien à remplacer", "⚠")
+
+    arrete = False
+    if not dry_run:
+        # Arrêté d'abord, mesuré ensuite : la part téléchargée n'augmente plus
+        # pendant qu'on la lit.
+        _qbit_post("stop", {"hashes": dl})
+        progres = (_qbit_info(dl) or {}).get("progress") or 0
+        if t.get("private") and progres > _PACK_STOP_MAX_PROGRESS:
+            _qbit_post("start", {"hashes": dl})
+            return fin("pack-partial", f"{resume}, déjà téléchargé à {progres:.0%} sur un tracker privé : "
+                                       "on le laisse finir, la règle reprendra après l'import", "⚠")
+        arrete = True
+        # Tracé tout de suite : si le service redémarre pendant la recherche, le
+        # passage de renfort relance le torrent.
+        _assist_record(dl, "sonarr", titre, "pack-stopped", resume, False)
+    try:
+        with _pack_slots:
+            cand, ecartes = _pack_candidate(url, cle, serie, saison, episodes, voulus, ref, profil, {dl})
+        if cand is None:
+            if arrete:
+                _qbit_post("start", {"hashes": dl})
+            return fin("pack-partial", f"{resume}, aucun pack complet trouvé{_ecarts(ecartes)} : on le garde", "⚠")
+        details = (f"{resume} → remplacé par {cand['title']} ({cand['indexer']}, "
+                   f"{cand['seeders']} sources, score {cand['score']})")
+        verdict["replacement"] = cand["title"]
+        if dry_run:
+            return fin("pack-replace", details, "✓")
+        _qbit_add(cand, t.get("category") or "", t)
+    except Exception:
+        if arrete:
+            _qbit_restart(dl)
+        raise
+
+    # Le pack complet est en place : le partiel peut partir.
+    _pack_register(serie_id, saison, dl, cand, "grab", voulus)
+    try:
+        if not _sonarr_blocklist(url, cle, serie_id, dl):
+            details += " (pas blacklisté : absent de la file Sonarr)"
+    except Exception as e:
+        details += f" (blacklist Sonarr impossible : {e})"
+        log.error("Règle 4 : blacklist de %s impossible (%s)", titre, e)
+    if not _pack_trash(t):
+        details += " (laissé arrêté dans sa catégorie : son dossier est aussi celui d'un autre torrent)"
+    return fin("pack-replace", details, "✓")
+
+
+def _pack_after_import(
+    url: str, cle: str, serie_id: int, dl: str, titre: str, records: list[dict[str, Any]],
+    episodes: list[dict[str, Any]], manquants: list[int], videos: list[str],
+    clients: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    Règle 4, filet après import : le pack de saison est importé mais n'a pas tout
+    apporté — pris pendant un arrêt du service, magnet sans métadonnées au grab,
+    torrent privé trop entamé pour être arrêté. Cherche un pack complet qui
+    remplacera ses épisodes et apportera les manquants.
+    Retourne (pack à ajouter, ou None ; note pour le verdict).
+    """
+    deja = _pack_replacement(dl, "old_hash")
+    if deja:
+        # Ajouté par un passage précédent, qui n'a pas pu sortir le partiel de la file.
+        return {"title": deja["new_title"], "deja": True}, ""
+    saisons = {e.get("seasonNumber") for e in episodes if e["id"] in manquants}
+    if len(saisons) != 1 or 0 in saisons:
+        return None, ""
+    saison = saisons.pop()
+    serie = _arr_request("GET", url, cle, f"series/{serie_id}") or {}
+    profil = _quality_profile(url, cle, serie.get("qualityProfileId"))
+    ref = _release_ref(url, cle, titre, profil)
+    if not ref["season_pack"] or ref["season"] != saison:
+        return None, ""
+    if _pack_attempts(serie_id, saison) >= _PACK_MAX_ATTEMPTS:
+        return None, "règle 4 : limite de remplacements atteinte pour cette saison"
+    categorie = _client_field(clients, records[0].get("downloadClient") or "", ("tvCategory",))
+    if not categorie:
+        return None, "règle 4 : pas de catégorie de téléchargement sur le client"
+
+    de_la_saison = [e for e in episodes if e.get("seasonNumber") == saison]
+    # Épisodes que ce pack a apportés : leur fichier est un hardlink d'une de ses vidéos.
+    inodes: set[int] = set()
+    for v in videos:
+        try:
+            inodes.add(os.stat(v).st_ino)
+        except OSError:
+            continue
+    chemins = {f["id"]: f.get("path") for f in
+               _arr_request("GET", url, cle, "episodefile", params={"seriesId": serie_id}) or []}
+    apportes: set[int] = set()
+    for e in de_la_saison:
+        chemin = chemins.get(e.get("episodeFileId"))
+        try:
+            if chemin and os.stat(chemin).st_ino in inodes:
+                apportes.add(e["id"])
+        except OSError:
+            continue
+    a_couvrir = apportes | set(manquants)
+    with _pack_slots:
+        cand, ecartes = _pack_candidate(url, cle, serie, saison, de_la_saison, a_couvrir, ref, profil, {dl})
+    if cand is None:
+        return None, f"règle 4 : aucun pack complet trouvé{_ecarts(ecartes)}"
+    cand.update(season=saison, episodes=a_couvrir, category=categorie)
+    return cand, ""
+
+
+def _pack_finish(
+    url: str, cle: str, dl: str, titre: str, inodes_media: set[int], remplacement: sqlite3.Row,
+    ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Règle 4, fin du remplacement. Le pack complet est téléchargé : Sonarr a importé
+    seul les épisodes manquants, mais refuse de remplacer ceux du pack partiel,
+    qu'il n'améliore pas (même score). On les importe à la main, en hardlink, à la
+    place des fichiers du pack partiel — de ceux-là seulement : un épisode remplacé
+    entre-temps par autre chose n'est pas touché. Le pack partiel, qui n'a plus de
+    fichier dans la bibliothèque, part ensuite en corbeille par l'event d'upgrade.
+    """
+    dry_run = ctx["dry_run"] or IMPORT_ASSIST_PACK_DRY_RUN
+    if not dry_run and _assist_seen(dl, "pack-reimport", False):
+        return ecarte("remplacement déjà lancé dans les dernières 24 h, toujours dans la file")
+    serie_id = remplacement["series_id"]
+    ancien = ctx["torrents"].get(remplacement["old_hash"])
+    inodes_ancien: set[int] = set()
+    for v in (_torrent_videos(ancien) or []) if ancien else []:
+        try:
+            inodes_ancien.add(os.stat(v).st_ino)
+        except OSError:
+            continue
+    if not inodes_ancien:
+        # Retiré de qBittorrent, ou arrêté au grab avant d'avoir rien téléchargé.
+        return ecarte("règle 4 : aucun fichier du pack partiel à remplacer, import à finir à la main")
+
+    prevus = set(json.loads(remplacement["episodes"] or "[]"))
+    chemins = {f["id"]: f.get("path") for f in
+               _arr_request("GET", url, cle, "episodefile", params={"seriesId": serie_id}) or []}
+    fichier_de = {e["id"]: chemins.get(e.get("episodeFileId"))
+                  for e in _arr_request("GET", url, cle, "episode", params={"seriesId": serie_id}) or []}
+
+    def du_partiel(episode_id: int) -> bool:
+        chemin = fichier_de.get(episode_id)
+        if not chemin:
+            return True  # sans fichier : rien à écraser
+        try:
+            return os.stat(chemin).st_ino in inodes_ancien
+        except OSError:
+            return False
+
+    entrees: list[dict[str, Any]] = []
+    propositions = _arr_request("GET", url, cle, "manualimport", timeout=300,
+                                params={"downloadId": dl.upper(), "filterExistingFiles": "false"}) or []
+    for it in propositions:
+        ids = [e["id"] for e in it.get("episodes") or []]
+        if (not ids or not it.get("quality") or (it.get("series") or {}).get("id") != serie_id
+                or not set(ids) <= prevus or not all(du_partiel(i) for i in ids)):
+            continue
+        try:
+            if os.stat(it["path"]).st_ino in inodes_media:
+                continue  # déjà importé
+        except OSError:
+            continue
+        entrees.append({
+            "path": it["path"], "seriesId": serie_id, "episodeIds": ids, "quality": it["quality"],
+            "languages": it.get("languages") or [], "releaseGroup": it.get("releaseGroup") or "",
+            "indexerFlags": it.get("indexerFlags") or 0, "releaseType": it.get("releaseType") or "singleEpisode",
+            "downloadId": dl.upper(),
+        })
+    if not entrees:
+        return ecarte("règle 4 : rien à remplacer, les épisodes restants ne viennent pas du pack partiel")
+
+    resume = f"pack complet de remplacement : {len(entrees)} vidéo(s) importée(s) à la place du pack partiel"
+    verdict.update(decision="pack-reimport", files=len(entrees))
+    if dry_run:
+        if _assist_seen(dl, "pack-reimport", True):
+            return verdict, False
+        _assist_record(dl, "sonarr", titre, "pack-reimport", resume, True)
+        log.info("  [SIMULATION] ✓ [sonarr] %s : %s", titre, resume)
+        return verdict, True
+    # « copy » : hardlink depuis le torrent, qui continue de seeder.
+    _arr_request("POST", url, cle, "command", json={"name": "ManualImport", "importMode": "copy", "files": entrees})
+    _assist_record(dl, "sonarr", titre, "pack-reimport", resume, False)
+    log.info("  ✓ [sonarr] %s : %s", titre, resume)
+    return verdict, True
+
+
+def _pack_recover() -> int:
+    """
+    Relance les packs arrêtés par une vérification restée sans verdict — service
+    redémarré pendant la recherche. Sans ça, ils resteraient arrêtés dans la file
+    de Sonarr. Retourne le nombre de torrents relancés.
+    """
+    maintenant = int(time.time())
+    with _db_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT a.download_id, a.title FROM assist_log a "
+                "WHERE a.decision = 'pack-stopped' AND a.dry_run = 0 AND a.at BETWEEN ? AND ? "
+                "AND NOT EXISTS (SELECT 1 FROM assist_log b WHERE b.download_id = a.download_id "
+                "AND b.id > a.id AND b.decision LIKE 'pack-%')",
+                (maintenant - 2 * 86400, maintenant - _PACK_RECOVER_AFTER),
+            ).fetchall()
+    relances = 0
+    for row in rows:
+        dl, titre = row["download_id"], row["title"]
+        try:
+            t = _qbit_info(dl)
+            if t and t.get("category") != TARGET_CAT and t.get("state") in ("stoppedDL", "pausedDL"):
+                _qbit_post("start", {"hashes": dl})
+                relances += 1
+                details = "vérification interrompue : torrent relancé"
+            else:
+                details = "vérification interrompue : torrent déjà reparti ou retiré"
+            _assist_record(dl, "sonarr", titre, "pack-resumed", details, False)
+            log.info("  ↻ [sonarr] %s : %s", titre, details)
+        except Exception as e:
+            log.error("Règle 4 : relance de %s impossible (%s)", titre, e)
+    return relances
+
+
+def _episodes_wanted(episodes: list[dict[str, Any]]) -> set[int]:
+    """Épisodes diffusés, surveillés et sans fichier : ceux que Sonarr attend."""
+    maintenant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {e["id"] for e in episodes if e.get("monitored") and not e.get("hasFile")
+            and (e.get("airDateUtc") or "9999") <= maintenant}
+
+
+def _video_names(fichiers: list[tuple[str, int]]) -> list[str]:
+    """Vidéos d'une liste (chemin, taille), échantillons exclus — comme _torrent_videos, sans le disque."""
+    return [nom for nom, taille in fichiers
+            if os.path.splitext(nom)[1].lower() in VIDEO_EXTENSIONS
+            and not (taille < _SAMPLE_MAX_BYTES and _SAMPLE_RE.search(nom))]
+
+
+def _pack_coverage(url: str, cle: str, serie_id: int, saison: int,
+                   episodes: list[dict[str, Any]], noms: list[str]) -> set[int]:
+    """
+    Épisodes de la saison qu'apportent ces vidéos, d'après le parseur de Sonarr.
+    Seul le nom du fichier compte, comme à l'import : une vidéo qui ne porte pas
+    son numéro ne couvre rien, même rangée dans un dossier « S01 ».
+    """
+    par_numero = {e["episodeNumber"]: e["id"] for e in episodes if e.get("seasonNumber") == saison}
+    par_absolu = {e["absoluteEpisodeNumber"]: e["id"] for e in episodes
+                  if e.get("seasonNumber") == saison and e.get("absoluteEpisodeNumber")}
+    couverts: set[int] = set()
+    for nom in noms:
+        p = _arr_request("GET", url, cle, "parse", params={"title": os.path.basename(nom)}) or {}
+        info = p.get("parsedEpisodeInfo") or {}
+        if not info or info.get("fullSeason"):
+            continue
+        serie = p.get("series") or {}
+        if serie:
+            # Série reconnue : la correspondance de Sonarr fait foi, numérotation
+            # de scène comprise. Une autre série ne couvre rien.
+            if serie.get("id") == serie_id:
+                couverts |= {e["id"] for e in p.get("episodes") or [] if e.get("seasonNumber") == saison}
+        elif info.get("episodeNumbers"):
+            if info.get("seasonNumber") == saison:
+                couverts |= {par_numero[n] for n in info["episodeNumbers"] if n in par_numero}
+        else:
+            couverts |= {par_absolu[n] for n in info.get("absoluteEpisodeNumbers") or [] if n in par_absolu}
+    return couverts
+
+
+def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any]:
+    """Qualités autorisées par le profil, et leur rang : l'ordre du profil, de la moins bonne à la meilleure."""
+    profil = (_arr_request("GET", url, cle, f"qualityprofile/{profil_id}") or {}) if profil_id else {}
+    autorisees: set[int] = set()
+    rangs: dict[int, int] = {}
+    for rang, item in enumerate(profil.get("items") or []):
+        for membre in [item] if item.get("quality") else item.get("items") or []:
+            qid = (membre.get("quality") or {}).get("id")
+            if qid is None:
+                continue
+            rangs[qid] = rang
+            if item.get("allowed"):
+                autorisees.add(qid)
+    return {"autorisees": autorisees, "rangs": rangs}
+
+
+def _series_title_key(titre: str) -> str:
+    """Titre de série tel que lu dans une release, comparable : sans casse, accents, ponctuation ni année."""
+    t = unicodedata.normalize("NFKD", titre).encode("ascii", "ignore").decode().lower()
+    t = re.sub(r"\b(19|20)\d{2}\b", " ", t)
+    return re.sub(r"[^a-z0-9]+", "", t)
+
+
+def _release_ref(url: str, cle: str, titre: str, profil: dict[str, Any]) -> dict[str, Any]:
+    """Titre de série, saison, score de formats et rang de qualité d'une release, d'après le parseur de Sonarr."""
+    p = _arr_request("GET", url, cle, "parse", params={"title": titre}) or {}
+    info = p.get("parsedEpisodeInfo") or {}
+    qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
+    return {
+        "series_title": _series_title_key(info.get("seriesTitle") or ""),
+        "season": info.get("seasonNumber"),
+        "season_pack": bool(info.get("fullSeason") or info.get("isPartialSeason")) and not info.get("isMultiSeason"),
+        "score": p.get("customFormatScore") or 0,
+        "rang": profil["rangs"].get(qid, -1),
+    }
+
+
+def _pack_queries(serie: dict[str, Any], saison: int) -> list[str]:
+    """Requêtes « Titre S01 » : titre de la série et titres alternatifs, deux au plus."""
+    titres = [serie.get("title") or ""] + [
+        a.get("title") or "" for a in serie.get("alternateTitles") or []
+        if a.get("seasonNumber") in (None, -1, saison)
+    ]
+    requetes: list[str] = []
+    for titre in titres:
+        titre = re.sub(r"\(\d{4}\)", " ", titre)
+        titre = re.sub(r"['’]", "", titre)
+        titre = re.sub(r"[^\w]+", " ", titre).strip()
+        requete = f"{titre} S{saison:02d}"
+        if titre and requete.lower() not in {r.lower() for r in requetes}:
+            requetes.append(requete)
+    return requetes[:2]
+
+
+def _pack_candidate(
+    url: str, cle: str, serie: dict[str, Any], saison: int, episodes: list[dict[str, Any]],
+    a_couvrir: set[int], ref: dict[str, Any], profil: dict[str, Any], exclus: set[str],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """
+    Cherche dans Prowlarr un pack de la saison qui apporte tous les épisodes à
+    couvrir, sans rien perdre : qualité autorisée par le profil et au moins aussi
+    bonne, score de formats au moins égal (le français reste le français).
+
+    Il doit aussi porter le même titre de série que le pack partiel. Une série
+    d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases
+    nomment chacune « S01 » : « Monster: The Lizzie Borden Story » est la saison 4
+    de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer.
+    Le « S01 complet » serait alors une autre histoire que celle demandée.
+
+    Les mieux notés d'abord ; seuls leurs .torrent sont lus, la liste des
+    fichiers faisant foi. Retourne (candidat, motifs d'écart).
+    """
+    if not (PROWLARR_URL and PROWLARR_API_KEY):
+        return None, ["Prowlarr non configuré"]
+    resultats: list[dict[str, Any]] = []
+    for requete in _pack_queries(serie, saison):
+        resultats += _prowlarr_search(requete)
+    # Déjà dans qBittorrent, partiel compris : rien à ajouter.
+    with qbit_session() as s:
+        deja = exclus | {t["hash"].lower() for t in qbit_get_torrents(s)}
+
+    candidats: list[tuple[int, int, int, dict[str, Any]]] = []
+    vus: set[tuple[str, Any]] = set()
+    autres_titres: set[str] = set()
+    for r in resultats:
+        titre = r.get("title") or ""
+        cle_r = (titre.lower(), r.get("size"))
+        if cle_r in vus:
+            continue
+        vus.add(cle_r)
+        # Un magnet n'a pas de liste de fichiers à lire avant d'être ajouté.
+        if r.get("protocol") != "torrent" or not r.get("downloadUrl"):
+            continue
+        if (r.get("seeders") or 0) < _PACK_MIN_SEEDERS:
+            continue
+        if (r.get("infoHash") or "").lower() in deja:
+            continue
+        if r.get("files") and r["files"] < len(a_couvrir):
+            continue  # Prowlarr connaît le nombre de fichiers : trop peu
+        p = _arr_request("GET", url, cle, "parse", params={"title": titre}) or {}
+        info = p.get("parsedEpisodeInfo") or {}
+        if ((p.get("series") or {}).get("id") != serie.get("id") or info.get("seasonNumber") != saison
+                or not info.get("fullSeason") or info.get("isPartialSeason") or info.get("isMultiSeason")
+                or info.get("isSeasonExtra") or info.get("special")):
+            continue
+        titre_serie = info.get("seriesTitle") or ""
+        if ref["series_title"] and _series_title_key(titre_serie) != ref["series_title"]:
+            autres_titres.add(titre_serie)
+            continue
+        qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
+        score, rang = p.get("customFormatScore") or 0, profil["rangs"].get(qid, -1)
+        if qid not in profil["autorisees"] or score < ref["score"] or rang < ref["rang"]:
+            continue
+        candidats.append((score, rang, r.get("seeders") or 0, r))
+    ecartes: list[str] = []
+    if autres_titres:
+        ecartes.append("sous un autre titre : " + ", ".join(sorted(autres_titres)[:3]))
+    if not candidats:
+        return None, ["aucun pack de la saison à la hauteur dans Prowlarr"] + ecartes
+
+    candidats.sort(key=lambda c: (-c[0], -c[1], -c[2]))
+    for score, _, seeders, r in candidats[:_PACK_MAX_TORRENTS]:
+        titre = r.get("title") or ""
+        try:
+            contenu = _fetch_torrent(r["downloadUrl"])
+            meta = _torrent_meta(contenu)
+        except Exception as e:
+            ecartes.append(f"{titre} : .torrent illisible ({e})")
+            continue
+        if meta["hash"] in deja:
+            ecartes.append(f"{titre} : déjà dans qBittorrent")
+            continue
+        noms = _video_names(meta["files"])
+        if len(noms) > _PACK_MAX_FILES:
+            ecartes.append(f"{titre} : {len(noms)} vidéos, trop pour être analysées")
+            continue
+        couverts = _pack_coverage(url, cle, serie["id"], saison, episodes, noms) & a_couvrir
+        if couverts == a_couvrir:
+            return {"title": titre, "indexer": r.get("indexer") or "?", "seeders": seeders, "score": score,
+                    "hash": meta["hash"], "torrent": contenu}, ecartes
+        ecartes.append(f"{titre} : {len(couverts)}/{len(a_couvrir)} épisodes")
+    return None, ecartes
+
+
+def _ecarts(ecartes: list[str]) -> str:
+    if not ecartes:
+        return ""
+    return " (" + " ; ".join(ecartes[:3]) + (" ; …" if len(ecartes) > 3 else "") + ")"
+
+
+def _prowlarr_search(requete: str) -> list[dict[str, Any]]:
+    """Recherche texte sur tous les indexeurs de Prowlarr. Rien n'est téléchargé."""
+    r = requests.get(
+        f"{PROWLARR_URL}/api/v1/search",
+        params={"query": requete, "type": "search", "limit": 100},
+        headers={"X-Api-Key": PROWLARR_API_KEY},
+        timeout=300,
+    )
+    r.raise_for_status()
+    return r.json() or []
+
+
+def _fetch_torrent(lien: str) -> bytes:
+    """
+    Télécharge un .torrent par son lien Prowlarr. Le lien porte une clé d'API, et
+    le tracker vers lequel il redirige souvent une clé personnelle : il n'apparaît
+    dans aucun message, l'erreur ne garde que son type.
+    """
+    try:
+        with requests.get(lien, timeout=60, stream=True) as r:
+            if r.status_code != 200:
+                raise ValueError(f"HTTP {r.status_code}")
+            contenu = b""
+            for bloc in r.iter_content(65536):
+                contenu += bloc
+                if len(contenu) > _PACK_TORRENT_MAX_BYTES:
+                    raise ValueError("fichier trop gros")
+            return contenu
+    except requests.RequestException as e:
+        # Un lien magnet (InvalidSchema) aboutit aussi ici.
+        raise ValueError(type(e).__name__) from None
+
+
+def _bdecode(data: bytes, i: int = 0) -> tuple[Any, int]:
+    """Décode une valeur bencode à partir de la position i. Retourne (valeur, position suivante)."""
+    c = data[i:i + 1]
+    if c == b"i":
+        fin = data.index(b"e", i)
+        return int(data[i + 1:fin]), fin + 1
+    if c in (b"l", b"d"):
+        i += 1
+        items: list[Any] = []
+        while data[i:i + 1] != b"e":
+            if i >= len(data):
+                raise ValueError("bencode tronqué")
+            v, i = _bdecode(data, i)
+            items.append(v)
+        return (items if c == b"l" else dict(zip(items[::2], items[1::2]))), i + 1
+    if c.isdigit():
+        sep = data.index(b":", i)
+        n = int(data[i:sep])
+        if sep + 1 + n > len(data):
+            raise ValueError("bencode tronqué")
+        return data[sep + 1:sep + 1 + n], sep + 1 + n
+    raise ValueError("bencode invalide")
+
+
+def _torrent_meta(contenu: bytes) -> dict[str, Any]:
+    """Nom, fichiers (chemin, taille) et infohash v1 d'un .torrent. Les trackers n'en sortent jamais."""
+    if contenu[:1] != b"d":
+        raise ValueError("pas un .torrent")
+    i, info, brut = 1, None, b""
+    while contenu[i:i + 1] != b"e":
+        if i >= len(contenu):
+            raise ValueError("bencode tronqué")
+        k, i = _bdecode(contenu, i)
+        debut = i
+        v, i = _bdecode(contenu, i)
+        if k == b"info":
+            info, brut = v, contenu[debut:i]
+    if not isinstance(info, dict):
+        raise ValueError("pas de dictionnaire info")
+    nom = info.get(b"name", b"").decode("utf-8", "replace")
+    if b"files" in info:
+        fichiers = [("/".join(p.decode("utf-8", "replace") for p in f[b"path"]), f[b"length"])
+                    for f in info[b"files"]]
+    elif b"length" in info:
+        fichiers = [(nom, info[b"length"])]
+    else:
+        raise ValueError("torrent v2 seul, non pris en charge")
+    return {"name": nom, "files": fichiers, "hash": hashlib.sha1(brut).hexdigest()}
+
+
+def _qbit_torrent_files(
+    dl: str, attente: float
+) -> tuple[dict[str, Any] | None, list[tuple[str, int]] | None]:
+    """
+    Le torrent et ses fichiers (chemin relatif, taille). Les fichiers valent None
+    tant que qBittorrent n'a pas les métadonnées : un magnet les tient des pairs.
+    """
+    fin = time.time() + attente
+    with qbit_session() as s:
+        while True:
+            r = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": dl}, timeout=10)
+            r.raise_for_status()
+            infos = r.json()
+            t = infos[0] if infos else None
+            if t is not None and t.get("has_metadata", True):
+                r = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": dl}, timeout=10)
+                r.raise_for_status()
+                fichiers = [(f.get("name") or "", f.get("size") or 0) for f in r.json() or []]
+                if fichiers:
+                    return t, fichiers
+            if time.time() >= fin:
+                return t, None
+            time.sleep(5)
+
+
+def _qbit_info(dl: str) -> dict[str, Any] | None:
+    with qbit_session() as s:
+        r = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": dl}, timeout=10)
+        r.raise_for_status()
+        infos = r.json()
+    return infos[0] if infos else None
+
+
+def _qbit_post(action: str, data: dict[str, str]) -> None:
+    with qbit_session() as s:
+        r = s.post(f"{QBIT_URL}/api/v2/torrents/{action}", data=data, timeout=10)
+        r.raise_for_status()
+
+
+def _qbit_restart(dl: str) -> None:
+    """Relance un torrent arrêté par la règle, sans masquer l'erreur qui a interrompu la vérification."""
+    try:
+        _qbit_post("start", {"hashes": dl})
+    except Exception as e:
+        log.error("Règle 4 : relance de %s impossible (%s), à relancer depuis qBittorrent", dl, e)
+
+
+def _qbit_add(cand: dict[str, Any], categorie: str, ref: dict[str, Any]) -> None:
+    """
+    Ajoute le pack complet dans la catégorie de téléchargement du client Sonarr,
+    rangé comme le torrent qu'il remplace. Il porte le titre de sa release : Sonarr,
+    qui ne l'a pas pris lui-même, le reconnaît par ce titre. Vérifie qu'il est là.
+    """
+    if not categorie:
+        raise RuntimeError("catégorie de téléchargement inconnue")
+    data = {"category": categorie, "rename": cand["title"], "tags": "cleanup-linker",
+            "stopped": "false", "paused": "false"}
+    if ref.get("auto_tmm"):
+        data["autoTMM"] = "true"
+    else:
+        data.update(autoTMM="false", savepath=ref.get("save_path") or "")
+    with qbit_session() as s:
+        r = s.post(f"{QBIT_URL}/api/v2/torrents/add", data=data, timeout=30,
+                   files={"torrents": (f"{cand['hash']}.torrent", cand["torrent"], "application/x-bittorrent")})
+        r.raise_for_status()
+        for _ in range(10):
+            r = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": cand["hash"]}, timeout=10)
+            r.raise_for_status()
+            if r.json():
+                return
+            time.sleep(1)
+    raise RuntimeError("qBittorrent n'a pas ajouté le torrent")
+
+
+def _sonarr_blocklist(url: str, cle: str, serie_id: int, dl: str) -> bool:
+    """
+    Sort le téléchargement de la file Sonarr en le blacklistant : ni suppression
+    dans le client, ni nouvelle recherche — le pack complet est déjà là.
+    Retourne False s'il n'apparaît pas dans la file.
+    """
+    for essai in range(3):
+        if essai:
+            time.sleep(10)  # Sonarr rafraîchit sa file quelques secondes après le grab
+        ids = [q["id"] for q in _arr_request("GET", url, cle, "queue/details", params={"seriesId": serie_id}) or []
+               if (q.get("downloadId") or "").lower() == dl]
+        if ids:
+            _arr_request("DELETE", url, cle, f"queue/{ids[0]}",
+                         params={"removeFromClient": "false", "blocklist": "true", "skipRedownload": "true"})
+            return True
+    return False
+
+
+def _pack_trash(t: dict[str, Any]) -> bool:
+    """
+    Le pack partiel part en corbeille, arrêté : à peine entamé, il n'a rien à seeder.
+    Sauf s'il partage son dossier avec un autre torrent — un pack complet publié
+    sous le même nom : ATM emporterait les fichiers de l'autre dans le dossier de
+    la corbeille. Il reste alors arrêté dans sa catégorie. True s'il est parti.
+    """
+    with qbit_session() as s:
+        partage = _shared_content({t["hash"]}, qbit_get_torrents(s))
+        actions = [("stop", {"hashes": t["hash"]})]
+        if not partage:
+            actions.insert(0, ("setCategory", {"hashes": t["hash"], "category": TARGET_CAT}))
+        for action, data in actions:
+            r = s.post(f"{QBIT_URL}/api/v2/torrents/{action}", data=data, timeout=10)
+            r.raise_for_status()
+    if partage:
+        return False
+    log_move(t["hash"], t.get("name", ""), t.get("category", ""), "assist")
+    return True
+
+
+def _pack_register(serie_id: int, saison: int, ancien: str, cand: dict[str, Any],
+                   etape: str, episodes: set[int]) -> None:
+    with _db_lock:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO pack_replace (series_id, season, old_hash, new_hash, new_title, stage, episodes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (serie_id, saison, ancien, cand["hash"], cand["title"], etape, json.dumps(sorted(episodes))),
+            )
+
+
+def _pack_attempts(serie_id: int, saison: int) -> int:
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM pack_replace WHERE series_id = ? AND season = ? AND at > ?",
+                (serie_id, saison, int(time.time()) - _PACK_ATTEMPTS_WINDOW),
+            ).fetchone()[0]
+
+
+def _pack_replacement(h: str, colonne: str = "new_hash") -> sqlite3.Row | None:
+    """Dernier remplacement où ce torrent est le pack complet (new_hash) ou le partiel (old_hash)."""
+    if colonne not in ("new_hash", "old_hash"):
+        raise ValueError(colonne)
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                f"SELECT * FROM pack_replace WHERE {colonne} = ? ORDER BY id DESC LIMIT 1", (h.lower(),)
+            ).fetchone()
 
 
 def _validate_webhook_payload(data: Any) -> tuple[bool, str]:
@@ -2250,6 +3072,12 @@ def webhook():
                     moved += move_torrents_for_path(path)
 
         return jsonify({"moved": moved, "event": "DownloadUpgrade", "rows": indexed})
+
+    elif event == "Grab":
+        # Règle 4 : un pack de saison vient d'être pris. Sa liste de fichiers est
+        # vérifiée tout de suite, avant qu'il ait eu le temps de télécharger.
+        lance = schedule_pack_check(data)
+        return jsonify({"status": "pack check started" if lance else "ignored", "event": event})
 
     elif event == "ManualInteractionRequired":
         # L'*arr vient de bloquer un import : titre non reconnu, grab rattaché par
