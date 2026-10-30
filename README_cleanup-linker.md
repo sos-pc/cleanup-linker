@@ -201,12 +201,12 @@ networks:
 | `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série/saison, qui compte légitimement beaucoup de fichiers |
 | `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit la suppression en action Sonarr/Radarr au lieu de déplacer les torrents directement |
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
-| `IMPORT_ASSIST_DRY_RUN` | `true` | Assistant d'import en simulation : il journalise ce qu'il ferait, sans agir. Seuls `0`, `false` ou `no` le font agir |
+| `IMPORT_ASSIST_DRY_RUN` | `true` | Règle 1 de l'assistant d'import (débloquer la file) en simulation : elle journalise ce qu'elle ferait, sans agir. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Passage de renfort de l'assistant d'import, pour les events manqués. `0` le désactive |
-| `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (packs de saison partiels) en simulation, indépendamment de la règle 1. Seuls `0`, `false` ou `no` la font agir |
+| `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (pack incomplet) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
-| `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (accorder la demande Seerr et la saison Sonarr) en simulation. Seuls `0`, `false` ou `no` la font agir |
+| `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (bonne saison : accorder la demande Seerr et la saison Sonarr) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes. Vide = règle 5 désactivée |
 | `SEERR_API_KEY` | — | Clé API Seerr (Paramètres → Général) |
 
@@ -398,9 +398,26 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 
 Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file, à l'état `importBlocked`. L'*arr attend une intervention, et tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. Dès que l'*arr signale un blocage, l'assistant examine les téléchargements bloqués, et règle ceux qui peuvent l'être sans risque.
 
-**Simulation par défaut** : il journalise ce qu'il ferait (`[SIMULATION] ✓ …`), sans rien changer. `IMPORT_ASSIST_DRY_RUN=false` le fait agir.
+**Chaque règle a son interrupteur**, en simulation par défaut : elle journalise ce qu'elle ferait (`[SIMULATION] ✓ …`), sans rien changer. Aucune ne dépend de l'interrupteur d'une autre.
 
-### Règle 1 : déjà importé, mais resté coincé
+| Règle | Interrupteur | Ce qu'elle fait |
+|-------|--------------|-----------------|
+| 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
+| 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet |
+| 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
+
+**Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
+
+```
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE
+INFO     ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
+INFO     ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
+INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
+```
+
+`✓` : la règle agit (ou agirait, en simulation). `⏭` : elle n'a rien à faire, et dit pourquoi. `⚠` : une erreur, ou un cas à voir à la main. `/assist/history?rule=5` ne montre que les verdicts d'une règle.
+
+### Règle 1 · débloquer la file : déjà importé, mais resté coincé
 
 Chaque vidéo du torrent a déjà un hardlink dans le dossier du média du grab. La comparaison se fait par inode, sans aucun nom de fichier. Les échantillons ne comptent pas : « sample » dans le nom, et moins de 300 Mo. Cas typiques :
 - un pack « S01 » qui n'apporte qu'une partie de la saison TVDB, comme une partie Netflix d'un anime. L'*arr a importé ce qu'il contenait, mais attend les épisodes manquants et garde le téléchargement ;
@@ -419,11 +436,11 @@ Il ne fait rien si :
 Rien n'est importé ni supprimé. Un téléchargement en erreur n'empêche pas de traiter les suivants. Si Sonarr refuse la recherche après le changement de catégorie, le verdict `search-failed` le signale : la recherche est alors à lancer depuis Sonarr. Chaque verdict est journalisé une fois par jour, et se relit avec `/assist/history` :
 
 ```
-INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : 12/12 vidéo(s) déjà dans la bibliothèque → [seed] Séries animation, recherche de 12 épisode(s) manquant(s)
-INFO   ⏭ [SIMULATION] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
+INFO     [SIMULATION] ✓ [règle 1 · débloquer la file] [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : 12/12 vidéo(s) déjà dans la bibliothèque → [seed] Séries animation, recherche de 12 épisode(s) manquant(s)
+INFO     [SIMULATION] ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 ```
 
-### Règle 4 : pack de saison partiel
+### Règle 4 · pack incomplet : pack de saison partiel
 
 Sonarr prend tout pack « S01 » pour la saison entière. Un pack qui n'en contient qu'une partie passe donc pour complet : une moitié de saison TVDB, comme une partie Netflix d'un anime, ou une « Part 1 ». Un vrai pack complet est ensuite refusé à chaque recherche, parce qu'il n'améliore pas les épisodes déjà là.
 
@@ -453,16 +470,16 @@ Garde-fous :
 
 **Après l'import, en filet.** Un pack partiel peut quand même être importé : pris pendant un arrêt du service, magnet sans liste de fichiers au grab, ou torrent privé trop entamé. La règle 1 le trouve alors bloqué dans la file. Au lieu de lancer la recherche des épisodes manquants un à un, l'assistant ajoute un pack complet, choisi de la même façon. Une fois ce pack téléchargé, Sonarr importe seul les épisodes manquants, mais refuse de remplacer ceux du pack partiel, faute de les améliorer. L'assistant les importe alors à la main, en hardlink, à la place des fichiers du pack partiel — et de ceux-là seulement : un épisode remplacé entre-temps par une autre release n'est pas touché. Le pack partiel, qui n'a plus de fichier dans la bibliothèque, part en corbeille par l'event d'upgrade.
 
-La règle 4 a **sa propre simulation**, active par défaut et indépendante de la règle 1 : `IMPORT_ASSIST_PACK_DRY_RUN=false` la fait agir. Elle demande « On Grab » coché dans le webhook de Sonarr. Sans `PROWLARR_URL` et `PROWLARR_API_KEY`, elle signale les packs partiels sans y toucher. La saison 0 (épisodes spéciaux) n'est pas traitée.
+La règle 4 a **sa propre simulation**, active par défaut et indépendante des autres règles : `IMPORT_ASSIST_PACK_DRY_RUN=false` la fait agir. Seul le filet après import dépend aussi de la règle 1 : il remplace la recherche d'épisodes de celle-ci, et n'agit donc que si elle agit. Elle demande « On Grab » coché dans le webhook de Sonarr. Sans `PROWLARR_URL` et `PROWLARR_API_KEY`, elle signale les packs partiels sans y toucher. La saison 0 (épisodes spéciaux) n'est pas traitée.
 
 Verdicts : `pack-ok`, `pack-partial` (pack gardé), `pack-replace`, `pack-reimport` (fin d'un remplacement après import), `pack-skipped` et `pack-error`. `pack-stopped` et `pack-resumed` tracent l'arrêt d'un torrent et sa relance.
 
 ```
-INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01.MULTi.VFF.1080p.WEBRiP.EAC3.2.0.x265-T3KASHi (C411, 15 sources, score 195)
-INFO   [SIMULATION] ⏭ [sonarr] Ranma ep 15-21 : pas un pack de saison
+INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01.MULTi.VFF.1080p.WEBRiP.EAC3.2.0.x265-T3KASHi (C411, 15 sources, score 195)
+INFO     [SIMULATION] ⏭ [règle 4 · pack incomplet] [sonarr] Ranma ep 15-21 : pas un pack de saison
 ```
 
-### Règle 5 : accorder la demande Seerr et la saison Sonarr
+### Règle 5 · bonne saison : accorder la demande Seerr et la saison Sonarr
 
 Seerr demande des saisons numérotées comme TMDB, Sonarr les range comme TVDB, et les deux ne s'accordent pas toujours. « Monster: The Lizzie Borden Story » est une mini-série d'une saison pour TMDB, mais la saison 4 de « Monster » pour TVDB. Seerr a demandé la saison 1, et Sonarr y a rangé les 8 épisodes de Lizzie Borden, sous les titres de Dahmer, qui en compte 10.
 
@@ -478,7 +495,7 @@ Quand une saison est trouvée, l'assistant :
 
 La règle 1 ne cherche plus les épisodes manquants de la saison écartée, même en simulation. La règle 4 n'y cherche pas non plus de pack complet.
 
-Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_ACCORD_DRY_RUN=false` la fait agir. Elle demande `SEERR_URL` et `SEERR_API_KEY`. Verdicts : `accord-fix` et `accord-unknown`, journalisés sous `seerr-<demande>-s<saison>`.
+Elle a **sa propre simulation**, active par défaut et indépendante des autres règles : `IMPORT_ASSIST_ACCORD_DRY_RUN=false` la fait agir. Elle demande `SEERR_URL` et `SEERR_API_KEY`. Verdicts : `accord-fix` et `accord-unknown`, journalisés sous `seerr-<demande>-s<saison>`.
 
 Limites :
 - Seerr peut repasser la demande en « partiellement disponible » à son prochain scan, une fois la saison demandée vidée.
@@ -486,15 +503,15 @@ Limites :
 - La règle n'aide pas Sonarr à trouver une release d'anthologie nommée « S01 » pour une saison 4 : elle range ce qu'il a déjà pris.
 
 ```
-INFO   [SIMULATION] ✓ [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
-INFO   [SIMULATION] ✓ [sonarr] Monster.The.Lizzie.Borden.Story.S01...-BYOR : 8/8 vidéo(s) déjà dans la bibliothèque → [seed] Rays_Le _Chat (règle 5 : la saison 1 demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés)
+INFO     [SIMULATION] ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
+INFO     [SIMULATION] ✓ [règle 1 · débloquer la file] [sonarr] Monster.The.Lizzie.Borden.Story.S01...-BYOR : 8/8 vidéo(s) déjà dans la bibliothèque → [seed] Rays_Le _Chat (règle 5 : la saison 1 demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés)
 ```
 
 ### Déclenchement
 
 - **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
 - **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués.
-- **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts. `&dry_run=false` agit même si le service est en simulation ; `&dry_run=true` simule même s'il est actif. Seules les valeurs `0`, `false` et `no` font agir : une valeur mal saisie reste une simulation.
+- **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts. Sans paramètre, chaque règle suit son interrupteur. `&dry_run=true` est un aperçu : toutes les règles simulent, même actives. `&dry_run=false` fait agir la règle 1 même si elle est en simulation, les règles 4 et 5 suivant toujours le leur. Seules les valeurs `0`, `false` et `no` font agir : une valeur mal saisie reste un aperçu.
 
 Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lance. Pendant un passage, `/assist` répond `409`. Un passage programmé par un event qui trouve le verrou pris est reprogrammé, au lieu d'être perdu : une recherche de pack complet peut tenir le verrou plusieurs minutes.
 
@@ -559,7 +576,7 @@ Les moves sont tracés dans `cleanup_log` avec `source = "jellyfin"`, donc visib
 | `/stats?token=...` | GET | Token | Statistiques de la DB |
 | `/jellyfin?token=...` | POST | Token | Reçoit les events Jellyfin (param `dry_run`) |
 | `/assist?token=...` | POST | Token | Lance un passage de l'assistant d'import et renvoie ses verdicts (param `dry_run`) |
-| `/assist/history?token=...` | GET | Token | Derniers verdicts de l'assistant d'import (param `limit`, défaut 50) |
+| `/assist/history?token=...` | GET | Token | Derniers verdicts de l'assistant d'import, avec la règle qui les a rendus (params `limit`, défaut 50, et `rule`, pour une seule règle) |
 | `/jellyfin/index?token=...` | POST | Token | Force la réindexation Jellyfin |
 | `/health` | GET | Non | Healthcheck |
 
