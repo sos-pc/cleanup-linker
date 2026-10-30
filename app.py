@@ -99,7 +99,9 @@ IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").str
 # pris s'il atteint ce score de formats, sans le bonus que le profil donne aux
 # packs. Avec le profil actuel, une release qui porte du français fait au moins
 # 55, une release sans français au plus 40 environ. Si le pack partiel est
-# lui-même plus bas, c'est son score qui sert de seuil.
+# lui-même plus bas, c'est son score qui sert de seuil. Sous le seuil, un pack
+# d'une autre langue ne sert qu'à combler les trous : le partiel est gardé, et
+# seuls les fichiers des épisodes manquants sont téléchargés.
 IMPORT_ASSIST_PACK_MIN_SCORE = int(os.getenv("IMPORT_ASSIST_PACK_MIN_SCORE", "50"))
 PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
@@ -2215,11 +2217,21 @@ def _assist_download(
                            + " demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés")
             manquants = [i for i in manquants if i not in hors_demande]
 
+    # Règle 4 : ce téléchargement est-il lui-même un pack ajouté par la règle ? On
+    # ne lui cherche jamais de remplaçant. Un pack en VO n'apportait que des trous :
+    # les autres épisodes viennent du partiel, et ceux qu'il a comblés sont
+    # aussitôt cherchés en français, pour remplacer la VO.
+    ajoute = _pack_replacement(dl) if arr == "sonarr" else None
+    recherche_vo: list[int] = []
+    if ajoute is not None and ajoute["stage"] == "vo":
+        manquants = []
+        recherche_vo = sorted(json.loads(ajoute["episodes"] or "[]"))[:_ASSIST_MAX_SEARCH]
+
     # Règle 4, filet après import : un pack de saison qui n'a pas tout apporté est
     # remplacé par un pack complet, plutôt que de chercher ses épisodes un à un.
     pack: dict[str, Any] | None = None
     note = ""
-    if manquants and not deja_vu:
+    if manquants and not deja_vu and ajoute is None:
         try:
             pack, note = _pack_after_import(url, cle, media_id, dl, titre, records, episodes,
                                             manquants, videos, clients)
@@ -2230,15 +2242,19 @@ def _assist_download(
     remplace = pack is not None and (bool(pack.get("deja")) or not IMPORT_ASSIST_PACK_DRY_RUN)
     if remplace and not dry_run and not pack.get("deja"):
         try:
-            _qbit_add(pack, pack["category"], t)
-            _pack_register(media_id, pack["season"], dl, pack, "import", pack["episodes"])
+            seulement = _pack_files_for(pack, set(manquants)) if pack.get("vo") else None
+            _qbit_add(pack, pack["category"], t, seulement=seulement)
+            _pack_register(media_id, pack["season"], dl, pack, "vo" if pack.get("vo") else "import", pack["episodes"])
         except Exception as e:
             remplace, note = False, f"règle 4 : ajout du pack complet {pack['title']} impossible : {e}"
             log.error("  ⚠ [%s] [%s] %s : %s", _regle(4), arr, titre, note)
 
     recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH and not remplace else []
     resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
-    if remplace and pack.get("combler"):
+    if remplace and pack.get("vo"):
+        resume += (f", règle 4 : les {len(manquants)} épisode(s) manquant(s) pris en VO dans {pack['title']}, "
+                   "seuls leurs fichiers téléchargés")
+    elif remplace and pack.get("combler"):
         resume += (f", règle 4 : pack complet {pack['title']} pour combler les {len(manquants)} épisode(s) "
                    "manquant(s), moins bien noté : les épisodes déjà là restent")
     elif remplace:
@@ -2248,12 +2264,17 @@ def _assist_download(
     elif manquants:
         resume += (f", {len(manquants)} épisodes manquants : trop pour une recherche "
                    "automatique, à lancer depuis Sonarr")
+    if recherche_vo:
+        resume += f", règle 4 : recherche en français des {len(recherche_vo)} épisode(s) pris en VO"
     if note:
         resume += f" ({note})"
+    elif pack is not None and not remplace and pack.get("vo"):
+        resume += f" (règle 4 en simulation : prendrait les épisodes manquants en VO dans {pack['title']})"
     elif pack is not None and not remplace:
         resume += f" (règle 4 en simulation : remplacerait par le pack complet {pack['title']})"
     if note_accord:
         resume += f" ({note_accord})"
+    recherche = recherche + [i for i in recherche_vo if i not in recherche]
     verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants),
                    search=bool(recherche), pack=pack["title"] if remplace else None)
 
@@ -2279,7 +2300,7 @@ def _assist_download(
             verdict["search"] = False
             _assist_record(dl, arr, titre, "search-failed",
                            f"recherche de {len(recherche)} épisode(s) non lancée : {e}", False, 1)
-            log.error("  ⚠ [%s] [%s] %s : recherche des épisodes manquants non lancée (%s), "
+            log.error("  ⚠ [%s] [%s] %s : recherche des épisodes non lancée (%s), "
                       "à lancer depuis Sonarr", _regle(1), arr, titre, e)
     return verdict, True
 
@@ -2445,6 +2466,23 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
             if arrete:
                 _qbit_post("start", {"hashes": dl})
             return fin("pack-partial", f"{resume}, aucun pack complet trouvé{_ecarts(ecartes)} : on le garde", "⚠")
+        if cand["vo"]:
+            # Pas de pack complet en français : le partiel est gardé, et seuls ses
+            # épisodes manquants sont pris dans le pack d'une autre langue.
+            trous = voulus - couverts
+            seulement = _pack_files_for(cand, trous)
+            details = (f"{resume} → gardé, ses {len(trous)} épisode(s) manquant(s) pris en VO dans {cand['title']} "
+                       f"({cand['indexer']}, {cand['seeders']} sources, score {cand['score']}) : "
+                       f"{len(seulement)} fichier(s) téléchargé(s) sur {len(cand['par_fichier'])}")
+            verdict["vo"] = cand["title"]
+            if dry_run:
+                return fin("pack-fill", details, "✓")
+            _qbit_add(cand, t.get("category") or "", t, seulement=seulement)
+            if arrete:
+                _qbit_post("start", {"hashes": dl})
+                arrete = False
+            _pack_register(serie_id, saison, dl, cand, "vo", trous)
+            return fin("pack-fill", details, "✓")
         moins = f", moins bien noté que le partiel ({ref['score']}) mais complet" if cand["score"] < ref["score"] else ""
         details = (f"{resume} → remplacé par {cand['title']} ({cand['indexer']}, "
                    f"{cand['seeders']} sources, score {cand['score']}{moins})")
@@ -2484,8 +2522,8 @@ def _pack_after_import(
     """
     deja = _pack_replacement(dl, "old_hash")
     if deja:
-        # Ajouté par un passage précédent, qui n'a pas pu sortir le partiel de la file.
-        return {"title": deja["new_title"], "deja": True}, ""
+        # Ajouté par un passage précédent, ou au grab : ses épisodes sont en route.
+        return {"title": deja["new_title"], "deja": True, "vo": deja["stage"] == "vo"}, ""
     saisons = {e.get("seasonNumber") for e in episodes if e["id"] in manquants}
     if len(saisons) != 1 or 0 in saisons:
         return None, ""
@@ -2525,8 +2563,9 @@ def _pack_after_import(
     if cand is None:
         return None, f"règle 4 : aucun pack complet trouvé{_ecarts(ecartes)}"
     # Moins bien noté que le partiel, il ne fait que combler les trous : les
-    # épisodes déjà importés gardent leur meilleure version.
-    combler = cand["score"] < ref["score"]
+    # épisodes déjà importés gardent leur meilleure version. En VO, seuls les
+    # fichiers des trous seront téléchargés.
+    combler = cand["vo"] or cand["score"] < ref["score"]
     cand.update(season=saison, episodes=set(manquants) if combler else a_couvrir, category=categorie, combler=combler)
     return cand, ""
 
@@ -2557,7 +2596,7 @@ def _pack_finish(
     # Au grab, le partiel a été arrêté avant d'avoir rien apporté : seuls les trous
     # comptent. Après l'import, ses épisodes se reconnaissent à ses inodes.
     inodes_ancien: set[int] = set()
-    if remplacement["stage"] != "grab":
+    if remplacement["stage"] not in ("grab", "vo"):
         ancien = ctx["torrents"].get(remplacement["old_hash"])
         for v in (_torrent_videos(ancien) or []) if ancien else []:
             try:
@@ -2590,6 +2629,10 @@ def _pack_finish(
         if obstacle:
             return ecarte(f"remplacement terminé, mais {obstacle}", 4, dry_run)
         resume = f"remplacement terminé : les {len(prevus)} épisode(s) prévu(s) sont en place → {categorie}"
+        # Les trous comblés en VO sont aussitôt cherchés en français.
+        recherche_vo = sorted(prevus)[:_ASSIST_MAX_SEARCH] if remplacement["stage"] == "vo" else []
+        if recherche_vo:
+            resume += f", recherche en français des {len(recherche_vo)} épisode(s) pris en VO"
         verdict.update(decision="pack-done", category=categorie)
         if _assist_seen(dl, "pack-done", dry_run):
             return verdict, False
@@ -2597,6 +2640,12 @@ def _pack_finish(
             _qbit_post("setCategory", {"hashes": dl, "category": categorie})
         _assist_record(dl, "sonarr", titre, "pack-done", resume, dry_run, 4)
         _assist_log(4, "✓", "sonarr", titre, resume, dry_run)
+        if recherche_vo and not dry_run:
+            try:
+                _arr_request("POST", url, cle, "command", json={"name": "EpisodeSearch", "episodeIds": recherche_vo})
+            except Exception as e:
+                log.error("  ⚠ [%s] [sonarr] %s : recherche en français non lancée (%s), à lancer depuis Sonarr",
+                          _regle(4), titre, e)
         return verdict, True
 
     entrees: list[dict[str, Any]] = []
@@ -2687,32 +2736,40 @@ def _video_names(fichiers: list[tuple[str, int]]) -> list[str]:
 
 def _pack_coverage(url: str, cle: str, serie_id: int, saison: int,
                    episodes: list[dict[str, Any]], noms: list[str]) -> set[int]:
+    """Épisodes de la saison qu'apportent ces vidéos, toutes ensemble."""
+    return set().union(*_pack_file_episodes(url, cle, serie_id, saison, episodes, noms).values())
+
+
+def _pack_file_episodes(url: str, cle: str, serie_id: int, saison: int,
+                        episodes: list[dict[str, Any]], noms: list[str]) -> dict[str, set[int]]:
     """
-    Épisodes de la saison qu'apportent ces vidéos, d'après le parseur de Sonarr.
+    Épisodes de la saison qu'apporte chaque vidéo, d'après le parseur de Sonarr.
     Seul le nom du fichier compte, comme à l'import : une vidéo qui ne porte pas
     son numéro ne couvre rien, même rangée dans un dossier « S01 ».
     """
     par_numero = {e["episodeNumber"]: e["id"] for e in episodes if e.get("seasonNumber") == saison}
     par_absolu = {e["absoluteEpisodeNumber"]: e["id"] for e in episodes
                   if e.get("seasonNumber") == saison and e.get("absoluteEpisodeNumber")}
-    couverts: set[int] = set()
+    par_fichier: dict[str, set[int]] = {}
     for nom in noms:
         p = _arr_request("GET", url, cle, "parse", params={"title": os.path.basename(nom)}) or {}
         info = p.get("parsedEpisodeInfo") or {}
-        if not info or info.get("fullSeason"):
-            continue
+        couverts: set[int] = set()
         serie = p.get("series") or {}
-        if serie:
+        if not info or info.get("fullSeason"):
+            pass
+        elif serie:
             # Série reconnue : la correspondance de Sonarr fait foi, numérotation
             # de scène comprise. Une autre série ne couvre rien.
             if serie.get("id") == serie_id:
-                couverts |= {e["id"] for e in p.get("episodes") or [] if e.get("seasonNumber") == saison}
+                couverts = {e["id"] for e in p.get("episodes") or [] if e.get("seasonNumber") == saison}
         elif info.get("episodeNumbers"):
             if info.get("seasonNumber") == saison:
-                couverts |= {par_numero[n] for n in info["episodeNumbers"] if n in par_numero}
+                couverts = {par_numero[n] for n in info["episodeNumbers"] if n in par_numero}
         else:
-            couverts |= {par_absolu[n] for n in info.get("absoluteEpisodeNumbers") or [] if n in par_absolu}
-    return couverts
+            couverts = {par_absolu[n] for n in info.get("absoluteEpisodeNumbers") or [] if n in par_absolu}
+        par_fichier[nom] = couverts
+    return par_fichier
 
 
 def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any]:
@@ -2736,7 +2793,8 @@ def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any
     formats = (_arr_request("GET", url, cle, "customformat") or []) if notes else []
     bonus_pack = {f["id"]: notes[f["id"]] for f in formats if f.get("id") in notes and any(
         c.get("implementation") == "ReleaseTypeSpecification" for c in f.get("specifications") or [])}
-    return {"autorisees": autorisees, "rangs": rangs, "bonus_pack": bonus_pack}
+    return {"autorisees": autorisees, "rangs": rangs, "bonus_pack": bonus_pack,
+            "score_min": profil.get("minFormatScore") or 0}
 
 
 def _score_hors_pack(p: dict[str, Any], profil: dict[str, Any]) -> int:
@@ -2796,6 +2854,9 @@ def _pack_candidate(
     couvrir. Mieux vaut une saison sans trou : son score de formats peut être plus
     bas que celui du pack partiel, tant qu'il atteint IMPORT_ASSIST_PACK_MIN_SCORE
     (le français reste le français), ou le score du partiel s'il est plus bas.
+    À défaut, un pack d'une autre langue que Sonarr accepterait encore (score
+    minimal du profil) : marqué « vo », il ne sert qu'à combler les trous, et
+    seuls les fichiers de ces épisodes seront téléchargés.
     Sa qualité est autorisée par le profil, et au moins aussi bonne.
 
     Il doit aussi porter le même titre de série que le pack partiel. Une série
@@ -2817,6 +2878,8 @@ def _pack_candidate(
         deja = exclus | {t["hash"].lower() for t in qbit_get_torrents(s)}
 
     seuil = min(ref["score"], IMPORT_ASSIST_PACK_MIN_SCORE)
+    # Pour combler des trous, une autre langue suffit, tant que Sonarr l'accepterait.
+    plancher = min(seuil, profil["score_min"])
     candidats: list[tuple[int, int, int, dict[str, Any]]] = []
     vus: set[tuple[str, Any]] = set()
     autres_titres: set[str] = set()
@@ -2847,7 +2910,7 @@ def _pack_candidate(
             continue
         qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
         score, rang = _score_hors_pack(p, profil), profil["rangs"].get(qid, -1)
-        if qid not in profil["autorisees"] or rang < ref["rang"] or score < seuil:
+        if qid not in profil["autorisees"] or rang < ref["rang"] or score < plancher:
             continue
         candidats.append((score, rang, r.get("seeders") or 0, r))
     ecartes: list[str] = []
@@ -2857,27 +2920,37 @@ def _pack_candidate(
         return None, ["aucun pack de la saison à la hauteur dans Prowlarr"] + ecartes
 
     candidats.sort(key=lambda c: (-c[0], -c[1], -c[2]))
-    for score, _, seeders, r in candidats[:_PACK_MAX_TORRENTS]:
-        titre = r.get("title") or ""
-        try:
-            contenu = _fetch_torrent(r["downloadUrl"])
-            meta = _torrent_meta(contenu)
-        except Exception as e:
-            ecartes.append(f"{titre} : .torrent illisible ({e})")
-            continue
-        if meta["hash"] in deja:
-            ecartes.append(f"{titre} : déjà dans qBittorrent")
-            continue
-        noms = _video_names(meta["files"])
-        if len(noms) > _PACK_MAX_FILES:
-            ecartes.append(f"{titre} : {len(noms)} vidéos, trop pour être analysées")
-            continue
-        couverts = _pack_coverage(url, cle, serie["id"], saison, episodes, noms) & a_couvrir
-        if couverts == a_couvrir:
-            return {"title": titre, "indexer": r.get("indexer") or "?", "seeders": seeders, "score": score,
-                    "hash": meta["hash"], "torrent": contenu}, ecartes
-        ecartes.append(f"{titre} : {len(couverts)}/{len(a_couvrir)} épisodes")
+    # Les packs au seuil d'abord ; à défaut, ceux d'une autre langue, qui ne
+    # serviront qu'à combler les trous. Chaque groupe a son lot de .torrent à lire.
+    for vo, groupe in ((False, [c for c in candidats if c[0] >= seuil]),
+                       (True, [c for c in candidats if c[0] < seuil])):
+        for score, _, seeders, r in groupe[:_PACK_MAX_TORRENTS]:
+            titre = r.get("title") or ""
+            try:
+                contenu = _fetch_torrent(r["downloadUrl"])
+                meta = _torrent_meta(contenu)
+            except Exception as e:
+                ecartes.append(f"{titre} : .torrent illisible ({e})")
+                continue
+            if meta["hash"] in deja:
+                ecartes.append(f"{titre} : déjà dans qBittorrent")
+                continue
+            noms = _video_names(meta["files"])
+            if len(noms) > _PACK_MAX_FILES:
+                ecartes.append(f"{titre} : {len(noms)} vidéos, trop pour être analysées")
+                continue
+            par_fichier = _pack_file_episodes(url, cle, serie["id"], saison, episodes, noms)
+            couverts = set().union(*par_fichier.values()) & a_couvrir
+            if couverts == a_couvrir:
+                return {"title": titre, "indexer": r.get("indexer") or "?", "seeders": seeders, "score": score,
+                        "hash": meta["hash"], "torrent": contenu, "vo": vo, "par_fichier": par_fichier}, ecartes
+            ecartes.append(f"{titre} : {len(couverts)}/{len(a_couvrir)} épisodes")
     return None, ecartes
+
+
+def _pack_files_for(cand: dict[str, Any], trous: set[int]) -> list[str]:
+    """Vidéos du pack qui apportent au moins un de ces épisodes : les seules à télécharger."""
+    return sorted(nom for nom, eps in cand["par_fichier"].items() if eps & trous)
 
 
 def _ecarts(ecartes: list[str]) -> str:
@@ -3016,16 +3089,21 @@ def _qbit_restart(dl: str) -> None:
         log.error("  ⚠ [%s] torrent %s : relance impossible (%s), à relancer depuis qBittorrent", _regle(4), dl, e)
 
 
-def _qbit_add(cand: dict[str, Any], categorie: str, ref: dict[str, Any]) -> None:
+def _qbit_add(cand: dict[str, Any], categorie: str, ref: dict[str, Any], seulement: list[str] | None = None) -> None:
     """
     Ajoute le pack complet dans la catégorie de téléchargement du client Sonarr,
     rangé comme le torrent qu'il remplace. Il porte le titre de sa release : Sonarr,
     qui ne l'a pas pris lui-même, le reconnaît par ce titre. Vérifie qu'il est là.
+
+    `seulement` : chemins (dans le .torrent) des seuls fichiers à télécharger. Le
+    pack est alors ajouté à l'arrêt, les autres fichiers passent en « ne pas
+    télécharger », puis il démarre : Sonarr n'importera que ce qu'il trouve.
     """
     if not categorie:
         raise RuntimeError("catégorie de téléchargement inconnue")
+    arret = "true" if seulement is not None else "false"
     data = {"category": categorie, "rename": cand["title"], "tags": "cleanup-linker",
-            "stopped": "false", "paused": "false"}
+            "stopped": arret, "paused": arret}
     if ref.get("auto_tmm"):
         data["autoTMM"] = "true"
     else:
@@ -3038,9 +3116,27 @@ def _qbit_add(cand: dict[str, Any], categorie: str, ref: dict[str, Any]) -> None
             r = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": cand["hash"]}, timeout=10)
             r.raise_for_status()
             if r.json():
-                return
+                break
             time.sleep(1)
-    raise RuntimeError("qBittorrent n'a pas ajouté le torrent")
+        else:
+            raise RuntimeError("qBittorrent n'a pas ajouté le torrent")
+        if seulement is None:
+            return
+        r = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": cand["hash"]}, timeout=10)
+        r.raise_for_status()
+        fichiers = r.json() or []
+        # qBittorrent préfixe les chemins du dossier racine du torrent, ou pas, selon sa disposition.
+        garder = [any(f.get("name") == g or (f.get("name") or "").endswith("/" + g) for g in seulement) for f in fichiers]
+        if not any(garder):
+            # Laissé à l'arrêt : rien de ce qu'il fallait n'est dans le torrent.
+            raise RuntimeError("aucun des fichiers voulus dans le torrent ajouté, laissé à l'arrêt")
+        sauter = [str(f.get("index", i)) for i, (f, g) in enumerate(zip(fichiers, garder)) if not g]
+        if sauter:
+            r = s.post(f"{QBIT_URL}/api/v2/torrents/filePrio", timeout=10,
+                       data={"hash": cand["hash"], "id": "|".join(sauter), "priority": "0"})
+            r.raise_for_status()
+        r = s.post(f"{QBIT_URL}/api/v2/torrents/start", data={"hashes": cand["hash"]}, timeout=10)
+        r.raise_for_status()
 
 
 def _sonarr_blocklist(url: str, cle: str, serie_id: int, dl: str) -> bool:
