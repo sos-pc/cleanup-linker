@@ -206,6 +206,9 @@ networks:
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (packs de saison partiels) en simulation, indépendamment de la règle 1. Seuls `0`, `false` ou `no` la font agir |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
+| `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (accorder la demande Seerr et la saison Sonarr) en simulation. Seuls `0`, `false` ou `no` la font agir |
+| `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes. Vide = règle 5 désactivée |
+| `SEERR_API_KEY` | — | Clé API Seerr (Paramètres → Général) |
 
 ---
 
@@ -459,6 +462,34 @@ INFO   [SIMULATION] ✓ [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2
 INFO   [SIMULATION] ⏭ [sonarr] Ranma ep 15-21 : pas un pack de saison
 ```
 
+### Règle 5 : accorder la demande Seerr et la saison Sonarr
+
+Seerr demande des saisons numérotées comme TMDB, Sonarr les range comme TVDB, et les deux ne s'accordent pas toujours. « Monster: The Lizzie Borden Story » est une mini-série d'une saison pour TMDB, mais la saison 4 de « Monster » pour TVDB. Seerr a demandé la saison 1, et Sonarr y a rangé les 8 épisodes de Lizzie Borden, sous les titres de Dahmer, qui en compte 10.
+
+C'est la demande qui tranche. À chaque passage, avant les autres règles, l'assistant relit les demandes de séries Seerr des 30 derniers jours, approuvées ou terminées. Pour chaque saison demandée, il compare ses épisodes TMDB avec ceux de la saison TVDB de même numéro : nombre, dates de diffusion, titres.
+- Si elles collent, rien à faire.
+- Sinon, il cherche la seule autre saison TVDB qui colle : toutes les dates identiques, ou au moins 80 % des titres (les épisodes à venir n'ont pas de date). Pour Lizzie Borden, c'est la S04, avec 8/8 dates et 8/8 titres, alors que la S03 a aussi 8 épisodes mais aucun en commun.
+- Si aucune saison ne colle, ou si plusieurs collent, il le signale et ne touche à rien.
+
+Quand une saison est trouvée, l'assistant :
+1. surveille la saison TVDB trouvée ;
+2. reprend les fichiers de la demande rangés dans la saison demandée, ceux dont la release porte le titre de la fiche demandée. Il les réaffecte aux épisodes de même numéro de la bonne saison par un import manuel sur place, puis les range par un renommage. Rien n'est copié ni supprimé, et le torrent reste lié. C'est tout ou rien : si un épisode cible a déjà un fichier, aucun fichier ne bouge ;
+3. cesse de surveiller la saison demandée, sauf si une autre demande la vise ou si elle garde des fichiers d'une autre release.
+
+La règle 1 ne cherche plus les épisodes manquants de la saison écartée, même en simulation. La règle 4 n'y cherche pas non plus de pack complet.
+
+Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_ACCORD_DRY_RUN=false` la fait agir. Elle demande `SEERR_URL` et `SEERR_API_KEY`. Verdicts : `accord-fix` et `accord-unknown`, journalisés sous `seerr-<demande>-s<saison>`.
+
+Limites :
+- Seerr peut repasser la demande en « partiellement disponible » à son prochain scan, une fois la saison demandée vidée.
+- Une saison TMDB qui couvre une partie d'une saison TVDB (les parties d'un anime) n'est pas encore accordée.
+- La règle n'aide pas Sonarr à trouver une release d'anthologie nommée « S01 » pour une saison 4 : elle range ce qu'il a déjà pris.
+
+```
+INFO   [SIMULATION] ✓ [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
+INFO   [SIMULATION] ✓ [sonarr] Monster.The.Lizzie.Borden.Story.S01...-BYOR : 8/8 vidéo(s) déjà dans la bibliothèque → [seed] Rays_Le _Chat (règle 5 : la saison 1 demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés)
+```
+
 ### Déclenchement
 
 - **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
@@ -479,7 +510,7 @@ Limite : le passage programmé par un event vit dans le worker gunicorn qui a re
 
 | Event | Déclencheur | Action |
 |---|---|---|
-| `EpisodeFileDelete` | Suppression manuelle d'un épisode | Move vers cleanuparr-unlinked |
+| `EpisodeFileDelete` | Suppression manuelle d'un épisode | Move vers cleanuparr-unlinked. Ignoré si le fichier est toujours sur le disque : il a été réaffecté (`manualOverride`, règle 5) |
 | `SeriesDelete` | Suppression d'une série entière | Move vers cleanuparr-unlinked |
 | `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
@@ -493,7 +524,7 @@ Limite : le passage programmé par un event vit dans le worker gunicorn qui a re
 
 | Event | Déclencheur | Action |
 |---|---|---|
-| `MovieFileDelete` | Suppression manuelle d'un film | Move vers cleanuparr-unlinked |
+| `MovieFileDelete` | Suppression manuelle d'un film | Move vers cleanuparr-unlinked. Ignoré si le fichier est toujours sur le disque |
 | `MovieDelete` | Suppression d'un film entier | Move vers cleanuparr-unlinked |
 | `Download` isUpgrade=false | Import normal (On File Import) | Marqué arr_managed, fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |

@@ -95,6 +95,13 @@ IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").str
 PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
 
+# Règle 5 de l'assistant : accorde chaque saison demandée dans Seerr (numérotée
+# comme TMDB) avec la saison TVDB que Sonarr surveille. Simulation propre, dans
+# les mêmes conditions. Sans Seerr, la règle ne fait rien.
+IMPORT_ASSIST_ACCORD_DRY_RUN = os.getenv("IMPORT_ASSIST_ACCORD_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+SEERR_URL = os.getenv("SEERR_URL", "").rstrip("/")
+SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
+
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
 # ── Jellyfin ─────────────────────────────────────────────────────────────────
@@ -1938,14 +1945,19 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
 
     La correspondance se fait par inode, sans aucun nom de fichier. Rien n'est
     importé, rien n'est supprimé, rien ne bouge sur le disque.
-    Retourne un verdict par téléchargement bloqué, ou None si un autre passage
-    tournait déjà.
+
+    La règle 5 passe d'abord, sur les demandes Seerr récentes : une saison
+    demandée qui correspond à une autre saison TVDB n'a plus d'épisodes à chercher.
+    Retourne un verdict par téléchargement bloqué et par désaccord de saison, ou
+    None si un autre passage tournait déjà.
     """
     dry_run = IMPORT_ASSIST_DRY_RUN if dry_run is None else dry_run
     with _assist_exclusive(_ASSIST_LOCK_WAIT) as libre:
         if not libre:
             log.info("Assistant d'import déjà en cours, passage %s ignoré", source)
             return None
+
+        verdicts_accord, ecartees = run_accord(dry_run)
 
         # Les files d'abord : sans téléchargement bloqué, inutile de lister qBit.
         bloques: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
@@ -1958,7 +1970,7 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
             if par_dl:
                 bloques.append((arr, url, cle, par_dl))
         if not bloques:
-            return []
+            return verdicts_accord
 
         try:
             with qbit_session() as s:
@@ -1970,10 +1982,10 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
                 }
         except Exception as e:
             log.error("Assistant d'import : qBittorrent injoignable (%s)", e)
-            return []
+            return verdicts_accord
 
-        ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run}
-        verdicts: list[dict[str, Any]] = []
+        ctx = {"torrents": torrents, "categories": categories, "dry_run": dry_run, "ecartees": ecartees}
+        verdicts: list[dict[str, Any]] = list(verdicts_accord)
         nouveaux = 0
         for arr, url, cle, par_dl in bloques:
             try:
@@ -1996,7 +2008,7 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
         if nouveaux:
             log.info(
                 "=== Assistant d'import%s (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
-                " [SIMULATION]" if dry_run else "", source, len(verdicts), nouveaux,
+                " [SIMULATION]" if dry_run else "", source, len(verdicts) - len(verdicts_accord), nouveaux,
             )
         return verdicts
 
@@ -2128,10 +2140,19 @@ def _assist_download(
     manquants: list[int] = []
     episodes: list[dict[str, Any]] = []
     attendus = {r.get("episodeId") for r in records if r.get("episodeId")}
+    note_accord = ""
     if arr == "sonarr" and attendus:
         episodes = _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
         voulus = _episodes_wanted(episodes)
+        # Règle 5 : une saison demandée qui est en réalité une autre saison TVDB n'a
+        # plus d'épisodes attendus — chercher ceux de Dahmer pour Lizzie Borden.
+        ecartees = (ctx.get("ecartees") or {}).get(media_id) or set()
+        hors_demande = {e["id"] for e in episodes if e.get("seasonNumber") in ecartees}
         manquants = [e["id"] for e in episodes if e["id"] in attendus and e["id"] in voulus]
+        if hors_demande & set(manquants):
+            note_accord = ("règle 5 : la saison " + ", ".join(str(s) for s in sorted(ecartees))
+                           + " demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés")
+            manquants = [i for i in manquants if i not in hors_demande]
 
     # Règle 4, filet après import : un pack de saison qui n'a pas tout apporté est
     # remplacé par un pack complet, plutôt que de chercher ses épisodes un à un.
@@ -2167,6 +2188,8 @@ def _assist_download(
         resume += f" ({note})"
     elif pack is not None and not remplace:
         resume += f" (règle 4 en simulation : remplacerait par le pack complet {pack['title']})"
+    if note_accord:
+        resume += f" ({note_accord})"
     verdict.update(decision="seed", category=categorie, missing_episodes=len(manquants),
                    search=bool(recherche), pack=pack["title"] if remplace else None)
 
@@ -2974,6 +2997,301 @@ def _pack_replacement(h: str, colonne: str = "new_hash") -> sqlite3.Row | None:
             ).fetchone()
 
 
+# ── Assistant d'import, règle 5 : accorder la demande Seerr et la saison Sonarr ─
+#
+# Seerr demande des saisons numérotées comme TMDB, Sonarr les range comme TVDB,
+# et les deux ne s'accordent pas toujours. « Monster: The Lizzie Borden Story »
+# est une mini-série d'une saison pour TMDB, mais la saison 4 de « Monster »
+# pour TVDB : Seerr a demandé la saison 1, celle de Dahmer, et Sonarr y a rangé
+# les 8 épisodes de Lizzie Borden. C'est la demande qui tranche. La saison TVDB
+# qui lui correspond se reconnaît à ses épisodes : mêmes dates de diffusion,
+# mêmes titres. La règle surveille alors la bonne saison, cesse de surveiller
+# l'autre, et réaffecte les fichiers déjà rangés au mauvais endroit — sur place,
+# puis par un renommage : rien n'est supprimé, le torrent reste lié.
+
+# Demandes examinées : celles des derniers jours.
+_ACCORD_WINDOW_DAYS = 30
+_ACCORD_PAGE = 50
+# Une saison correspond si toutes ses dates coïncident, ou au moins cette part de
+# ses titres : les épisodes à venir n'ont pas encore de date.
+_ACCORD_TITLES_MIN = 0.8
+# Attente maximale de l'import manuel qui réaffecte les fichiers, avant le renommage.
+_ACCORD_COMMAND_WAIT = 120
+
+
+def _seerr_get(route: str, **params: Any) -> Any:
+    r = requests.get(f"{SEERR_URL}/api/v1/{route}", params=params or None,
+                     headers={"X-Api-Key": SEERR_API_KEY}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def _seerr_tv_requests(depuis: float) -> list[dict[str, Any]]:
+    """Demandes de séries approuvées ou terminées depuis cette date, les plus récentes d'abord."""
+    demandes: list[dict[str, Any]] = []
+    skip = 0
+    while True:
+        page = _seerr_get("request", take=_ACCORD_PAGE, skip=skip, filter="all", sort="added") or {}
+        lot = page.get("results") or []
+        for d in lot:
+            cree = datetime.strptime((d.get("createdAt") or "1970-01-01")[:19], "%Y-%m-%dT%H:%M:%S")
+            if (cree - datetime(1970, 1, 1)).total_seconds() < depuis:
+                return demandes
+            media = d.get("media") or {}
+            if d.get("type") == "tv" and d.get("status") in (2, 5) and media.get("tmdbId") and media.get("tvdbId"):
+                demandes.append(d)
+        skip += len(lot)
+        if not lot or skip >= ((page.get("pageInfo") or {}).get("results") or 0):
+            return demandes
+
+
+def _episode_title_key(titre: str) -> str:
+    t = unicodedata.normalize("NFKD", titre or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "", t)
+
+
+def _season_scores(tmdb_eps: list[dict[str, Any]], tvdb_eps: list[dict[str, Any]]) -> tuple[int, int] | None:
+    """(dates identiques, titres identiques), épisode par épisode dans l'ordre. None si les nombres diffèrent."""
+    if not tmdb_eps or len(tmdb_eps) != len(tvdb_eps):
+        return None
+    dates = titres = 0
+    for a, b in zip(tmdb_eps, tvdb_eps):
+        dates += bool(a.get("airDate")) and a.get("airDate") == b.get("airDate")
+        cle = _episode_title_key(a.get("name") or "")
+        titres += bool(cle) and cle == _episode_title_key(b.get("title") or "")
+    return dates, titres
+
+
+def _season_for_request(tmdb_eps: list[dict[str, Any]], par_saison: dict[int, list[dict[str, Any]]],
+                        demandee: int) -> tuple[int | None, str]:
+    """
+    Saison TVDB qui correspond à la saison TMDB demandée : la sienne si elle colle,
+    sinon la seule autre qui colle. None si aucune ne colle, ou plusieurs.
+    """
+    n = len(tmdb_eps)
+
+    def colle(saison: int) -> tuple[int, int] | None:
+        scores = _season_scores(tmdb_eps, par_saison.get(saison) or [])
+        if scores and (scores[0] == n or scores[1] >= max(1, round(n * _ACCORD_TITLES_MIN))):
+            return scores
+        return None
+
+    if not tmdb_eps:
+        return None, "saison sans épisode connu de TMDB"
+    if colle(demandee):
+        return demandee, ""
+    autres = [(s, sc) for s in sorted(par_saison) if s != demandee for sc in [colle(s)] if sc]
+    if len(autres) == 1:
+        s, (dates, titres) = autres[0]
+        return s, f"{dates}/{n} dates et {titres}/{n} titres identiques"
+    if autres:
+        return None, "plusieurs saisons TVDB correspondent : " + ", ".join(f"S{s:02d}" for s, _ in autres)
+    return None, f"aucune saison TVDB de {n} épisode{'s' if n > 1 else ''} ne correspond"
+
+
+def run_accord(dry_run: bool) -> tuple[list[dict[str, Any]], dict[int, set[int]]]:
+    """
+    Règle 5, sur les demandes Seerr récentes. Retourne (verdicts, saisons écartées
+    par série Sonarr) : la règle 1 ne compte plus les épisodes de ces saisons parmi
+    les manquants, même en simulation.
+    """
+    if not (SEERR_URL and SEERR_API_KEY and SONARR_URL and SONARR_API_KEY):
+        return [], {}
+    dry = dry_run or IMPORT_ASSIST_ACCORD_DRY_RUN
+    url, cle = SONARR_URL, SONARR_API_KEY
+    try:
+        demandes = _seerr_tv_requests(time.time() - _ACCORD_WINDOW_DAYS * 86400)
+    except Exception as e:
+        log.error("Règle 5 : Seerr injoignable ou réponse inattendue (%s)", e)
+        return [], {}
+    # Plusieurs fiches Seerr peuvent viser la même série TVDB : Monster et Lizzie Borden.
+    par_tvdb: dict[int, list[dict[str, Any]]] = {}
+    for d in demandes:
+        par_tvdb.setdefault(d["media"]["tvdbId"], []).append(d)
+
+    verdicts: list[dict[str, Any]] = []
+    ecartees: dict[int, set[int]] = {}
+    for tvdb, liste in par_tvdb.items():
+        try:
+            verdicts += _accord_series(url, cle, tvdb, liste, dry, ecartees)
+        except Exception as e:
+            log.error("Règle 5 : série TVDB %s en erreur (%s)", tvdb, e)
+            verdicts.append({"arr": "sonarr", "download_id": f"tvdb-{tvdb}", "title": f"série TVDB {tvdb}",
+                             "decision": "error", "reason": str(e)})
+    return verdicts, ecartees
+
+
+def _accord_series(url: str, cle: str, tvdb: int, demandes: list[dict[str, Any]], dry: bool,
+                   ecartees: dict[int, set[int]]) -> list[dict[str, Any]]:
+    """Accorde les demandes d'une même série TVDB. Les saisons écartées s'ajoutent à `ecartees`."""
+    series = _arr_request("GET", url, cle, "series", params={"tvdbId": tvdb}) or []
+    if not series:
+        return []
+    serie = series[0]
+    episodes = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": serie["id"]}) or []
+                if (e.get("seasonNumber") or 0) > 0]
+    par_saison: dict[int, list[dict[str, Any]]] = {}
+    for e in sorted(episodes, key=lambda e: (e["seasonNumber"], e["episodeNumber"])):
+        par_saison.setdefault(e["seasonNumber"], []).append(e)
+
+    # Toutes les correspondances d'abord : une saison qu'une autre demande vise
+    # pour de bon reste surveillée.
+    plan: list[tuple[dict[str, Any], int, int | None, str, str]] = []
+    for d in demandes:
+        tmdb = d["media"]["tmdbId"]
+        titre_tmdb = (_seerr_get(f"tv/{tmdb}", language="en") or {}).get("name") or ""
+        for s in d.get("seasons") or []:
+            demandee = s.get("seasonNumber") or 0
+            if demandee <= 0:
+                continue
+            tmdb_eps = (_seerr_get(f"tv/{tmdb}/season/{demandee}", language="en") or {}).get("episodes") or []
+            cible, detail = _season_for_request(tmdb_eps, par_saison, demandee)
+            plan.append((d, demandee, cible, detail, titre_tmdb))
+    voulues = {cible for _, demandee, cible, _, _ in plan if cible == demandee}
+
+    verdicts: list[dict[str, Any]] = []
+    for d, demandee, cible, detail, titre_tmdb in plan:
+        if cible == demandee:
+            continue
+        cle_journal = f"seerr-{d['id']}-s{demandee}"
+        titre = f"{serie['title']} S{demandee:02d} (demande Seerr {d['id']}, {(d.get('requestedBy') or {}).get('displayName') or '?'})"
+        verdict: dict[str, Any] = {"arr": "sonarr", "download_id": cle_journal, "title": titre}
+        if cible is None:
+            verdict.update(decision="accord-unknown", reason=detail)
+            if not _assist_seen(cle_journal, "accord-unknown", dry):
+                _assist_record(cle_journal, "sonarr", titre, "accord-unknown", detail, dry)
+                log.info("  %s⏭ [sonarr] %s : %s", "[SIMULATION] " if dry else "", titre, detail)
+            verdicts.append(verdict)
+            continue
+        resume, ecartee = _accord_apply(url, cle, serie, par_saison, demandee, cible, demandee not in voulues,
+                                        titre_tmdb, dry, cle_journal)
+        if ecartee:
+            ecartees.setdefault(serie["id"], set()).add(demandee)
+        if resume is None:
+            continue  # déjà accordée
+        verdict.update(decision="accord-fix", reason=f"saison {demandee} demandée = S{cible:02d} TVDB ({detail}) → {resume}",
+                       season=cible)
+        verdicts.append(verdict)
+        if not _assist_seen(cle_journal, "accord-fix", dry):
+            _assist_record(cle_journal, "sonarr", titre, "accord-fix", verdict["reason"], dry)
+            log.info("  %s✓ [sonarr] %s : %s", "[SIMULATION] " if dry else "", titre, verdict["reason"])
+    return verdicts
+
+
+def _accord_apply(url: str, cle: str, serie: dict[str, Any], par_saison: dict[int, list[dict[str, Any]]],
+                  demandee: int, cible: int, libre: bool, titre_tmdb: str, dry: bool,
+                  cle_journal: str) -> tuple[str | None, bool]:
+    """
+    Surveille la saison TVDB qui correspond à la demande, y reprend les fichiers de
+    la demande rangés dans la saison demandée, et cesse de surveiller celle-ci —
+    seulement si aucune autre demande ne la vise (`libre`) et qu'elle n'a pas
+    d'autres fichiers. Retourne (résumé, ou None s'il n'y a plus rien à faire ;
+    saison demandée écartée).
+    """
+    saisons = {s["seasonNumber"]: s for s in serie.get("seasons") or []}
+    surveiller = not (saisons.get(cible) or {}).get("monitored")
+
+    # Fichiers de la demande rangés dans la saison demandée : leur release porte le
+    # titre de la fiche demandée (« Monster The Lizzie Borden Story »), pas celui
+    # d'une autre histoire de la même série.
+    cible_par_numero = {e["episodeNumber"]: e for e in par_saison.get(cible) or []}
+    fichiers = {f["id"]: f for f in _arr_request("GET", url, cle, "episodefile", params={"seriesId": serie["id"]}) or []}
+    titre_cle = _series_title_key(titre_tmdb)
+    a_reprendre: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    autres = 0
+    bloque = ""
+    for e in par_saison.get(demandee) or []:
+        f = fichiers.get(e.get("episodeFileId"))
+        if not f:
+            continue
+        nom = f.get("sceneName") or os.path.basename(f.get("relativePath") or "")
+        info = (_arr_request("GET", url, cle, "parse", params={"title": nom}) or {}).get("parsedEpisodeInfo") or {}
+        if not titre_cle or _series_title_key(info.get("seriesTitle") or "") != titre_cle:
+            autres += 1
+            continue
+        dest = cible_par_numero.get(e["episodeNumber"])
+        if dest is None or dest.get("episodeFileId"):
+            bloque = f"S{cible:02d}E{e['episodeNumber']:02d} absent ou déjà pourvu"
+        else:
+            a_reprendre.append((f, dest))
+    if bloque:
+        a_reprendre = []  # tout ou rien : pas de saison à moitié réaffectée
+    # Une saison qui garde des fichiers d'une autre release (une autre histoire,
+    # demandée plus tôt) reste surveillée.
+    ecartee = libre and not autres and not bloque
+    ne_plus = ecartee and bool((saisons.get(demandee) or {}).get("monitored"))
+
+    if not (surveiller or ne_plus or a_reprendre or bloque):
+        return None, ecartee
+    morceaux = []
+    if surveiller:
+        morceaux.append(f"S{cible:02d} surveillée")
+    if ne_plus:
+        morceaux.append(f"S{demandee:02d} plus surveillée")
+    if a_reprendre:
+        morceaux.append(f"{len(a_reprendre)} fichier(s) réaffecté(s) de S{demandee:02d} à S{cible:02d}")
+    elif bloque:
+        morceaux.append(f"fichiers laissés en S{demandee:02d} ({bloque})")
+    resume = ", ".join(morceaux)
+    if dry or _assist_seen(cle_journal, "accord-fix", False):
+        return resume, ecartee
+
+    if surveiller or ne_plus:
+        a_jour = _arr_request("GET", url, cle, f"series/{serie['id']}") or {}
+        for s in a_jour.get("seasons") or []:
+            if s["seasonNumber"] == cible:
+                s["monitored"] = True
+            elif s["seasonNumber"] == demandee and ne_plus:
+                s["monitored"] = False
+        # Sonarr aligne la surveillance des épisodes sur celle de leur saison.
+        _arr_request("PUT", url, cle, f"series/{serie['id']}", json=a_jour)
+    if a_reprendre:
+        # Sans downloadId, un fichier déjà dans le dossier de la série est réaffecté
+        # sur place (ImportApprovedEpisodes, newDownload=false) : ni copie ni suppression.
+        entrees = [{
+            "path": f["path"], "seriesId": serie["id"], "episodeIds": [dest["id"]], "quality": f.get("quality"),
+            "languages": f.get("languages") or [], "releaseGroup": f.get("releaseGroup") or "",
+            "indexerFlags": f.get("indexerFlags") or 0, "releaseType": "singleEpisode",
+        } for f, dest in a_reprendre]
+        commande = _arr_request("POST", url, cle, "command", json={"name": "ManualImport", "importMode": "auto", "files": entrees})
+        if not _arr_wait_command(url, cle, commande):
+            return resume + " (import manuel non terminé : renommage à lancer depuis Sonarr)", ecartee
+        # Le renommage range ensuite les fichiers dans le dossier de leur nouvelle saison.
+        nouveaux = {e.get("episodeFileId") for e in _arr_request("GET", url, cle, "episode", params={"seriesId": serie["id"]}) or []
+                    if e.get("seasonNumber") == cible and e.get("episodeFileId")}
+        a_renommer = [r["episodeFileId"] for r in _arr_request("GET", url, cle, "rename", params={"seriesId": serie["id"]}) or []
+                      if r.get("episodeFileId") in nouveaux]
+        if a_renommer:
+            _arr_request("POST", url, cle, "command", json={"name": "RenameFiles", "seriesId": serie["id"], "files": a_renommer})
+    return resume, ecartee
+
+
+def _arr_wait_command(url: str, cle: str, commande: dict[str, Any] | None) -> bool:
+    """Attend la fin d'une commande *arr. True si elle s'est terminée sans erreur."""
+    if not commande or not commande.get("id"):
+        return False
+    fin = time.time() + _ACCORD_COMMAND_WAIT
+    while time.time() < fin:
+        etat = (_arr_request("GET", url, cle, f"command/{commande['id']}") or {}).get("status")
+        if etat in ("completed", "failed", "aborted", "cancelled", "orphaned"):
+            return etat == "completed"
+        time.sleep(2)
+    return False
+
+
+def _still_on_disk(event: str, path: str) -> bool:
+    """
+    Un fichier « supprimé » qui est toujours là n'a pas été supprimé : l'*arr l'a
+    réaffecté à d'autres épisodes par un import manuel, sur place (raison
+    « manualOverride », règle 5). Il supprime toujours le fichier avant d'émettre
+    une vraie suppression. Déplacer son torrent le mettrait en corbeille à tort.
+    """
+    if not os.path.isfile(path):
+        return False
+    log.info("%s ignoré : %s est toujours sur le disque (fichier réaffecté)", event, path)
+    return True
+
+
 def _validate_webhook_payload(data: Any) -> tuple[bool, str]:
     """Valide la structure minimale d'un payload webhook Sonarr/Radarr."""
     if not isinstance(data, dict):
@@ -3020,6 +3338,8 @@ def webhook():
     # ── SONARR ───────────────────────────────────────────────────────────────
     if event in ("EpisodeFileDelete", "EpisodeFileDeleteForUpgrade"):
         path = data.get("episodeFile", {}).get("path")
+        if path and _still_on_disk(event, path):
+            return jsonify({"status": "ignored", "reason": "file still on disk", "path": path})
         if path:
             log.info("Sonarr %s: %s", event, path)
             n = move_torrents_for_path(path)
@@ -3041,6 +3361,8 @@ def webhook():
             folder = movie.get("folderPath", "").rstrip("/")
             rel = mfile.get("relativePath", "")
             path = f"{folder}/{rel}" if folder and rel else folder
+        if path and _still_on_disk(event, path):
+            return jsonify({"status": "ignored", "reason": "file still on disk", "path": path})
         if path:
             log.info("Radarr %s: %s", event, path)
             n = move_torrents_for_path(path)
