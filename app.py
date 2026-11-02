@@ -115,10 +115,13 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 
 # Règle 6 de l'assistant (téléchargement mort) : un téléchargement de la file
 # Sonarr/Radarr qui n'a rien reçu depuis ce nombre de jours, sans aucune source
-# connectée, est blacklisté par la file — l'*arr cherche alors une autre
-# release — et part en corbeille. Simulation propre, dans les mêmes conditions.
+# connectée, reste en place, et la meilleure autre version est prise en plus. Le
+# premier fini gagne. Si l'alternative meurt à son tour, la suivante est prise,
+# jusqu'à IMPORT_ASSIST_MORT_ESSAIS versions. Simulation propre, dans les mêmes
+# conditions.
 IMPORT_ASSIST_MORT_DRY_RUN = os.getenv("IMPORT_ASSIST_MORT_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_MORT_JOURS = float(os.getenv("IMPORT_ASSIST_MORT_JOURS", "3"))
+IMPORT_ASSIST_MORT_ESSAIS = int(os.getenv("IMPORT_ASSIST_MORT_ESSAIS", "5"))
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -289,6 +292,20 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_pack_new ON pack_replace(new_hash);
                 CREATE INDEX IF NOT EXISTS idx_pack_old ON pack_replace(old_hash);
+
+                -- Courses de versions pour un téléchargement mort (règle 6).
+                CREATE TABLE IF NOT EXISTS dead_race (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arr       TEXT    NOT NULL,
+                    media_id  INTEGER NOT NULL,
+                    episodes  TEXT,
+                    original  TEXT    NOT NULL,
+                    hashes    TEXT    NOT NULL,
+                    tried     TEXT    NOT NULL,
+                    last_try  INTEGER,
+                    done      INTEGER DEFAULT 0,
+                    at        INTEGER DEFAULT (strftime('%s','now'))
+                );
             """)
             # Migration : si l'ancienne table files a UNIQUE(path), on la recrée
             # Détecte si la contrainte unique est sur path seul
@@ -1973,6 +1990,17 @@ def _assist_seen(download_id: str, decision: str, dry_run: bool) -> bool:
             ).fetchone() is not None
 
 
+def _assist_recent(download_id: str, decisions: tuple[str, ...], dry_run: bool, duree: float) -> bool:
+    """Un de ces verdicts a-t-il été rendu pour ce téléchargement depuis `duree` secondes ?"""
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                f"SELECT 1 FROM assist_log WHERE download_id = ? AND decision IN ({','.join('?' * len(decisions))}) "
+                "AND dry_run = ? AND at > ?",
+                (download_id, *decisions, int(dry_run), int(time.time() - duree)),
+            ).fetchone() is not None
+
+
 def _assist_record(download_id: str, arr: str, title: str, decision: str,
                    details: str, dry_run: bool, regle: int) -> None:
     with _db_lock:
@@ -3515,20 +3543,30 @@ def _arr_wait_command(url: str, cle: str, commande: dict[str, Any] | None) -> bo
 
 # ── Assistant d'import, règle 6 : téléchargements morts ─────────────────────
 #
-# Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment :
-# aucun des deux ne le remplace, et la demande attend — des mois parfois. Passé
-# IMPORT_ASSIST_MORT_JOURS sans rien recevoir, sans aucune source connectée, il
-# est blacklisté par la file, ce qui relance la recherche d'une autre release, et
-# part en corbeille. Rien n'est supprimé.
+# Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment.
+# Aucun des deux ne le remplace : il refuse même toute autre version tant que
+# celle-ci occupe la file. La demande attend, des mois parfois. Passé
+# IMPORT_ASSIST_MORT_JOURS sans rien recevoir, l'assistant lance une course :
+# la meilleure autre version, choisie par l'*arr lui-même, est prise en plus,
+# sans rien retirer — un seeder peut revenir, même après des mois. Le premier
+# téléchargement fini et importé gagne, original compris ; les autres sortent
+# de la file sans blacklist et partent en corbeille. Si l'alternative meurt à
+# son tour, la suivante est prise. Rien n'est supprimé.
 
 # Files *arr d'un téléchargement en cours.
 _MORT_ETATS_FILE = {"downloading"}
 # États qBittorrent où le torrent attend son tour, se vérifie ou a perdu ses
 # fichiers : pas un téléchargement mort, ou un autre problème.
 _MORT_ETATS_ATTENTE = {"queuedDL", "checkingDL", "checkingResumeData", "moving", "allocating", "missingFiles", "error"}
-# Au plus tant de téléchargements traités par passage, les plus anciens d'abord :
-# une mesure fausse ne toucherait pas toutes les demandes à la fois.
+# Au plus tant de recherches par passage, les téléchargements les plus anciens
+# d'abord : une recherche interroge tous les indexeurs.
 _MORT_MAX_PAR_PASSAGE = 5
+# Refus de l'*arr qui ne disqualifient pas une autre version : la place est prise
+# dans la file — justement par le téléchargement mort — ou il lui manque des
+# sources, qui peuvent revenir comme pour l'original.
+_MORT_REFUS_ADMIS = ("in queue", "seeder")
+# États de file où une version de la course peut encore se trouver.
+_MORT_ETATS_COURSE = {"downloading", "importBlocked", "importPending", "importing", "failedPending"}
 
 
 def _dead_since(t: dict[str, Any] | None, maintenant: float) -> float | None:
@@ -3544,62 +3582,245 @@ def _dead_since(t: dict[str, Any] | None, maintenant: float) -> float | None:
     return maintenant - max(t.get("last_activity") or 0, t["added_on"])
 
 
+def _arr_conf(arr: str) -> tuple[str, str]:
+    return (SONARR_URL, SONARR_API_KEY) if arr == "sonarr" else (RADARR_URL, RADARR_API_KEY)
+
+
+def _races() -> list[sqlite3.Row]:
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute("SELECT * FROM dead_race WHERE done = 0 ORDER BY id").fetchall()
+
+
+def _race_update(race_id: int, **champs: Any) -> None:
+    with _db_lock:
+        with get_db() as conn:
+            conn.execute(f"UPDATE dead_race SET {', '.join(f'{k} = ?' for k in champs)} WHERE id = ?",
+                         (*champs.values(), race_id))
+
+
 def run_dead_downloads(
     en_cours: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]], ctx: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
     """Règle 6, sur les téléchargements en cours des files. Retourne (verdicts, journalisés maintenant)."""
     dry = ctx["apercu"] or IMPORT_ASSIST_MORT_DRY_RUN
     maintenant = time.time()
+    seuil = IMPORT_ASSIST_MORT_JOURS * 86400
+    verdicts: list[dict[str, Any]] = []
+    nouveaux = 0
+
+    def noter(verdict: dict[str, Any] | None, nouveau: bool) -> None:
+        nonlocal nouveaux
+        if verdict is not None:
+            verdicts.append(verdict)
+            nouveaux += nouveau
+
+    # 1. Les courses déjà lancées : le premier fini gagne. Aucune n'existe en simulation.
+    #    Une course close à l'instant vient de retirer ses perdants de la file, qui
+    #    a été lue avant : l'étape 2 ne doit pas les reprendre pour des morts.
+    sortis: set[str] = set()
+    if not dry:
+        for course in _races():
+            try:
+                noter(*_race_resolve(course, ctx, sortis))
+            except Exception as e:
+                log.error("  ⚠ [%s] [%s] course %s en erreur (%s)", _regle(6), course["arr"], course["original"], e)
+
+    # 2. Les téléchargements morts : une course commence, ou repart avec la version
+    #    suivante quand tous ses téléchargements sont morts depuis une période.
+    courses = _races()
+    files = {arr: par_dl for arr, _, _, par_dl in en_cours}
     morts = []
     for arr, url, cle, par_dl in en_cours:
         for dl, records in par_dl.items():
-            t = ctx["torrents"].get(dl)
-            inactif = _dead_since(t, maintenant)
-            if inactif is not None and inactif >= IMPORT_ASSIST_MORT_JOURS * 86400:
-                morts.append((inactif, arr, url, cle, dl, records, t))
+            inactif = _dead_since(ctx["torrents"].get(dl), maintenant)
+            if inactif is not None and inactif >= seuil and dl not in sortis:
+                morts.append((inactif, arr, url, cle, dl, records))
     morts.sort(key=lambda m: -m[0])
-    verdicts: list[dict[str, Any]] = []
-    nouveaux = 0
-    for inactif, arr, url, cle, dl, records, t in morts[:_MORT_MAX_PAR_PASSAGE]:
+    vues: set[int] = set()
+    lancees = attente = 0
+    for inactif, arr, url, cle, dl, records in morts:
+        course = next((c for c in courses if c["arr"] == arr and dl in json.loads(c["hashes"])), None)
+        if course is not None:
+            if course["id"] in vues:
+                continue
+            vues.add(course["id"])
+            inactifs = [_dead_since(ctx["torrents"][h], maintenant) for h in json.loads(course["hashes"])
+                        if h in ctx["torrents"]]
+            if any(d is None or d < seuil for d in inactifs) or maintenant - (course["last_try"] or 0) < seuil:
+                continue
+            inactif = min(inactifs)
+            if course["original"] in files[arr]:
+                # La course se poursuit au nom de l'original, dont le titre est alors exclu.
+                dl, records = course["original"], files[arr][course["original"]]
+        if _assist_recent(dl, ("dead-race", "dead-wait"), dry, seuil):
+            continue  # déjà cherché il y a moins d'une période
+        # Une course qui a épuisé ses essais ne cherche plus : elle ne prend pas de place.
+        cherche = course is None or len(json.loads(course["tried"])) < IMPORT_ASSIST_MORT_ESSAIS
+        if cherche and lancees >= _MORT_MAX_PAR_PASSAGE:
+            attente += 1
+            continue
+        lancees += cherche
         try:
-            verdict, nouveau = _dead_download(arr, url, cle, dl, records, t, inactif, dry)
+            noter(*_race_try(arr, url, cle, dl, records, course, inactif, dry))
         except Exception as e:
             titre = records[0].get("title") or dl
             log.error("  ⚠ [%s] [%s] %s en erreur (%s)", _regle(6), arr, titre, e)
-            verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "error", "reason": str(e)}
-            nouveau = False
-        verdicts.append(verdict)
-        nouveaux += nouveau
-    if len(morts) > _MORT_MAX_PAR_PASSAGE:
-        log.info("  [%s] %d autre(s) téléchargement(s) mort(s) attendront le passage suivant",
-                 _regle(6), len(morts) - _MORT_MAX_PAR_PASSAGE)
+            noter({"arr": arr, "download_id": dl, "title": titre, "decision": "error", "reason": str(e)}, False)
+    if attente:
+        log.info("  [%s] %d autre(s) téléchargement(s) mort(s) attendront le passage suivant", _regle(6), attente)
     return verdicts, nouveaux
 
 
-def _dead_download(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
-                   inactif: float, dry: bool) -> tuple[dict[str, Any], bool]:
+def _alternatives(arr: str, url: str, cle: str, film: int | None, episodes: set[int],
+                  exclus: set[str], hashes: set[str]) -> list[dict[str, Any]]:
+    """
+    Les autres versions du même film ou des mêmes épisodes, d'après la recherche
+    interactive de l'*arr, dans son ordre de préférence. Seuls les refus « la place
+    est prise dans la file » et « pas assez de sources » sont passés outre : une
+    version sans source peut revenir, comme l'original.
+    """
+    if arr == "radarr":
+        resultats = _arr_request("GET", url, cle, "release", params={"movieId": film}, timeout=300) or []
+        memes = [r for r in resultats if r.get("mappedMovieId") == film]
+    else:
+        if not episodes:
+            return []
+        resultats = _arr_request("GET", url, cle, "release", params={"episodeId": min(episodes)}, timeout=300) or []
+        memes = [r for r in resultats if episodes <= {e.get("id") for e in r.get("mappedEpisodeInfo") or []}]
+    exclus = {t.lower() for t in exclus}
+    return [
+        r for r in memes
+        if r.get("protocol") == "torrent" and (r.get("title") or "").lower() not in exclus
+        and (r.get("infoHash") or "").lower() not in hashes
+        and all(any(a in m.lower() for a in _MORT_REFUS_ADMIS) for m in r.get("rejections") or [])
+    ]
+
+
+def _race_try(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], course: sqlite3.Row | None,
+              inactif: float, dry: bool) -> tuple[dict[str, Any], bool]:
+    """Prend en plus la meilleure version pas encore essayée. Sans elle, l'original reste seul et en route."""
     titre = records[0].get("title") or dl
-    progres = t.get("progress") or 0
-    # Un torrent privé déjà entamé n'est pas arrêté : le tracker attend qu'il
-    # partage ce qu'il a reçu (hit-and-run).
-    garder = bool(t.get("private")) and progres > 0
-    details = (f"{progres:.0%} reçu, plus rien depuis {inactif / 86400:.0f} j, aucune source → blacklisté, "
-               "nouvelle recherche, torrent en corbeille"
-               + (", laissé en route (tracker privé déjà entamé)" if garder else ", arrêté"))
-    verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "dead-retry", "reason": details}
-    if _assist_seen(dl, "dead-retry", dry):
-        return verdict, False
-    if not dry:
-        # Retiré de la file en le blacklistant, sans rien supprimer dans le
-        # client : l'*arr cherche aussitôt une autre release.
-        _arr_request("DELETE", url, cle, f"queue/{records[0]['id']}",
-                     params={"removeFromClient": "false", "blocklist": "true", "skipRedownload": "false"})
-        if not _assist_trash(t, arreter=not garder):
-            details += " (laissé dans sa catégorie : son dossier est aussi celui d'un autre torrent)"
-            verdict["reason"] = details
-    _assist_record(dl, arr, titre, "dead-retry", details, dry, 6)
-    _assist_log(6, "✓", arr, titre, details, dry)
+    if course:
+        essayees, hashes = json.loads(course["tried"]), set(json.loads(course["hashes"]))
+        media, episodes = course["media_id"], set(json.loads(course["episodes"] or "[]"))
+    else:
+        essayees, hashes = [], {dl}
+        media = records[0].get("movieId") if arr == "radarr" else records[0].get("seriesId")
+        episodes = {r["episodeId"] for r in records if r.get("episodeId")} if arr == "sonarr" else set()
+    verdict: dict[str, Any] = {"arr": arr, "download_id": dl, "title": titre}
+    depuis = f"plus rien reçu depuis {inactif / 86400:.0f} j"
+    if len(essayees) >= IMPORT_ASSIST_MORT_ESSAIS:
+        details = f"{depuis}, {len(essayees)} autre(s) version(s) déjà essayée(s), mortes aussi : on attend que l'une reparte"
+        decision = "dead-wait"
+    else:
+        cands = _alternatives(arr, url, cle, media, episodes, set(essayees) | {titre}, hashes)
+        if not cands:
+            details = f"{depuis}, aucune autre version trouvée : on attend, le torrent reste en route"
+            decision = "dead-wait"
+        else:
+            alt = cands[0]
+            decision = "dead-race"
+            details = (f"{depuis} → {'essai %d : ' % (len(essayees) + 1) if essayees else ''}autre version prise en plus, "
+                       f"{alt.get('title')} ({alt.get('indexer')}, {alt.get('seeders')} source(s), score "
+                       f"{alt.get('customFormatScore')}) ; la première finie gagnera")
+            verdict["alternative"] = alt.get("title")
+            if not dry:
+                # Comme « télécharger quand même » dans l'*arr : il passe outre la place prise dans sa file.
+                _arr_request("POST", url, cle, "release", json={"guid": alt["guid"], "indexerId": alt["indexerId"]},
+                             timeout=120)
+                essayees = essayees + [alt.get("title")]
+                if course:
+                    _race_update(course["id"], tried=json.dumps(essayees), last_try=int(time.time()))
+                else:
+                    with _db_lock:
+                        with get_db() as conn:
+                            conn.execute(
+                                "INSERT INTO dead_race (arr, media_id, episodes, original, hashes, tried, last_try) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (arr, media, json.dumps(sorted(episodes)) if episodes else None, dl, json.dumps([dl]),
+                                 json.dumps(essayees), int(time.time())),
+                            )
+    if decision == "dead-wait" and course and not dry:
+        _race_update(course["id"], last_try=int(time.time()))  # on y revient dans une période
+    verdict.update(decision=decision, reason=details)
+    # Une fois par période au plus : le verdict lui-même espace les recherches.
+    _assist_record(dl, arr, titre, decision, details, dry, 6)
+    _assist_log(6, "✓" if decision == "dead-race" else "⏭", arr, titre, details, dry)
     return verdict, True
+
+
+def _race_resolve(course: sqlite3.Row, ctx: dict[str, Any], sortis: set[str]) -> tuple[dict[str, Any] | None, bool]:
+    """
+    Le premier téléchargement de la course fini et importé — ses vidéos sont dans
+    la bibliothèque du média — gagne. Les autres sortent de la file sans
+    blacklist et partent en corbeille, arrêtés, sauf un privé entamé ou un fini,
+    qui continuent de seeder. Une course close ajoute ses téléchargements à `sortis`.
+    """
+    arr, media = course["arr"], course["media_id"]
+    url, cle = _arr_conf(arr)
+    hashes = json.loads(course["hashes"])
+    essayees = set(json.loads(course["tried"]))
+    # Les versions prises se retrouvent par leur grab dans l'historique.
+    route, param = ("history/movie", "movieId") if arr == "radarr" else ("history/series", "seriesId")
+    for g in _arr_request("GET", url, cle, route, params={param: media}) or []:
+        h = (g.get("downloadId") or "").lower()
+        if g.get("eventType") == "grabbed" and g.get("sourceTitle") in essayees and h and h not in hashes:
+            hashes.append(h)
+    if hashes != json.loads(course["hashes"]):
+        _race_update(course["id"], hashes=json.dumps(hashes))
+    dossier = (_arr_request("GET", url, cle, f"{'movie' if arr == 'radarr' else 'series'}/{media}") or {}).get("path") or ""
+    inodes = set(scan_video_files(dossier)) if dossier else set()
+
+    gagnant, finis = None, []
+    for h in hashes:
+        t = ctx["torrents"].get(h)
+        if not t or (t.get("progress") or 0) < 1:
+            continue
+        lies = 0
+        for v in _torrent_videos(t) or []:
+            try:
+                lies += os.stat(v).st_ino in inodes
+            except OSError:
+                continue
+        if lies:
+            gagnant = t
+            break
+        finis.append(t)
+    if gagnant is None:
+        if not any(ctx["torrents"].get(h) for h in hashes):
+            _race_update(course["id"], done=1)  # tous retirés de qBittorrent : plus de course
+            sortis.update(hashes)
+            return None, False
+        if not finis or _assist_seen(course["original"], "dead-blocked", False):
+            return None, False
+        details = (f"{finis[0].get('name')} a fini, mais {arr.capitalize()} ne l'a pas importé : "
+                   "import à faire à la main ; les autres versions continuent")
+        _assist_record(course["original"], arr, finis[0].get("name") or "", "dead-blocked", details, False, 6)
+        _assist_log(6, "⚠", arr, finis[0].get("name") or "", details, False)
+        return {"arr": arr, "download_id": course["original"], "title": finis[0].get("name"),
+                "decision": "dead-blocked", "reason": details}, True
+
+    # Le gagnant est là : les autres versions sortent de la file, sans blacklist.
+    file = {dl: recs for dl, recs in _assist_blocked(url, cle, _MORT_ETATS_COURSE).items()}
+    perdants = [h for h in hashes if h != gagnant["hash"].lower()]
+    retires = 0
+    for h in perdants:
+        if h in file:
+            _arr_request("DELETE", url, cle, f"queue/{file[h][0]['id']}",
+                         params={"removeFromClient": "false", "blocklist": "false", "skipRedownload": "true"})
+        t = ctx["torrents"].get(h)
+        if t and t.get("category") != TARGET_CAT:
+            progres = t.get("progress") or 0
+            seeder = progres >= 1 or (bool(t.get("private")) and progres > 0)  # hit-and-run
+            retires += _assist_trash(t, arreter=not seeder)
+    _race_update(course["id"], hashes=json.dumps(hashes), done=1)
+    sortis.update(hashes)
+    details = f"{gagnant.get('name')} a fini le premier → {retires} autre(s) version(s) retirée(s) de la file, sans blacklist, et en corbeille"
+    _assist_record(course["original"], arr, gagnant.get("name") or "", "dead-won", details, False, 6)
+    _assist_log(6, "✓", arr, gagnant.get("name") or "", details, False)
+    return {"arr": arr, "download_id": course["original"], "title": gagnant.get("name"),
+            "decision": "dead-won", "reason": details}, True
 
 
 def _still_on_disk(event: str, path: str) -> bool:
