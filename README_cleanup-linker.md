@@ -203,6 +203,7 @@ networks:
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | Supprimer une série ou un film depuis Jellyfin retire l'entrée de Sonarr/Radarr, au lieu de seulement la dé-monitorer |
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Règle 1 de l'assistant d'import (débloquer la file) en simulation : elle journalise ce qu'elle ferait, sans agir. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Passage de renfort de l'assistant d'import, pour les events manqués. `0` le désactive |
+| `IMPORT_ASSIST_NOM_DRY_RUN` | `true` | Règle 2 de l'assistant (torrent mal nommé) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Règle 4 de l'assistant (pack incomplet) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
@@ -407,6 +408,7 @@ Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste
 | Règle | Interrupteur | Ce qu'elle fait |
 |-------|--------------|-----------------|
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
+| 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false` | Renomme avec le titre de sa release un torrent que l'*arr ne reconnaît pas, pour qu'il l'importe lui-même |
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
 | 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false` | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
@@ -414,7 +416,7 @@ Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste
 **Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
 
 ```
-INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 2 · torrent mal nommé en simulation, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation
 INFO     ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
@@ -443,6 +445,29 @@ Rien n'est importé ni supprimé. Un téléchargement en erreur n'empêche pas d
 ```
 INFO     [SIMULATION] ✓ [règle 1 · débloquer la file] [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : 12/12 vidéo(s) déjà dans la bibliothèque → [seed] Séries animation, recherche de 12 épisode(s) manquant(s)
 INFO     [SIMULATION] ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
+```
+
+### Règle 2 · torrent mal nommé : la release est bonne, pas le nom du torrent
+
+Au bout du téléchargement, Sonarr et Radarr reconnaissent le média d'après **le nom du torrent dans qBittorrent**, et non d'après le titre de la release. Ce nom est souvent celui du fichier, choisi par l'uploader : `Resident.Evil.2026.2026.1080p.AMZN…-KyoGo.mkv` pour la release `Resident.Evil.2026.VOSTFR.1080p.WEB…-KyoGo`. Avec l'année en double, Radarr y lit le titre « Resident Evil 2026 », un film qui n'existe pas. Il retrouve le film par l'historique du grab, mais celui-ci l'avait rattaché par l'identifiant de l'indexeur. Radarr bloque alors l'import : « matched to movie by ID. Manual Import required ». Un identifiant faux suffirait sinon à importer un autre film.
+
+La règle renomme le torrent avec **le titre de la release**. L'*arr relit ce nom à son rafraîchissement suivant, reconnaît le média et importe lui-même, avec ses contrôles habituels (upgrade, échantillon, place libre). Seul le nom affiché change : aucun fichier ne bouge, et le torrent continue de seeder. Le fichier importé garde le titre de la release comme nom de scène : ses formats, VOSTFR par exemple, sont reconnus.
+
+Elle n'agit que sur un téléchargement bloqué « matched … by ID », complet, dont aucune vidéo n'est dans la bibliothèque, et seulement si :
+- **le titre de la release désigne à lui seul le même média** pour l'*arr (`/parse`) : le même film, ou la même série avec au moins les épisodes de la file. C'est la preuve qui manquait à l'*arr ;
+- le nom actuel du torrent ne désigne aucun autre média ;
+- la saison n'est pas une saison demandée sous un autre numéro (règle 5) ;
+- **le torrent ne contient aucun fichier suspect**, coché ou non : exécutable (`.exe`, `.bat`, `.msi`…), script (`.ps1`, `.vbs`, `.js`…), raccourci (`.lnk`, `.url`) ou archive (`.zip`, `.rar`…). Une fausse release les glisse à côté d'une vidéo leurre. Or Sonarr et Radarr ne les signalent que si rien d'autre n'est importé : une fois renommé, le leurre serait importé. Un tel torrent reste bloqué, avec un avertissement `rename-suspect`.
+
+Un titre de release identique au nom du torrent ne prouve rien de plus. C'est le cas de `Ghosts.S06E01.NORDiC…` : « Ghosts » désigne six séries sur TVDB, et seul l'identifiant de l'indexeur relie ce téléchargement à Ghosts (US). Il reste bloqué.
+
+Si l'*arr bloque toujours le torrent 10 minutes après le renommage, l'avertissement `rename-blocked` le signale, et l'import reste à faire à la main. Le torrent n'est jamais renommé deux fois.
+
+Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_NOM_DRY_RUN=false` la fait agir. Verdicts : `rename` (torrent renommé), `rename-suspect`, `rename-blocked` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
+
+```
+INFO     [SIMULATION] ✓ [règle 2 · torrent mal nommé] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : le titre de la release désigne bien Resident Evil (2026) : torrent renommé Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo → Radarr l'importera seul
+INFO     [SIMULATION] ⏭ [règle 2 · torrent mal nommé] [sonarr] Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION.mkv : le nom du torrent est déjà le titre de la release : seul l'identifiant de l'indexeur relie ce téléchargement au média
 ```
 
 ### Règle 4 · pack incomplet : pack de saison partiel
@@ -530,7 +555,7 @@ Le téléchargement mort n'est **ni blacklisté ni retiré** : un seeder peut re
 3. Si toutes les versions de la course meurent à leur tour, la suivante est prise, une par période de `IMPORT_ASSIST_MORT_JOURS`, jusqu'à `IMPORT_ASSIST_MORT_ESSAIS` versions (5 par défaut). Ensuite, on attend que l'une reparte.
 4. Sans autre version, l'original reste seul et en route. Une nouvelle recherche a lieu au plus une fois par période.
 
-Si une version finie n'est pas importée (par exemple quand Radarr ne reconnaît pas le titre : « matched to movie by ID »), un avertissement le signale, et l'import reste à faire à la main. Les autres versions continuent.
+Si une version finie n'est pas importée, parce que l'*arr la bloque dans sa file, un avertissement le signale, et l'import reste à faire à la main. Les autres versions continuent. Un torrent mal nommé est réglé par la règle 2.
 
 Pour une série, une autre version doit couvrir tous les épisodes du téléchargement mort : un pack ou un multi-épisodes. La recherche se fait sur le premier de ces épisodes.
 

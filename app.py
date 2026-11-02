@@ -89,6 +89,12 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
 
+# Règle 2 de l'assistant (torrent mal nommé) : un import bloqué « matched by ID »,
+# parce que l'*arr ne reconnaît pas le nom du torrent, alors que le titre de la
+# release désigne à lui seul le même média. Le torrent est renommé avec ce titre,
+# et l'*arr importe lui-même. Simulation propre, dans les mêmes conditions.
+IMPORT_ASSIST_NOM_DRY_RUN = os.getenv("IMPORT_ASSIST_NOM_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+
 # Règle 4 de l'assistant (pack incomplet) : un pack de saison partiel est
 # remplacé par un pack complet, cherché dans Prowlarr. Sa propre simulation,
 # dans les mêmes conditions. Le filet après import remplace la recherche
@@ -1872,7 +1878,8 @@ _assist_timer_lock = threading.Lock()
 _assist_timer: threading.Timer | None = None
 # Nom de chaque règle, dans les logs et dans /assist/history : on y lit quelle
 # règle a fait quoi.
-_REGLES = {1: "débloquer la file", 4: "pack incomplet", 5: "bonne saison", 6: "téléchargement mort"}
+_REGLES = {1: "débloquer la file", 2: "torrent mal nommé", 4: "pack incomplet", 5: "bonne saison",
+           6: "téléchargement mort"}
 
 
 def _regle(n: int) -> str:
@@ -1892,8 +1899,8 @@ def _assist_modes() -> str:
     r4 = (mode(IMPORT_ASSIST_PACK_DRY_RUN) if sonarr and PROWLARR_URL and PROWLARR_API_KEY
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
-    return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(4)} {r4}, {_regle(5)} {r5}, "
-            f"{_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}")
+    return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)}, "
+            f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}")
 
 
 @contextmanager
@@ -1999,6 +2006,16 @@ def _assist_recent(download_id: str, decisions: tuple[str, ...], dry_run: bool, 
                 "AND dry_run = ? AND at > ?",
                 (download_id, *decisions, int(dry_run), int(time.time() - duree)),
             ).fetchone() is not None
+
+
+def _assist_last(download_id: str, decision: str, dry_run: bool) -> int | None:
+    """Date du dernier verdict de ce type pour ce téléchargement, ou None."""
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                "SELECT MAX(at) FROM assist_log WHERE download_id = ? AND decision = ? AND dry_run = ?",
+                (download_id, decision, int(dry_run)),
+            ).fetchone()[0]
 
 
 def _assist_record(download_id: str, arr: str, title: str, decision: str,
@@ -2237,6 +2254,9 @@ def _assist_download(
         remplacement = _pack_replacement(dl) if arr == "sonarr" else None
         if remplacement:
             return _pack_finish(url, cle, dl, titre, inodes, remplacement, ctx, verdict, ecarte, t, categorie)
+        # Règle 2 : rien n'est importé, parce que l'*arr ne reconnaît pas le nom du torrent.
+        if not lies and _matched_by_id(records):
+            return _misnamed(arr, url, cle, dl, records, t, media_id, ctx, verdict, ecarte)
         return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
     obstacle = _seed_obstacle(categorie, t, ctx)
@@ -2374,6 +2394,125 @@ def import_assist_loop() -> None:
         except Exception as e:
             log.error("Erreur assistant d'import : %s", e)
         time.sleep(IMPORT_ASSIST_INTERVAL)
+
+
+# ── Assistant d'import, règle 2 : torrent mal nommé ─────────────────────────
+#
+# Au bout du téléchargement, Sonarr et Radarr reconnaissent le média d'après le
+# nom du torrent dans qBittorrent, relu à chaque rafraîchissement, et non
+# d'après le titre de la release. Un nom qui ne dit rien
+# (« Resident.Evil.2026.2026.1080p… ») est rattaché par l'historique du grab.
+# Si ce grab l'avait été par l'identifiant de l'indexeur, l'import est bloqué
+# (« matched to movie by ID ») : un identifiant faux ferait sinon importer un
+# autre média. La règle renomme le torrent avec le titre de la release, à
+# condition que ce titre désigne à lui seul le même média. L'*arr importe alors
+# lui-même, avec ses contrôles habituels. Seul le nom affiché change : aucun
+# fichier ne bouge.
+
+_NOM_BLOCAGE = re.compile(r"matched to (movie|series) by id", re.IGNORECASE)
+# Exécutables, scripts, raccourcis et archives : une fausse release les glisse à
+# côté d'une vidéo leurre. Sonarr et Radarr ne les signalent que si rien d'autre
+# n'est importé ; renommer un tel torrent ferait importer le leurre.
+_NOM_SUSPECTS = {
+    ".exe", ".msi", ".bat", ".cmd", ".com", ".sh", ".ps1", ".scr", ".pif", ".lnk", ".url", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar", ".dll", ".cpl", ".reg", ".apk",
+    ".zip", ".zipx", ".rar", ".r00", ".7z", ".arj", ".lzh", ".gz", ".bz2", ".tar", ".tgz",
+}
+# L'*arr relit le nom du torrent à son rafraîchissement suivant, chaque minute :
+# passé ce délai, le renommage n'a pas suffi.
+_NOM_DELAI = 600
+
+
+def _matched_by_id(records: list[dict[str, Any]]) -> bool:
+    return any(_NOM_BLOCAGE.search(m) for r in records for s in r.get("statusMessages") or []
+               for m in s.get("messages") or [])
+
+
+def _sans_extension(nom: str) -> str:
+    base, ext = os.path.splitext(nom)
+    return (base if ext.lower() in VIDEO_EXTENSIONS else nom).lower()
+
+
+def _suspects(dl: str) -> list[str]:
+    """Fichiers suspects du torrent, d'après sa liste dans qBittorrent, cochés ou non."""
+    with qbit_session() as s:
+        r = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": dl}, timeout=10)
+        r.raise_for_status()
+        noms = [f.get("name") or "" for f in r.json()]
+    return [os.path.basename(n) for n in noms if os.path.splitext(n)[1].lower() in _NOM_SUSPECTS]
+
+
+def _misnamed(
+    arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+    media_id: int, ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any,
+) -> tuple[dict[str, Any], bool]:
+    """Règle 2 sur un téléchargement bloqué « matched by ID », dont rien n'est dans la bibliothèque."""
+    dry = ctx["apercu"] or IMPORT_ASSIST_NOM_DRY_RUN
+    titre = records[0].get("title") or dl
+
+    def signaler(decision: str, details: str) -> tuple[dict[str, Any], bool]:
+        verdict.update(decision=decision, reason=details)
+        if _assist_seen(dl, decision, dry):
+            return verdict, False
+        _assist_record(dl, arr, titre, decision, details, dry, 2)
+        _assist_log(2, "⚠", arr, titre, details, dry)
+        return verdict, True
+
+    grabs = [g for g in (_arr_request("GET", url, cle, "history",
+                                      params={"downloadId": records[0]["downloadId"], "pageSize": 50})
+                         or {}).get("records") or []
+             if g.get("eventType") == "grabbed" and g.get("sourceTitle")]
+    if not grabs:
+        return ecarte("aucun grab dans l'historique : rien ne prouve le média", 2, dry)
+    release = max(grabs, key=lambda g: g.get("date") or "")["sourceTitle"]
+
+    if _sans_extension(release) == _sans_extension(t.get("name") or ""):
+        renomme = _assist_last(dl, "rename", False)
+        if renomme is None:
+            return ecarte("le nom du torrent est déjà le titre de la release : seul l'identifiant "
+                          "de l'indexeur relie ce téléchargement au média", 2, dry)
+        if time.time() - renomme < _NOM_DELAI:
+            verdict.update(decision="rename-pending", reason="renommé à l'instant, pas encore relu par l'*arr")
+            return verdict, False
+        return signaler("rename-blocked", f"renommé {release}, mais {arr.capitalize()} le bloque toujours : "
+                                          "import à faire à la main")
+
+    suspects = _suspects(dl)
+    if suspects:
+        return signaler("rename-suspect", f"{', '.join(suspects[:3])} dans le torrent : release suspecte, "
+                                          "rien n'est renommé")
+
+    # Le titre de la release doit désigner ce média sans l'aide de l'identifiant.
+    p = _arr_request("GET", url, cle, "parse", params={"title": release}) or {}
+    cible = p.get("movie" if arr == "radarr" else "series") or {}
+    if cible.get("id") != media_id:
+        autre = f" ({cible.get('title')})" if cible else ""
+        return ecarte(f"le titre de la release ne désigne pas ce média à lui seul{autre}", 2, dry)
+    if arr == "sonarr":
+        attendus = {r["episodeId"] for r in records if r.get("episodeId")}
+        if not attendus <= {e.get("id") for e in p.get("episodes") or []}:
+            return ecarte("le titre de la release ne couvre pas les épisodes de la file", 2, dry)
+        saison = (p.get("parsedEpisodeInfo") or {}).get("seasonNumber")
+        if saison in ((ctx.get("ecartees") or {}).get(media_id) or set()):
+            return ecarte(f"règle 5 : la saison {saison} demandée est une autre saison TVDB", 2, dry)
+    q = _arr_request("GET", url, cle, "parse", params={"title": t.get("name") or ""}) or {}
+    actuel = q.get("movie" if arr == "radarr" else "series") or {}
+    if actuel and actuel.get("id") != media_id:
+        return ecarte(f"le nom du torrent désigne un autre média ({actuel.get('title')})", 2, dry)
+
+    nom = f"{cible.get('title')} ({cible.get('year')})" if arr == "radarr" else cible.get("title")
+    details = f"le titre de la release désigne bien {nom} : torrent renommé {release} → {arr.capitalize()} l'importera seul"
+    verdict.update(decision="rename", reason=details, release=release)
+    if _assist_seen(dl, "rename", dry):
+        return verdict, False
+    if not dry:
+        try:
+            _qbit_post("rename", {"hash": dl, "name": release})
+        except Exception as e:
+            return signaler("rename-failed", f"renommage en {release} impossible ({e}) : import à faire à la main")
+    _assist_record(dl, arr, titre, "rename", details, dry, 2)
+    _assist_log(2, "✓", arr, titre, details, dry)
+    return verdict, True
 
 
 # ── Assistant d'import, règle 4 : packs de saison partiels ──────────────────
