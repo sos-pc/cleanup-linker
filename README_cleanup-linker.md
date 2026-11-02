@@ -210,6 +210,9 @@ networks:
 | `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (bonne saison : accorder la demande Seerr et la saison Sonarr) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes. Vide = règle 5 désactivée |
 | `SEERR_API_KEY` | — | Clé API Seerr (Paramètres → Général) |
+| `IMPORT_ASSIST_MORT_DRY_RUN` | `true` | Règle 6 de l'assistant (téléchargement mort) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
+| `IMPORT_ASSIST_MORT_JOURS` | `3` | Jours sans rien recevoir, sans source connectée, au bout desquels un téléchargement est jugé mort. C'est aussi l'écart minimal entre deux recherches d'une autre version |
+| `IMPORT_ASSIST_MORT_ESSAIS` | `5` | Autres versions essayées au plus pour un même téléchargement mort |
 
 ---
 
@@ -406,11 +409,12 @@ Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
+| 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false` | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
 
 **Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
 
 ```
-INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation
 INFO     ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
@@ -510,6 +514,33 @@ Limites :
 ```
 INFO     [SIMULATION] ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     [SIMULATION] ✓ [règle 1 · débloquer la file] [sonarr] Monster.The.Lizzie.Borden.Story.S01...-BYOR : 8/8 vidéo(s) déjà dans la bibliothèque → [seed] Rays_Le _Chat (règle 5 : la saison 1 demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés)
+```
+
+### Règle 6 · téléchargement mort : plus aucune source
+
+Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment. Aucun des deux ne le remplace, et la demande attend, parfois des mois. À chaque passage, l'assistant regarde les téléchargements en cours de leurs files. Un téléchargement est mort quand, depuis `IMPORT_ASSIST_MORT_JOURS` jours (3 par défaut), il n'a rien reçu, sans aucune source connectée et sans débit. Ne comptent pas :
+- un torrent fini ;
+- un torrent qui attend son tour, se vérifie ou se déplace ;
+- un torrent dont les fichiers ont disparu, qui est un autre problème ;
+- un torrent sans date d'ajout, qu'on ne peut pas juger.
+
+Le téléchargement mort n'est **ni blacklisté ni retiré** : un seeder peut revenir, même après des mois. L'assistant lance une **course** :
+1. Il fait chercher par Sonarr ou Radarr les autres versions du même film, ou des mêmes épisodes, et prend la meilleure dans leur propre ordre de préférence (qualité, score de formats, langue). Elle est prise **quel que soit son nombre de sources**. Les seuls refus passés outre sont « la place est prise dans la file », justement par le téléchargement mort, et « pas assez de sources ». Le grab se fait comme un « télécharger quand même » dans l'*arr.
+2. **Le premier téléchargement fini et importé gagne**, l'original compris si son seeder revient. Les autres versions sortent alors de la file, sans blacklist, et partent en corbeille, arrêtées. Un torrent privé déjà entamé reste en route, à cause du hit-and-run, et une version finie continue de seeder. Un dossier partagé avec un autre torrent reste dans sa catégorie.
+3. Si toutes les versions de la course meurent à leur tour, la suivante est prise, une par période de `IMPORT_ASSIST_MORT_JOURS`, jusqu'à `IMPORT_ASSIST_MORT_ESSAIS` versions (5 par défaut). Ensuite, on attend que l'une reparte.
+4. Sans autre version, l'original reste seul et en route. Une nouvelle recherche a lieu au plus une fois par période.
+
+Si une version finie n'est pas importée (par exemple quand Radarr ne reconnaît pas le titre : « matched to movie by ID »), un avertissement le signale, et l'import reste à faire à la main. Les autres versions continuent.
+
+Pour une série, une autre version doit couvrir tous les épisodes du téléchargement mort : un pack ou un multi-épisodes. La recherche se fait sur le premier de ces épisodes.
+
+Garde-fous : au plus 5 recherches par passage, les téléchargements les plus anciens d'abord ; une course qui a épuisé ses essais ne cherche plus et ne prend pas de place. Rien n'est supprimé. Un torrent mis en pause à la main compte aussi : s'il ne reçoit plus rien, il bloque la demande comme les autres.
+
+Elle a **sa propre simulation**, active par défaut et indépendante des autres règles : `IMPORT_ASSIST_MORT_DRY_RUN=false` la fait agir. Verdicts : `dead-race` (autre version prise en plus), `dead-wait` (aucune autre version : on attend), `dead-won` (une version a gagné, les autres en corbeille) et `dead-blocked` (finie mais pas importée). Les courses sont dans la table `dead_race`.
+
+```
+INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Parking.mkv : plus rien reçu depuis 21 j → autre version prise en plus, Parking (2008) Chung Mong-Hong DVDRip 480p VOstFr XVid (…, 0 source(s), score 31) ; la première finie gagnera
+INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Féroce.2017.FRENCH.1080p.WEB.H264-ViVENDi : plus rien reçu depuis 11 j, aucune autre version trouvée : on attend, le torrent reste en route
 ```
 
 ### Déclenchement
