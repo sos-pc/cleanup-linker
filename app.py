@@ -29,7 +29,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -128,6 +128,11 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 IMPORT_ASSIST_MORT_DRY_RUN = os.getenv("IMPORT_ASSIST_MORT_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_MORT_JOURS = float(os.getenv("IMPORT_ASSIST_MORT_JOURS", "3"))
 IMPORT_ASSIST_MORT_ESSAIS = int(os.getenv("IMPORT_ASSIST_MORT_ESSAIS", "5"))
+
+# Règle 7 de l'assistant (téléchargement inutile) : un téléchargement bloqué qui
+# n'apporterait rien, la bibliothèque ayant déjà mieux, sort de la file sans
+# blacklist et part en corbeille, où il continue de seeder. Simulation propre.
+IMPORT_ASSIST_INUTILE_DRY_RUN = os.getenv("IMPORT_ASSIST_INUTILE_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -1879,7 +1884,7 @@ _assist_timer: threading.Timer | None = None
 # Nom de chaque règle, dans les logs et dans /assist/history : on y lit quelle
 # règle a fait quoi.
 _REGLES = {1: "débloquer la file", 2: "torrent mal nommé", 4: "pack incomplet", 5: "bonne saison",
-           6: "téléchargement mort"}
+           6: "téléchargement mort", 7: "téléchargement inutile"}
 
 
 def _regle(n: int) -> str:
@@ -1900,7 +1905,8 @@ def _assist_modes() -> str:
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
     return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)}, "
-            f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}")
+            f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}, "
+            f"{_regle(7)} {mode(IMPORT_ASSIST_INUTILE_DRY_RUN)}")
 
 
 @contextmanager
@@ -2068,7 +2074,7 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
         en_cours: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
         for arr, url, cle in _assist_arrs():
             try:
-                par_dl = _assist_blocked(url, cle, _ASSIST_STATES | _MORT_ETATS_FILE)
+                par_dl = _assist_queue(arr, url, cle, _ASSIST_STATES | _MORT_ETATS_FILE)
             except Exception as e:
                 log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
                 continue
@@ -2157,24 +2163,70 @@ def _run_scheduled_assist(source: str) -> None:
         log.error("Erreur assistant d'import : %s", e)
 
 
+def _queue_pages(url: str, cle: str, params: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
+    """Toutes les lignes de la file d'un *arr, page par page."""
+    page, lues = 1, 0
+    while True:
+        rep = _arr_request("GET", url, cle, "queue",
+                           params={"page": page, "pageSize": _ASSIST_QUEUE_PAGE, **(params or {})}) or {}
+        lot = rep.get("records") or []
+        yield from lot
+        lues += len(lot)
+        if not lot or lues >= (rep.get("totalRecords") or 0):
+            return
+        page += 1
+
+
 def _assist_blocked(url: str, cle: str, etats: set[str] | None = None) -> dict[str, list[dict[str, Any]]]:
     """Lignes de file d'un *arr dans ces états (les bloqués par défaut), regroupées par téléchargement."""
     etats = _ASSIST_STATES if etats is None else etats
     bloques: dict[str, list[dict[str, Any]]] = {}
-    page, lues = 1, 0
-    while True:
-        # Sans les éléments « inconnus » : quand Sonarr et Radarr partagent une
-        # catégorie, chacun liste les téléchargements de l'autre, sans média.
-        rep = _arr_request("GET", url, cle, "queue",
-                           params={"page": page, "pageSize": _ASSIST_QUEUE_PAGE}) or {}
-        lot = rep.get("records") or []
-        for r in lot:
-            if r.get("downloadId") and r.get("trackedDownloadState") in etats:
-                bloques.setdefault(r["downloadId"].lower(), []).append(r)
-        lues += len(lot)
-        if not lot or lues >= (rep.get("totalRecords") or 0):
-            return bloques
-        page += 1
+    # Sans les éléments « inconnus » : quand Sonarr et Radarr partagent une
+    # catégorie, chacun liste les téléchargements de l'autre, sans média.
+    for r in _queue_pages(url, cle):
+        if r.get("downloadId") and r.get("trackedDownloadState") in etats:
+            bloques.setdefault(r["downloadId"].lower(), []).append(r)
+    return bloques
+
+
+def _assist_queue(arr: str, url: str, cle: str, etats: set[str]) -> dict[str, list[dict[str, Any]]]:
+    """
+    Comme _assist_blocked, en une seule lecture, plus les téléchargements bloqués
+    que la file montre sans média alors que cet *arr les a pris lui-même. Il a
+    perdu leur média en relisant le seul nom du torrent, après un autre import du
+    même film par exemple. Le média revient de l'historique du grab, et la ligne
+    est marquée « orphelin ». Les lignes inconnues de l'autre *arr, dans une
+    catégorie partagée, n'ont pas de grab ici : elles restent écartées.
+    """
+    cle_media = "movieId" if arr == "radarr" else "seriesId"
+    inconnus = "includeUnknownMovieItems" if arr == "radarr" else "includeUnknownSeriesItems"
+    par_dl: dict[str, list[dict[str, Any]]] = {}
+    sans_media: dict[str, dict[str, Any]] = {}
+    for r in _queue_pages(url, cle, {inconnus: "true"}):
+        if not r.get("downloadId") or r.get("trackedDownloadState") not in etats:
+            continue
+        if r.get(cle_media):
+            par_dl.setdefault(r["downloadId"].lower(), []).append(r)
+        elif r.get("trackedDownloadState") in _ASSIST_STATES:
+            sans_media.setdefault(r["downloadId"].lower(), r)
+    for dl, r in sans_media.items():
+        if dl in par_dl:
+            continue
+        try:
+            grabs = [g for g in (_arr_request("GET", url, cle, "history",
+                                              params={"downloadId": r["downloadId"], "pageSize": 200})
+                                 or {}).get("records") or []
+                     if g.get("eventType") == "grabbed" and g.get(cle_media)]
+        except Exception as e:
+            log.error("Assistant d'import : historique de %s illisible (%s)", r.get("title") or dl, e)
+            continue
+        if arr == "radarr" and grabs:
+            par_dl[dl] = [dict(r, movieId=grabs[0]["movieId"], orphelin=True)]
+        elif grabs:
+            episodes = sorted({g["episodeId"] for g in grabs if g.get("episodeId")})
+            if episodes:
+                par_dl[dl] = [dict(r, seriesId=grabs[0]["seriesId"], episodeId=e, orphelin=True) for e in episodes]
+    return par_dl
 
 
 def _seed_obstacle(categorie: str, t: dict[str, Any], ctx: dict[str, Any]) -> str:
@@ -2254,9 +2306,15 @@ def _assist_download(
         remplacement = _pack_replacement(dl) if arr == "sonarr" else None
         if remplacement:
             return _pack_finish(url, cle, dl, titre, inodes, remplacement, ctx, verdict, ecarte, t, categorie)
-        # Règle 2 : rien n'est importé, parce que l'*arr ne reconnaît pas le nom du torrent.
-        if not lies and _matched_by_id(records):
-            return _misnamed(arr, url, cle, dl, records, t, media_id, ctx, verdict, ecarte)
+        # Rien n'est importé. Règle 7 : l'*arr refuse chaque vidéo parce que la
+        # bibliothèque a déjà mieux. Règle 2 : il ne reconnaît pas le nom du torrent.
+        if not lies:
+            refusees = _rejected_as_no_upgrade(records)
+            if refusees:
+                return _useless(arr, url, cle, dl, records, t, ctx, verdict,
+                                f"{arr.capitalize()} refuse les {refusees} vidéo(s) : la bibliothèque a déjà mieux pour chacune")
+            if _matched_by_id(records):
+                return _misnamed(arr, url, cle, dl, records, t, media_id, ctx, verdict, ecarte)
         return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
     obstacle = _seed_obstacle(categorie, t, ctx)
@@ -2500,6 +2558,17 @@ def _misnamed(
     if actuel and actuel.get("id") != media_id:
         return ecarte(f"le nom du torrent désigne un autre média ({actuel.get('title')})", 2, dry)
 
+    # Règle 7 : un autre import a pu passer devant entre-temps — l'*arr refuserait alors celui-ci.
+    mieux = _library_better(arr, url, cle, media_id, records, p)
+    if mieux:
+        return _useless(arr, url, cle, dl, records, t, ctx, verdict,
+                        f"la bibliothèque a déjà mieux ({mieux}) que la release {release} ({_release_desc(arr, p)})")
+    # Un orphelin a perdu son média dans l'*arr : relu sous le bon nom, il serait reconnu,
+    # mais l'import partirait sans film ni série (Import() n'utilise que celui du suivi).
+    if records[0].get("orphelin"):
+        return signaler("rename-orphan", f"{arr.capitalize()} a détaché ce téléchargement de son média : "
+                                         "renommer ne suffirait plus, import manuel à faire")
+
     nom = f"{cible.get('title')} ({cible.get('year')})" if arr == "radarr" else cible.get("title")
     details = f"le titre de la release désigne bien {nom} : torrent renommé {release} → {arr.capitalize()} l'importera seul"
     verdict.update(decision="rename", reason=details, release=release)
@@ -2512,6 +2581,108 @@ def _misnamed(
             return signaler("rename-failed", f"renommage en {release} impossible ({e}) : import à faire à la main")
     _assist_record(dl, arr, titre, "rename", details, dry, 2)
     _assist_log(2, "✓", arr, titre, details, dry)
+    return verdict, True
+
+
+# ── Assistant d'import, règle 7 : téléchargement inutile ────────────────────
+#
+# Un téléchargement fini que l'*arr n'importera jamais, parce que la
+# bibliothèque a déjà mieux : un pack qui n'améliore aucun épisode, ou un
+# upgrade dépassé par un autre arrivé entre-temps. Il reste bloqué dans la file
+# indéfiniment, et Jellyfin, qui lit les dossiers de téléchargement, le montre
+# en double. La règle le retire de la file, sans blacklist : l'*arr ne le
+# reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille,
+# où il continue de seeder. Rien n'est supprimé.
+
+_INUTILE_REJET = re.compile(r"not an upgrade|not a custom format upgrade|not a quality revision upgrade",
+                            re.IGNORECASE)
+_INUTILE_ECHANTILLON = re.compile(r"\bsample\b", re.IGNORECASE)
+
+
+def _rejected_as_no_upgrade(records: list[dict[str, Any]]) -> int:
+    """
+    Nombre de vidéos que l'*arr a refusées parce que la bibliothèque a déjà mieux,
+    si c'est le cas de toutes ; 0 sinon. Un échantillon refusé comme tel ne compte
+    pas. La file donne une entrée de statut par fichier, plus un en-tête.
+    """
+    refus = [s.get("messages") or [] for s in records[0].get("statusMessages") or []
+             if os.path.splitext(s.get("title") or "")[1].lower() in VIDEO_EXTENSIONS]
+    refus = [m for m in refus if not any(_INUTILE_ECHANTILLON.search(x) for x in m)]
+    if refus and all(any(_INUTILE_REJET.search(x) for x in m) for m in refus):
+        return len(refus)
+    return 0
+
+
+def _quality_rank(url: str, cle: str, profil: int | None) -> dict[int, int]:
+    """Rang de chaque qualité du profil, de la plus basse à la plus haute ; les qualités d'un groupe partagent son rang."""
+    items = ((_arr_request("GET", url, cle, f"qualityprofile/{profil}") or {}).get("items") or []) if profil else []
+    return {q["quality"]["id"]: i for i, item in enumerate(items) for q in [item, *(item.get("items") or [])]
+            if q.get("quality")}
+
+
+def _release_desc(arr: str, p: dict[str, Any]) -> str:
+    info = p.get("parsedMovieInfo" if arr == "radarr" else "parsedEpisodeInfo") or {}
+    return f"{((info.get('quality') or {}).get('quality') or {}).get('name')}, score {p.get('customFormatScore')}"
+
+
+def _library_better(arr: str, url: str, cle: str, media_id: int, records: list[dict[str, Any]],
+                    p: dict[str, Any]) -> str:
+    """
+    Le fichier en place, s'il vaut au moins la release `p` (lue par /parse) : une
+    qualité de rang égal ou supérieur dans le profil, et à rang égal un score de
+    formats au moins égal. Pour une série, chaque épisode de la file doit avoir un
+    tel fichier. "" sinon, ou dans le doute.
+    """
+    info = p.get("parsedMovieInfo" if arr == "radarr" else "parsedEpisodeInfo") or {}
+    q_release = ((info.get("quality") or {}).get("quality") or {}).get("id")
+    score = p.get("customFormatScore")
+    if q_release is None or score is None:
+        return ""
+    if arr == "radarr":
+        media = _arr_request("GET", url, cle, f"movie/{media_id}") or {}
+        en_place = _arr_request("GET", url, cle, "moviefile", params={"movieId": media_id}) or []
+    else:
+        media = _arr_request("GET", url, cle, f"series/{media_id}") or {}
+        voulus = {r.get("episodeId") for r in records if r.get("episodeId")}
+        fichiers = {f["id"]: f for f in _arr_request("GET", url, cle, "episodefile", params={"seriesId": media_id}) or []}
+        episodes = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
+                    if e.get("id") in voulus]
+        if not voulus or len(episodes) != len(voulus):
+            return ""
+        en_place = [fichiers.get(e.get("episodeFileId")) for e in episodes]
+    rang = _quality_rank(url, cle, media.get("qualityProfileId"))
+    r_release = rang.get(q_release)
+    if not en_place or r_release is None:
+        return ""
+    for f in en_place:
+        r = rang.get((((f or {}).get("quality") or {}).get("quality") or {}).get("id"))
+        s = (f or {}).get("customFormatScore")
+        if r is None or s is None or r < r_release or (r == r_release and s < score):
+            return ""
+    f = en_place[0]
+    return (f"{f['quality']['quality']['name']}, score {f['customFormatScore']}"
+            + (f", pour les {len(en_place)} épisodes" if len(en_place) > 1 else ""))
+
+
+def _useless(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+             ctx: dict[str, Any], verdict: dict[str, Any], constat: str) -> tuple[dict[str, Any], bool]:
+    """Règle 7 : retire de la file, sans blacklist, un téléchargement qui n'apporterait rien, et le met en corbeille."""
+    dry = ctx["apercu"] or IMPORT_ASSIST_INUTILE_DRY_RUN
+    titre = records[0].get("title") or dl
+    details = f"{constat} → retiré de la file sans blacklist, en corbeille, où il continue de seeder"
+    verdict.update(decision="useless", reason=details)
+    if _assist_seen(dl, "useless", dry):
+        return verdict, False
+    if not dry:
+        _arr_request("DELETE", url, cle, f"queue/{records[0]['id']}",
+                     params={"removeFromClient": "false", "blocklist": "false", "skipRedownload": "true"})
+        # Fini : il continue de seeder dans la corbeille.
+        if not _assist_trash(t, arreter=False):
+            details = (f"{constat} → retiré de la file sans blacklist ; laissé dans sa catégorie, "
+                       "son dossier est aussi celui d'un autre torrent")
+            verdict["reason"] = details
+    _assist_record(dl, arr, titre, "useless", details, dry, 7)
+    _assist_log(7, "✓", arr, titre, details, dry)
     return verdict, True
 
 
