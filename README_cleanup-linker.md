@@ -214,6 +214,7 @@ networks:
 | `IMPORT_ASSIST_MORT_DRY_RUN` | `true` | Règle 6 de l'assistant (téléchargement mort) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `IMPORT_ASSIST_MORT_JOURS` | `3` | Jours sans rien recevoir, sans source connectée, au bout desquels un téléchargement est jugé mort. C'est aussi l'écart minimal entre deux recherches d'une autre version |
 | `IMPORT_ASSIST_MORT_ESSAIS` | `5` | Autres versions essayées au plus pour un même téléchargement mort |
+| `IMPORT_ASSIST_INUTILE_DRY_RUN` | `true` | Règle 7 de l'assistant (téléchargement inutile) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 
 ---
 
@@ -412,11 +413,12 @@ Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
 | 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false` | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
+| 7 · téléchargement inutile | `IMPORT_ASSIST_INUTILE_DRY_RUN=false` | Sort de la file, sans blacklist, un téléchargement bloqué qui n'apporterait rien, et le met en corbeille, où il seede encore |
 
 **Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
 
 ```
-INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 2 · torrent mal nommé en simulation, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 2 · torrent mal nommé en simulation, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation, règle 7 · téléchargement inutile en simulation
 INFO     ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
@@ -463,7 +465,11 @@ Un titre de release identique au nom du torrent ne prouve rien de plus. C'est le
 
 Si l'*arr bloque toujours le torrent 10 minutes après le renommage, l'avertissement `rename-blocked` le signale, et l'import reste à faire à la main. Le torrent n'est jamais renommé deux fois.
 
-Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_NOM_DRY_RUN=false` la fait agir. Verdicts : `rename` (torrent renommé), `rename-suspect`, `rename-blocked` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
+**Si un autre import est passé devant entre-temps**, parce que l'*arr a trouvé et importé mieux pendant que celui-ci restait bloqué, le renommer ne servirait à rien : l'*arr le refuserait. La règle 7 le retire alors de la file. C'est arrivé à Resident Evil (2026) le 2026-11-02 : une version MULTi est arrivée une heure après la KyoGo.
+
+**Un téléchargement détaché de son média.** Quand ce média change, après un autre import par exemple, l'*arr relit le seul nom du torrent. S'il ne le reconnaît pas, la file montre le téléchargement sans film ni série. L'assistant reprend ces lignes, à condition que l'historique de cet *arr montre leur grab. Le média revient alors de ce grab. Les lignes sans média de l'autre *arr, qui voit les téléchargements d'une catégorie partagée, n'ont pas de grab ici : elles restent écartées. Pour un tel téléchargement, le renommage ne suffirait plus, car l'*arr importerait sans média. L'avertissement `rename-orphan` demande un import manuel, sauf si la règle 7 constate qu'il est inutile.
+
+Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_NOM_DRY_RUN=false` la fait agir. Verdicts : `rename` (torrent renommé), `rename-suspect`, `rename-blocked`, `rename-orphan` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
 
 ```
 INFO     [SIMULATION] ✓ [règle 2 · torrent mal nommé] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : le titre de la release désigne bien Resident Evil (2026) : torrent renommé Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo → Radarr l'importera seul
@@ -566,6 +572,21 @@ Elle a **sa propre simulation**, active par défaut et indépendante des autres 
 ```
 INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Parking.mkv : plus rien reçu depuis 21 j → autre version prise en plus, Parking (2008) Chung Mong-Hong DVDRip 480p VOstFr XVid (…, 0 source(s), score 31) ; la première finie gagnera
 INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Féroce.2017.FRENCH.1080p.WEB.H264-ViVENDi : plus rien reçu depuis 11 j, aucune autre version trouvée : on attend, le torrent reste en route
+```
+
+### Règle 7 · téléchargement inutile : la bibliothèque a déjà mieux
+
+Un téléchargement fini que l'*arr n'importera jamais, parce que la bibliothèque a déjà mieux, reste bloqué dans sa file indéfiniment. Jellyfin, qui lit les dossiers de téléchargement, le montre en double. La règle le reconnaît de deux façons, quand aucune de ses vidéos n'est dans la bibliothèque :
+1. **l'*arr a refusé chacune de ses vidéos** parce qu'elle n'améliore pas le fichier en place (« Not an upgrade », « Not a Custom Format upgrade », « Not a quality revision upgrade »). Les échantillons refusés comme tels ne comptent pas. C'est le cas de Veronica Mars SN2P : un pack à 150, contre 160 à 235 pour les 72 épisodes en place ;
+2. **un téléchargement bloqué « matched by ID »** (règle 2), quand le fichier en place vaut au moins la release. Il faut une qualité de rang égal ou supérieur dans le profil et, à rang égal, un score de formats au moins égal. Pour une série, chaque épisode du téléchargement doit avoir un tel fichier. C'est le cas de la KyoGo de Resident Evil (2026) : WEBDL-1080p à 51, contre la kazui MULTi en place, WEBDL-1080p à 171. Dans le doute, par exemple si une note manque, la règle ne fait rien.
+
+Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille, où **il continue de seeder**. Un torrent dont le dossier est partagé avec un autre reste dans sa catégorie. Rien n'est supprimé.
+
+Elle a **sa propre simulation**, active par défaut : `IMPORT_ASSIST_INUTILE_DRY_RUN=false` la fait agir. Verdict : `useless`.
+
+```
+INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : Sonarr refuse les 72 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
+INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : la bibliothèque a déjà mieux (WEBDL-1080p, score 171) que la release Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo (WEBDL-1080p, score 51) → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 ```
 
 ### Déclenchement
