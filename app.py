@@ -113,6 +113,13 @@ IMPORT_ASSIST_ACCORD_DRY_RUN = os.getenv("IMPORT_ASSIST_ACCORD_DRY_RUN", "true")
 SEERR_URL = os.getenv("SEERR_URL", "").rstrip("/")
 SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 
+# Règle 6 de l'assistant (téléchargement mort) : un téléchargement de la file
+# Sonarr/Radarr qui n'a rien reçu depuis ce nombre de jours, sans aucune source
+# connectée, est blacklisté par la file — l'*arr cherche alors une autre
+# release — et part en corbeille. Simulation propre, dans les mêmes conditions.
+IMPORT_ASSIST_MORT_DRY_RUN = os.getenv("IMPORT_ASSIST_MORT_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+IMPORT_ASSIST_MORT_JOURS = float(os.getenv("IMPORT_ASSIST_MORT_JOURS", "3"))
+
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
 # ── Jellyfin ─────────────────────────────────────────────────────────────────
@@ -1848,7 +1855,7 @@ _assist_timer_lock = threading.Lock()
 _assist_timer: threading.Timer | None = None
 # Nom de chaque règle, dans les logs et dans /assist/history : on y lit quelle
 # règle a fait quoi.
-_REGLES = {1: "débloquer la file", 4: "pack incomplet", 5: "bonne saison"}
+_REGLES = {1: "débloquer la file", 4: "pack incomplet", 5: "bonne saison", 6: "téléchargement mort"}
 
 
 def _regle(n: int) -> str:
@@ -1868,7 +1875,8 @@ def _assist_modes() -> str:
     r4 = (mode(IMPORT_ASSIST_PACK_DRY_RUN) if sonarr and PROWLARR_URL and PROWLARR_API_KEY
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
-    return f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(4)} {r4}, {_regle(5)} {r5}"
+    return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(4)} {r4}, {_regle(5)} {r5}, "
+            f"{_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}")
 
 
 @contextmanager
@@ -2008,17 +2016,24 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
 
         verdicts_accord, ecartees = run_accord(apercu)
 
-        # Les files d'abord : sans téléchargement bloqué, inutile de lister qBit.
+        # Les files d'abord : sans téléchargement bloqué ni en cours, inutile de
+        # lister qBit. Une seule lecture par *arr : bloqués pour la règle 1, en
+        # cours pour la règle 6.
         bloques: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
+        en_cours: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
         for arr, url, cle in _assist_arrs():
             try:
-                par_dl = _assist_blocked(url, cle)
+                par_dl = _assist_blocked(url, cle, _ASSIST_STATES | _MORT_ETATS_FILE)
             except Exception as e:
                 log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
                 continue
-            if par_dl:
-                bloques.append((arr, url, cle, par_dl))
-        if not bloques:
+            bloque = {dl: r for dl, r in par_dl.items() if r[0].get("trackedDownloadState") in _ASSIST_STATES}
+            cours = {dl: r for dl, r in par_dl.items() if dl not in bloque}
+            if bloque:
+                bloques.append((arr, url, cle, bloque))
+            if cours:
+                en_cours.append((arr, url, cle, cours))
+        if not bloques and not en_cours:
             return verdicts_accord
 
         try:
@@ -2055,11 +2070,15 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
                     nouveau = False
                 verdicts.append(verdict)
                 nouveaux += nouveau
+
+        verdicts_morts, nouveaux_morts = run_dead_downloads(en_cours, ctx)
+        verdicts += verdicts_morts
+        nouveaux += nouveaux_morts
         if nouveaux:
             # Chaque ligne au-dessus dit sa règle, et si elle n'est qu'une simulation.
             log.info(
-                "=== Assistant d'import (%s) : %d téléchargement(s) bloqué(s), %d nouveau(x) verdict(s) ===",
-                source, len(verdicts) - len(verdicts_accord), nouveaux,
+                "=== Assistant d'import (%s) : %d téléchargement(s) bloqué(s), %d mort(s), %d nouveau(x) verdict(s) ===",
+                source, sum(len(p) for *_, p in bloques), len(verdicts_morts), nouveaux,
             )
         return verdicts
 
@@ -2093,8 +2112,9 @@ def _run_scheduled_assist(source: str) -> None:
         log.error("Erreur assistant d'import : %s", e)
 
 
-def _assist_blocked(url: str, cle: str) -> dict[str, list[dict[str, Any]]]:
-    """Lignes de file des téléchargements bloqués d'un *arr, regroupées par téléchargement."""
+def _assist_blocked(url: str, cle: str, etats: set[str] | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Lignes de file d'un *arr dans ces états (les bloqués par défaut), regroupées par téléchargement."""
+    etats = _ASSIST_STATES if etats is None else etats
     bloques: dict[str, list[dict[str, Any]]] = {}
     page, lues = 1, 0
     while True:
@@ -2104,7 +2124,7 @@ def _assist_blocked(url: str, cle: str) -> dict[str, list[dict[str, Any]]]:
                            params={"page": page, "pageSize": _ASSIST_QUEUE_PAGE}) or {}
         lot = rep.get("records") or []
         for r in lot:
-            if r.get("downloadId") and r.get("trackedDownloadState") in _ASSIST_STATES:
+            if r.get("downloadId") and r.get("trackedDownloadState") in etats:
                 bloques.setdefault(r["downloadId"].lower(), []).append(r)
         lues += len(lot)
         if not lot or lues >= (rep.get("totalRecords") or 0):
@@ -2503,7 +2523,7 @@ def check_pack_grab(serie_id: int, saison: int, dl: str, titre: str,
     except Exception as e:
         details += f" (blacklist Sonarr impossible : {e})"
         log.error("  ⚠ [%s] [sonarr] %s : blacklist impossible (%s)", _regle(4), titre, e)
-    if not _pack_trash(t):
+    if not _assist_trash(t):
         details += " (laissé arrêté dans sa catégorie : son dossier est aussi celui d'un autre torrent)"
     return fin("pack-replace", details, "✓")
 
@@ -3157,16 +3177,17 @@ def _sonarr_blocklist(url: str, cle: str, serie_id: int, dl: str) -> bool:
     return False
 
 
-def _pack_trash(t: dict[str, Any]) -> bool:
+def _assist_trash(t: dict[str, Any], arreter: bool = True) -> bool:
     """
-    Le pack partiel part en corbeille, arrêté : à peine entamé, il n'a rien à seeder.
+    Le torrent part en corbeille, arrêté : un pack partiel à peine entamé, un
+    téléchargement mort n'ont rien à seeder (`arreter=False` le laisse en route).
     Sauf s'il partage son dossier avec un autre torrent — un pack complet publié
     sous le même nom : ATM emporterait les fichiers de l'autre dans le dossier de
-    la corbeille. Il reste alors arrêté dans sa catégorie. True s'il est parti.
+    la corbeille. Il reste alors dans sa catégorie. True s'il est parti.
     """
     with qbit_session() as s:
         partage = _shared_content({t["hash"]}, qbit_get_torrents(s))
-        actions = [("stop", {"hashes": t["hash"]})]
+        actions = [("stop", {"hashes": t["hash"]})] if arreter else []
         if not partage:
             actions.insert(0, ("setCategory", {"hashes": t["hash"], "category": TARGET_CAT}))
         for action, data in actions:
@@ -3490,6 +3511,95 @@ def _arr_wait_command(url: str, cle: str, commande: dict[str, Any] | None) -> bo
             return etat == "completed"
         time.sleep(2)
     return False
+
+
+# ── Assistant d'import, règle 6 : téléchargements morts ─────────────────────
+#
+# Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment :
+# aucun des deux ne le remplace, et la demande attend — des mois parfois. Passé
+# IMPORT_ASSIST_MORT_JOURS sans rien recevoir, sans aucune source connectée, il
+# est blacklisté par la file, ce qui relance la recherche d'une autre release, et
+# part en corbeille. Rien n'est supprimé.
+
+# Files *arr d'un téléchargement en cours.
+_MORT_ETATS_FILE = {"downloading"}
+# États qBittorrent où le torrent attend son tour, se vérifie ou a perdu ses
+# fichiers : pas un téléchargement mort, ou un autre problème.
+_MORT_ETATS_ATTENTE = {"queuedDL", "checkingDL", "checkingResumeData", "moving", "allocating", "missingFiles", "error"}
+# Au plus tant de téléchargements traités par passage, les plus anciens d'abord :
+# une mesure fausse ne toucherait pas toutes les demandes à la fois.
+_MORT_MAX_PAR_PASSAGE = 5
+
+
+def _dead_since(t: dict[str, Any] | None, maintenant: float) -> float | None:
+    """
+    Depuis combien de secondes ce torrent n'a rien reçu, sans source connectée.
+    None s'il est fini, actif, en attente, ou s'il ne peut pas être jugé (pas de
+    date d'ajout).
+    """
+    if not t or (t.get("progress") or 0) >= 1 or not t.get("added_on"):
+        return None
+    if t.get("state") in _MORT_ETATS_ATTENTE or t.get("num_seeds") or t.get("dlspeed"):
+        return None
+    return maintenant - max(t.get("last_activity") or 0, t["added_on"])
+
+
+def run_dead_downloads(
+    en_cours: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]], ctx: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Règle 6, sur les téléchargements en cours des files. Retourne (verdicts, journalisés maintenant)."""
+    dry = ctx["apercu"] or IMPORT_ASSIST_MORT_DRY_RUN
+    maintenant = time.time()
+    morts = []
+    for arr, url, cle, par_dl in en_cours:
+        for dl, records in par_dl.items():
+            t = ctx["torrents"].get(dl)
+            inactif = _dead_since(t, maintenant)
+            if inactif is not None and inactif >= IMPORT_ASSIST_MORT_JOURS * 86400:
+                morts.append((inactif, arr, url, cle, dl, records, t))
+    morts.sort(key=lambda m: -m[0])
+    verdicts: list[dict[str, Any]] = []
+    nouveaux = 0
+    for inactif, arr, url, cle, dl, records, t in morts[:_MORT_MAX_PAR_PASSAGE]:
+        try:
+            verdict, nouveau = _dead_download(arr, url, cle, dl, records, t, inactif, dry)
+        except Exception as e:
+            titre = records[0].get("title") or dl
+            log.error("  ⚠ [%s] [%s] %s en erreur (%s)", _regle(6), arr, titre, e)
+            verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "error", "reason": str(e)}
+            nouveau = False
+        verdicts.append(verdict)
+        nouveaux += nouveau
+    if len(morts) > _MORT_MAX_PAR_PASSAGE:
+        log.info("  [%s] %d autre(s) téléchargement(s) mort(s) attendront le passage suivant",
+                 _regle(6), len(morts) - _MORT_MAX_PAR_PASSAGE)
+    return verdicts, nouveaux
+
+
+def _dead_download(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+                   inactif: float, dry: bool) -> tuple[dict[str, Any], bool]:
+    titre = records[0].get("title") or dl
+    progres = t.get("progress") or 0
+    # Un torrent privé déjà entamé n'est pas arrêté : le tracker attend qu'il
+    # partage ce qu'il a reçu (hit-and-run).
+    garder = bool(t.get("private")) and progres > 0
+    details = (f"{progres:.0%} reçu, plus rien depuis {inactif / 86400:.0f} j, aucune source → blacklisté, "
+               "nouvelle recherche, torrent en corbeille"
+               + (", laissé en route (tracker privé déjà entamé)" if garder else ", arrêté"))
+    verdict = {"arr": arr, "download_id": dl, "title": titre, "decision": "dead-retry", "reason": details}
+    if _assist_seen(dl, "dead-retry", dry):
+        return verdict, False
+    if not dry:
+        # Retiré de la file en le blacklistant, sans rien supprimer dans le
+        # client : l'*arr cherche aussitôt une autre release.
+        _arr_request("DELETE", url, cle, f"queue/{records[0]['id']}",
+                     params={"removeFromClient": "false", "blocklist": "true", "skipRedownload": "false"})
+        if not _assist_trash(t, arreter=not garder):
+            details += " (laissé dans sa catégorie : son dossier est aussi celui d'un autre torrent)"
+            verdict["reason"] = details
+    _assist_record(dl, arr, titre, "dead-retry", details, dry, 6)
+    _assist_log(6, "✓", arr, titre, details, dry)
+    return verdict, True
 
 
 def _still_on_disk(event: str, path: str) -> bool:

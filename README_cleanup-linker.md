@@ -210,6 +210,8 @@ networks:
 | `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Règle 5 de l'assistant (bonne saison : accorder la demande Seerr et la saison Sonarr) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
 | `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes. Vide = règle 5 désactivée |
 | `SEERR_API_KEY` | — | Clé API Seerr (Paramètres → Général) |
+| `IMPORT_ASSIST_MORT_DRY_RUN` | `true` | Règle 6 de l'assistant (téléchargement mort) en simulation, indépendamment des autres règles. Seuls `0`, `false` ou `no` la font agir |
+| `IMPORT_ASSIST_MORT_JOURS` | `3` | Jours sans rien recevoir, sans source connectée, au bout desquels un téléchargement est jugé mort |
 
 ---
 
@@ -406,11 +408,12 @@ Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
+| 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false` | Remplace un téléchargement qui ne reçoit plus rien, sans aucune source |
 
 **Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
 
 ```
-INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 4 · pack incomplet en simulation, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort en simulation
 INFO     ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     ⏭ [règle 1 · débloquer la file] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : 0/72 vidéo(s) dans la bibliothèque
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
@@ -510,6 +513,26 @@ Limites :
 ```
 INFO     [SIMULATION] ✓ [règle 5 · bonne saison] [sonarr] Monster (2022) S01 (demande Seerr 912, Hind) : saison 1 demandée = S04 TVDB (8/8 dates et 8/8 titres identiques) → S04 surveillée, S01 plus surveillée, 8 fichier(s) réaffecté(s) de S01 à S04
 INFO     [SIMULATION] ✓ [règle 1 · débloquer la file] [sonarr] Monster.The.Lizzie.Borden.Story.S01...-BYOR : 8/8 vidéo(s) déjà dans la bibliothèque → [seed] Rays_Le _Chat (règle 5 : la saison 1 demandée est une autre saison TVDB, ses épisodes manquants ne sont pas cherchés)
+```
+
+### Règle 6 · téléchargement mort : plus aucune source
+
+Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment. Aucun des deux ne le remplace, et la demande attend, parfois des mois. À chaque passage, l'assistant regarde les téléchargements en cours de leurs files. Un téléchargement est mort quand, depuis `IMPORT_ASSIST_MORT_JOURS` jours (3 par défaut), il n'a rien reçu, sans aucune source connectée et sans débit. Ne comptent pas :
+- un torrent fini ;
+- un torrent qui attend son tour, se vérifie ou se déplace ;
+- un torrent dont les fichiers ont disparu, qui est un autre problème ;
+- un torrent sans date d'ajout, qu'on ne peut pas juger.
+
+Pour un téléchargement mort, l'assistant :
+1. le retire de la file en le blacklistant, sans rien supprimer dans le client. Sonarr ou Radarr cherche aussitôt une autre release, et la demande repart ;
+2. met le torrent en corbeille, arrêté. Un torrent privé déjà entamé reste en route, car le tracker attend qu'il partage ce qu'il a reçu (hit-and-run). Un torrent qui partage son dossier avec un autre reste dans sa catégorie.
+
+Garde-fous : au plus 5 téléchargements par passage, les plus anciens d'abord, et rien n'est supprimé. Un torrent mis en pause à la main compte aussi : s'il ne reçoit plus rien, il bloque la demande comme les autres.
+
+Elle a **sa propre simulation**, active par défaut et indépendante des autres règles : `IMPORT_ASSIST_MORT_DRY_RUN=false` la fait agir. Verdict : `dead-retry`.
+
+```
+INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Parking.mkv : 0% reçu, plus rien depuis 19 j, aucune source → blacklisté, nouvelle recherche, torrent en corbeille, arrêté
 ```
 
 ### Déclenchement
