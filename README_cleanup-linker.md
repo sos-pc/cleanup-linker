@@ -750,33 +750,39 @@ Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment. 
 
 Un torrent mis en pause à la main compte aussi : s'il ne reçoit plus rien, il bloque la demande comme les autres.
 
-**La course.** Le téléchargement mort n'est **ni blacklisté ni retiré**, car un seeder peut revenir, même après des mois. L'assistant lance une course :
+**Rien à remplacer.** Si le fichier en place vaut déjà au moins la release morte, aucune recherche n'a lieu : la règle 7 retire le téléchargement (voir plus bas). Cela ne vaut qu'avant le début d'une course.
+
+**La course.** Sinon, le téléchargement mort n'est **ni blacklisté ni retiré**, car un seeder peut revenir, même après des mois. L'assistant lance une course :
 1. **Le choix de l'autre version.**
    - Sonarr ou Radarr cherche les autres versions du même film, ou des mêmes épisodes. L'assistant prend la meilleure dans leur propre ordre de préférence : qualité, score de formats, langue.
    - Elle est prise **quel que soit son nombre de sources**.
    - Les seuls refus passés outre sont « la place est prise dans la file », justement par le téléchargement mort, et « pas assez de sources ».
-   - Le grab se fait comme un « télécharger quand même » dans l'*arr.
+   - La release déjà prise est écartée. Le nom du torrent ne permet pas de la reconnaître : `Parking.mkv` dans qBittorrent, `Parking (2008) Chung Mong-Hong DVDRip…` chez l'indexeur. L'assistant lit donc dans l'historique de l'*arr ce qui a été noté à la prise : le guid de la release, et son titre sur cet indexeur. La même release sur un autre tracker reste une vraie alternative : c'est un autre torrent, avec d'autres sources.
+   - Une version que qBittorrent a déjà est écartée, quand l'indexeur donne son hash.
+   - Le grab se fait comme un « télécharger quand même » dans l'*arr, en un seul appel. S'il est refusé, par exemple par qBittorrent pour un torrent qu'il a déjà, un avertissement le signale et la version compte comme un essai. La suivante attend la période suivante.
 2. **Le premier téléchargement fini et importé gagne**, l'original compris si son seeder revient. Les autres versions sortent alors de la file, sans blacklist, et partent en corbeille, arrêtées. Un torrent privé déjà entamé reste en route, et une version finie continue de seeder.
-3. Si toutes les versions de la course meurent à leur tour, la suivante est prise, une par période de `IMPORT_ASSIST_MORT_JOURS`, jusqu'à `IMPORT_ASSIST_MORT_ESSAIS` versions (5 par défaut). Ensuite, on attend que l'une reparte.
+3. Si toutes les versions de la course meurent à leur tour, la suivante est prise, une par période de `IMPORT_ASSIST_MORT_JOURS`, jusqu'à `IMPORT_ASSIST_MORT_ESSAIS` versions (5 par défaut), prises refusées comprises. Ensuite, on attend que l'une reparte.
 4. Sans autre version, l'original reste seul et en route. Une nouvelle recherche a lieu au plus une fois par période.
 
 Si une version finie n'est pas importée, parce que l'*arr la bloque dans sa file, un avertissement le signale, et l'import reste à faire à la main. Les autres versions continuent.
 
 Pour une série, une autre version doit couvrir tous les épisodes du téléchargement mort : un pack ou un multi-épisodes. La recherche se fait sur le premier de ces épisodes.
 
-Garde-fous : au plus 5 recherches par passage, les téléchargements les plus anciens d'abord. Une course qui a épuisé ses essais ne cherche plus, et ne prend pas de place. Rien n'est supprimé.
+Garde-fous : au plus 5 recherches par passage, les téléchargements les plus anciens d'abord. Une course qui a épuisé ses essais ne cherche plus, et ne prend pas de place. Une erreur, par exemple une recherche qui échoue, est journalisée : le nouvel essai attend 24 h. Rien n'est supprimé.
 
 Verdicts :
 - `dead-race` : une autre version est prise en plus ;
 - `dead-wait` : aucune autre version, on attend ;
 - `dead-won` : une version a gagné, les autres sont en corbeille ;
-- `dead-blocked` : une version est finie mais pas importée.
+- `dead-blocked` : une version est finie mais pas importée ;
+- `dead-refused` : la prise a été refusée, elle compte comme un essai ;
+- `dead-error` : une erreur, avec un nouvel essai au bout de 24 h.
 
 Les courses sont dans la table `dead_race`.
 
 ```
-INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Parking.mkv : plus rien reçu depuis 21 j → autre version prise en plus, Parking (2008) Chung Mong-Hong DVDRip 480p VOstFr XVid (…, 0 source(s), score 31) ; la première finie gagnera
-INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Féroce.2017.FRENCH.1080p.WEB.H264-ViVENDi : plus rien reçu depuis 11 j, aucune autre version trouvée : on attend, le torrent reste en route
+INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Féroce.2017.FRENCH.1080p.WEB.H264-ViVENDi : plus rien reçu depuis 14 j → autre version prise en plus, Feroce.2017.MUET.VO.1080p.WEB.AAC.2.0.H264-FABZ (C411 (Prowlarr), 18 source(s), score 101) ; la première finie gagnera
+INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Parking.mkv : plus rien reçu depuis 23 j, aucune autre version trouvée : on attend, le torrent reste en route
 ```
 
 ### Règle 7 · téléchargement inutile : la bibliothèque a déjà mieux
@@ -785,11 +791,14 @@ Un téléchargement fini que l'*arr n'importera jamais, parce que la bibliothèq
 1. **l'*arr a refusé chacune de ses vidéos** parce qu'elle n'améliore pas le fichier en place (« Not an upgrade », « Not a Custom Format upgrade », « Not a quality revision upgrade »). La file donne une entrée de statut par fichier. Les échantillons refusés comme tels ne comptent pas. C'est le cas de Veronica Mars SN2P : un pack à 150, contre 160 à 235 pour les 72 épisodes en place ;
 2. **un téléchargement bloqué « matched by ID »** (règle 2), quand le fichier en place vaut au moins la release. Il faut une qualité de rang égal ou supérieur dans le profil, les qualités d'un groupe partageant son rang, et, à rang égal, un score de formats au moins égal. Pour une série, chaque épisode du téléchargement doit avoir un tel fichier. C'est le cas de la KyoGo de Resident Evil (2026) : WEBDL-1080p à 51, contre la kazui MULTi en place, WEBDL-1080p à 171. Dans le doute, par exemple si une note manque, la règle ne fait rien.
 
-Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille, où **il continue de seeder**. Rien n'est supprimé. Verdict : `useless`.
+La règle 6 lui confie aussi **un téléchargement mort**, avant le début d'une course, quand le fichier en place vaut au moins la release, selon la même comparaison. C'est le cas de L'invitée de l'hiver : un WEBDL-1080p à 39, mort depuis 101 jours, contre un Bluray-1080p à 60 en place.
+
+Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille, où **il continue de seeder**. Un téléchargement mort y est arrêté, puisqu'il n'a rien à seeder, sauf un torrent privé déjà entamé. Rien n'est supprimé. Verdict : `useless`.
 
 ```
 INFO     ✓ [règle 7 · téléchargement inutile] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : Sonarr refuse les 72 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : la bibliothèque a déjà mieux (WEBDL-1080p, score 171) que la release Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo (WEBDL-1080p, score 51) → retiré de la file sans blacklist, en corbeille, où il continue de seeder
+INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] L.invitee.de.l.hiver.1997.VOSTF.BR.1080P.HEVC.DTS-X-AZAZE.mkv : plus rien reçu depuis 101 j, et la bibliothèque a déjà mieux (Bluray-1080p, score 60) que cette release (WEBDL-1080p, score 39) → retiré de la file sans blacklist, en corbeille et arrêté : il n'a rien à seeder
 ```
 
 ---
