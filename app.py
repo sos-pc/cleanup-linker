@@ -902,6 +902,12 @@ def sync_db() -> None:
         except Exception as e:
             log.error("Erreur indexation Jellyfin: %s", e)
 
+    # Ce contrôle ne fait que signaler : il ne doit jamais faire échouer la sync.
+    try:
+        report_abandoned()
+    except Exception as e:
+        log.error("Contrôle des fichiers abandonnés impossible : %s", e)
+
 
 def sync_loop() -> None:
     """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes.
@@ -919,6 +925,119 @@ def sync_loop() -> None:
             log.error("Erreur sync: %s", e)
         log.info("Prochaine sync dans %dh", SYNC_INTERVAL // 3600)
         time.sleep(SYNC_INTERVAL)
+
+
+# ── Fichiers abandonnés ──────────────────────────────────────────────────────
+
+_ABANDONNES_LOG_MAX = 20
+
+
+def _abandoned_folder(chemin: str) -> str:
+    """Le dossier à montrer : le premier niveau sous la catégorie, ou sous le tracker dans cross-seeds."""
+    morceaux = os.path.relpath(chemin, "/data/Multimedia").split(os.sep)
+    return os.path.join("/data/Multimedia", *morceaux[:3 if morceaux[0] == "cross-seeds" else 2])
+
+
+def find_abandoned() -> dict[str, Any]:
+    """
+    Les vidéos abandonnées de /data/Multimedia : aucun torrent à la dernière sync,
+    aucun nom dans /data/Media, et Jellyfin ne les lit pas. Tout le service part des
+    torrents : une série supprimée dont le pack n'a plus de torrent reste donc sur le
+    disque sans que rien ne le voie.
+
+    Seuls les dossiers de l'index sont contrôlés (catégories qBittorrent et
+    cross-seeds), donc pas une collection rangée ailleurs. Un fichier qui a un autre
+    nom, où qu'il soit, n'est pas abandonné. Ne supprime rien. Lève une exception si
+    Jellyfin ne répond pas : sans ses bibliothèques, on ne peut rien conclure.
+    """
+    lues: list[str] = []
+    if jellyfin_enabled():
+        r = requests.get(
+            f"{JELLYFIN_URL}/Library/VirtualFolders",
+            headers={"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'},
+            timeout=30,
+        )
+        r.raise_for_status()
+        lues = [map_jellyfin_path(p).rstrip("/") + "/" for b in r.json() for p in b.get("Locations") or []]
+
+    with get_db() as conn:
+        # Une sync sans aucun torrent (qBittorrent qui répond vide) ferait tout passer pour abandonné.
+        if not conn.execute("SELECT 1 FROM files WHERE stale = 0 AND torrent_hash IS NOT NULL LIMIT 1").fetchone():
+            return {"total_bytes": 0, "folders": []}
+        # DISTINCT : deux catégories peuvent partager un dossier, qui est alors indexé deux fois.
+        lignes = conn.execute(
+            """
+            SELECT DISTINCT inode, path FROM files
+            WHERE stale = 0 AND torrent_hash IS NULL AND path LIKE '/data/Multimedia/%'
+            """
+        ).fetchall()
+    noms: dict[int, list[str]] = {}
+    for ligne in lignes:
+        noms.setdefault(ligne["inode"], []).append(ligne["path"])
+
+    limite = time.time() - CLEANUP_GRACE_HOURS * 3600
+    total = 0
+    dossiers: dict[str, dict[str, Any]] = {}
+    for inode, chemins in noms.items():
+        presents: dict[str, os.stat_result] = {}
+        for chemin in chemins:
+            try:
+                st = os.stat(chemin)
+            except OSError:
+                continue  # supprimé depuis la sync
+            if st.st_ino == inode:
+                presents[chemin] = st
+        if not presents:
+            continue
+        st = next(iter(presents.values()))
+        if (
+            st.st_nlink > len(presents)  # un autre nom : bibliothèque, collection…
+            or st.st_ctime > limite  # un déménagement ou un ménage en cours
+            or any(c.startswith(d) for c in presents for d in lues)
+        ):
+            continue
+        total += st.st_size
+        # Tous ses noms sont signalés : le fichier ne libère rien tant qu'il en reste un.
+        for chemin in presents:
+            d = dossiers.setdefault(_abandoned_folder(chemin), {"videos": 0, "bytes": 0, "ctime": 0.0})
+            d["videos"] += 1
+            d["bytes"] += st.st_size
+            d["ctime"] = max(d["ctime"], st.st_ctime)
+
+    resultat = []
+    for dossier, d in sorted(dossiers.items(), key=lambda kv: -kv[1]["bytes"]):
+        dans_le_dossier = sum(len(p) for p in scan_video_files(dossier).values())
+        resultat.append({
+            "folder": dossier,
+            "videos": d["videos"],
+            "bytes": d["bytes"],
+            "since": time.strftime("%Y-%m-%d", time.gmtime(d["ctime"])),
+            # Encore utilisées : retirer tout le dossier leur ferait perdre ce nom.
+            "other_videos": max(dans_le_dossier - d["videos"], 0),
+        })
+    return {"total_bytes": total, "folders": resultat}
+
+
+def report_abandoned() -> None:
+    """Signale les fichiers abandonnés dans les logs, après chaque sync. Ne supprime rien."""
+    resultat = find_abandoned()
+    dossiers = resultat["folders"]
+    if not dossiers:
+        log.info("Fichiers abandonnés : aucun")
+        return
+    log.warning(
+        "⚠️ Fichiers abandonnés : %.1f Go dans %d dossier(s), sans torrent ni bibliothèque, invisibles "
+        "dans Jellyfin. Rien n'est supprimé : à vérifier, puis à retirer à la main",
+        resultat["total_bytes"] / 1e9, len(dossiers),
+    )
+    for d in dossiers[:_ABANDONNES_LOG_MAX]:
+        log.warning(
+            "   %.1f Go | %d vidéo(s) | depuis %s | %s%s",
+            d["bytes"] / 1e9, d["videos"], d["since"], d["folder"],
+            f" | {d['other_videos']} autre(s) vidéo(s) encore utilisée(s) dans ce dossier" if d["other_videos"] else "",
+        )
+    if len(dossiers) > _ABANDONNES_LOG_MAX:
+        log.warning("   … et %d autre(s) dossier(s) : voir /abandoned", len(dossiers) - _ABANDONNES_LOG_MAX)
 
 
 # ── Cross-seed DB ────────────────────────────────────────────────────────────
@@ -5180,6 +5299,19 @@ def history():
                 (limit,),
             ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/abandoned")
+def abandoned():
+    """Les fichiers abandonnés, d'après la dernière sync. Ne supprime rien."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        return jsonify(find_abandoned())
+    except Exception as e:
+        log.error("Contrôle des fichiers abandonnés impossible : %s", e)
+        return jsonify({"error": "contrôle impossible, voir les logs"}), 503
 
 
 @app.route("/stats")

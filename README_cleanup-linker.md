@@ -28,6 +28,7 @@ Trois principes valent partout :
 | Corbeille après une suppression ou un upgrade dans Sonarr/Radarr | Webhook Sonarr/Radarr | Oui |
 | Corbeille après une suppression dans Jellyfin, déléguée à Sonarr/Radarr si l'option est active | Webhook Jellyfin | Oui |
 | Assistant d'import (règles 1, 2, 4, 5, 6, 7) | Event « Manual Interaction Required », « On Grab » pour la règle 4, passage de renfort toutes les 6 h | Oui |
+| Signalement des fichiers abandonnés, sans jamais les supprimer | Après chaque sync, ou par `/abandoned` | Oui |
 | Balayage des orphelins (`/cleanup`) | À la main | Non |
 | Restauration, bootstrap, sync forcée | À la main | Non |
 
@@ -133,7 +134,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `SYNC_INTERVAL_HOURS` | `12` | Intervalle entre deux syncs |
 | `BACKUP_DIR` | `/config/backups` | Dossier des sauvegardes de la base |
 | `BACKUP_RETENTION` | `5` | Nombre de sauvegardes gardées |
-| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
+| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. Délai aussi avant de signaler une vidéo comme abandonnée. `0` désactive ce délai |
 | `VIDEO_EXTENSIONS` | `.mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v` | Extensions indexées, séparées par des virgules. Le point initial et la casse sont facultatifs. Un fichier d'une autre extension est invisible pour tout le service |
 
 **Sonarr et Radarr**
@@ -533,6 +534,44 @@ Sans ce bornage, tout ce qui est dans la corbeille et figure au journal repartir
 
 cleanup-linker ne vide jamais `cleanuparr-unlinked`. C'est le rôle de cleanuparr, qui supprime selon sa propre logique, par exemple quand la place manque. Sans lui, la corbeille ne fait que grossir : ses torrents seedent, et leurs fichiers occupent toujours le disque.
 
+### Les fichiers abandonnés
+
+Tout le service part des torrents. Une vidéo sans torrent lui échappe donc : si elle garde un deuxième nom dans `/data/Multimedia`, la retirer de la bibliothèque ne libère rien, et plus rien ne la voit. Une série supprimée dont le pack n'a plus de torrent reste ainsi sur le disque, sans apparaître nulle part.
+
+Après chaque sync, le service signale une vidéo si elle réunit toutes ces conditions :
+- elle est dans un dossier de catégorie qBittorrent ou dans `/data/Multimedia/cross-seeds`. Une collection rangée ailleurs n'est donc jamais regardée ;
+- aucun torrent ne l'utilisait à la dernière sync ;
+- elle n'a aucun autre nom sur le disque, que ce soit dans `/data/Media` ou dans une collection ;
+- aucune bibliothèque Jellyfin ne lit son dossier ;
+- ses liens n'ont pas changé depuis `CLEANUP_GRACE_HOURS` (24 h) : un ménage ou un déménagement en cours n'est pas signalé.
+
+**Rien n'est supprimé.** Le service ne fait que le dire, à vous de vérifier puis de retirer le dossier :
+
+```
+⚠️ Fichiers abandonnés : 352.1 Go dans 5 dossier(s), sans torrent ni bibliothèque, invisibles dans Jellyfin. Rien n'est supprimé : à vérifier, puis à retirer à la main
+   78.6 Go | 23 vidéo(s) | depuis 2026-10-28 | /data/Multimedia/Séries/Person.of.Interest.S01.MULTi.1080p.BluRay.DTS-HD.MA.5.1.x264-HeavyWeight
+```
+
+Le journal montre 20 dossiers au plus. `/abandoned` donne la liste complète :
+
+```bash
+curl -s 'http://192.168.1.111:5001/abandoned?token=VOTRE_TOKEN' | python3 -m json.tool
+```
+
+| Champ | Contenu |
+|---|---|
+| `total_bytes` | Ce que tout retirer libérerait : chaque fichier compté une fois |
+| `folder` | Le dossier, au premier niveau sous sa catégorie, ou sous le tracker dans `cross-seeds` |
+| `videos`, `bytes` | Les vidéos abandonnées de ce dossier |
+| `since` | Le dernier changement de liens de ces vidéos |
+| `other_videos` | Les autres vidéos du dossier, encore utilisées |
+
+Deux précautions avant de retirer un dossier :
+- **`other_videos` différent de 0 :** le dossier sert encore. Retirez seulement les vidéos abandonnées.
+- **Un même fichier dans deux dossiers :** chacun est listé, par exemple le pack et son cross-seed. L'espace ne revient qu'une fois les deux retirés.
+
+`/abandoned` s'appuie sur la dernière sync et vérifie le disque au moment de l'appel : ce qui a été retiré depuis n'apparaît plus. Si Jellyfin ne répond pas, le contrôle n'a pas lieu, car ses bibliothèques décident de ce qui sert encore : la sync note l'erreur, et `/abandoned` répond `503`.
+
 ---
 
 ## L'assistant d'import
@@ -828,6 +867,9 @@ curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.to
 # Aperçu de l'assistant : toutes les règles simulent, rien ne change
 curl -XPOST 'http://192.168.1.111:5001/assist?token=VOTRE_TOKEN&dry_run=true'
 
+# Fichiers abandonnés : rien n'est supprimé
+curl -s 'http://192.168.1.111:5001/abandoned?token=VOTRE_TOKEN' | python3 -m json.tool
+
 # Derniers verdicts de l'assistant, d'une seule règle
 curl -s 'http://192.168.1.111:5001/assist/history?token=VOTRE_TOKEN&rule=6&limit=20' | python3 -m json.tool
 
@@ -903,6 +945,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `/assist` | POST | `dry_run` | Lance un passage de l'assistant d'import et renvoie ses verdicts. `409` pendant un autre passage |
 | `/assist/history` | GET | `limit` (50, 500 au plus), `rule` | Derniers verdicts de l'assistant, avec la règle qui les a rendus |
 | `/history` | GET | `limit` (50, 500 au plus) | Derniers moves vers la corbeille |
+| `/abandoned` | GET | — | Fichiers sans torrent ni bibliothèque, invisibles dans Jellyfin. Ne supprime rien. `503` si Jellyfin ne répond pas |
 | `/stats` | GET | — | Statistiques de la base |
 | `/health` | GET | — | Healthcheck, sans token |
 
@@ -943,6 +986,8 @@ La suppression ne déplace alors rien, et le torrent devenu orphelin attend le p
 **`/cleanup` est un balayage aveugle.** Il ne regarde ni les files des *arr, ni l'utilité d'un téléchargement : tout torrent pris par un *arr et sans lien vers la bibliothèque depuis 24 h part en corbeille. Il n'est lancé par aucune tâche.
 
 **La corbeille n'est vidée que par cleanuparr.** Sans lui, elle grossit indéfiniment.
+
+**Fichiers abandonnés hors de l'index.** Le signalement ne regarde que les dossiers de catégories qBittorrent et `cross-seeds`. Une vidéo laissée ailleurs, comme le dossier de la corbeille, quand sa catégorie n'a pas de chemin propre, n'est pas signalée. Seules les vidéos sont contrôlées, pas les autres fichiers d'un dossier.
 
 **Passage d'assistant perdu.** Le passage programmé par un event vit dans le worker gunicorn qui a reçu l'event. Si ce worker redémarre dans les deux minutes, le passage est perdu, et le téléchargement attend le passage de renfort suivant.
 
