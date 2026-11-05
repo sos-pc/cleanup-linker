@@ -66,8 +66,9 @@ SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_HOURS", "12")) * 3600
 BACKUP_RETENTION = int(os.getenv("BACKUP_RETENTION", "5"))
 
 # Délai de grâce du /cleanup. Un torrent tout juste terminé est déjà marqué
-# arr_managed par le webhook de grab, mais n'a pas encore de hardlink tant que
-# l'*arr ne l'a pas importé : il ressemble donc à un orphelin sans en être un.
+# arr_managed par le webhook de grab (seul Sonarr coche « On Grab »), mais n'a pas
+# encore de hardlink tant que l'*arr ne l'a pas importé : il ressemble donc à un
+# orphelin sans en être un.
 # Passé ce délai, un torrent toujours sans hardlink l'est réellement.
 # 0 désactive la protection.
 CLEANUP_GRACE_HOURS = int(os.getenv("CLEANUP_GRACE_HOURS", "24"))
@@ -2084,7 +2085,7 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
             except Exception as e:
                 log.error("Assistant d'import : %s injoignable ou réponse inattendue (%s)", arr, e)
                 continue
-            bloque = {dl: r for dl, r in par_dl.items() if r[0].get("trackedDownloadState") in _ASSIST_STATES}
+            bloque = {dl: r for dl, r in par_dl.items() if _assist_stuck(r[0])}
             cours = {dl: r for dl, r in par_dl.items() if dl not in bloque}
             if bloque:
                 bloques.append((arr, url, cle, bloque))
@@ -2195,21 +2196,33 @@ def _assist_blocked(url: str, cle: str, etats: set[str] | None = None) -> dict[s
     return bloques
 
 
+def _assist_stuck(r: dict[str, Any]) -> bool:
+    """
+    L'*arr a tenté l'import et attend une intervention : `importBlocked`, ou
+    `importPending` avec un avertissement. Il laisse dans ce second état une vidéo
+    unique refusée (RejectedImportService) ou un dossier sans rien à importer, sans
+    émettre aucun event. Sans avertissement, `importPending` n'est que l'attente de l'import.
+    """
+    etat = r.get("trackedDownloadState")
+    return etat in _ASSIST_STATES or (etat == "importPending" and r.get("trackedDownloadStatus") == "warning")
+
+
 def _assist_queue(arr: str, url: str, cle: str, etats: set[str]) -> dict[str, list[dict[str, Any]]]:
     """
-    Comme _assist_blocked, en une seule lecture, plus les téléchargements bloqués
-    que la file montre sans média alors que cet *arr les a pris lui-même. Il a
-    perdu leur média en relisant le seul nom du torrent, après un autre import du
-    même film par exemple. Le média revient de l'historique du grab, et la ligne
-    est marquée « orphelin ». Les lignes inconnues de l'autre *arr, dans une
-    catégorie partagée, n'ont pas de grab ici : elles restent écartées.
+    Comme _assist_blocked, en une seule lecture, avec tout téléchargement coincé
+    (_assist_stuck), plus les téléchargements bloqués que la file montre sans média
+    alors que cet *arr les a pris lui-même. Il a perdu leur média en relisant le
+    seul nom du torrent, après un autre import du même film par exemple. Le média
+    revient de l'historique du grab, et la ligne est marquée « orphelin ». Les
+    lignes inconnues de l'autre *arr, dans une catégorie partagée, n'ont pas de
+    grab ici : elles restent écartées.
     """
     cle_media = "movieId" if arr == "radarr" else "seriesId"
     inconnus = "includeUnknownMovieItems" if arr == "radarr" else "includeUnknownSeriesItems"
     par_dl: dict[str, list[dict[str, Any]]] = {}
     sans_media: dict[str, dict[str, Any]] = {}
     for r in _queue_pages(url, cle, {inconnus: "true"}):
-        if not r.get("downloadId") or r.get("trackedDownloadState") not in etats:
+        if not r.get("downloadId") or not (r.get("trackedDownloadState") in etats or _assist_stuck(r)):
             continue
         if r.get(cle_media):
             par_dl.setdefault(r["downloadId"].lower(), []).append(r)
@@ -2267,6 +2280,10 @@ def _assist_download(
     def ecarte(raison: str, regle: int = 1, simulation: bool | None = None) -> tuple[dict[str, Any], bool]:
         # La règle 4 finit ses remplacements ici, avec sa propre simulation.
         simulation = dry_run if simulation is None else simulation
+        # Ces lignes-là n'ont déclenché aucun event : le motif de l'*arr dit pourquoi elles restent.
+        if records[0].get("trackedDownloadState") == "importPending":
+            motif = next((m for s in records[0].get("statusMessages") or [] for m in s.get("messages") or []), "")
+            raison = f"{raison} : {motif[:150]}" if motif else raison
         verdict.update(decision="ignored", reason=raison)
         decision = f"ignored:{raison}"
         if _assist_seen(dl, decision, simulation):
@@ -2600,6 +2617,7 @@ def _misnamed(
 # reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille,
 # où il continue de seeder. Rien n'est supprimé. La règle 6 lui confie aussi un
 # téléchargement mort dont la bibliothèque a déjà mieux : inutile de le remplacer.
+# Une vidéo unique refusée n'émet aucun event : seul le passage de renfort la voit.
 
 _INUTILE_REJET = re.compile(r"not an upgrade|not a custom format upgrade|not a quality revision upgrade",
                             re.IGNORECASE)
@@ -2610,10 +2628,13 @@ def _rejected_as_no_upgrade(records: list[dict[str, Any]]) -> int:
     """
     Nombre de vidéos que l'*arr a refusées parce que la bibliothèque a déjà mieux,
     si c'est le cas de toutes ; 0 sinon. Un échantillon refusé comme tel ne compte
-    pas. La file donne une entrée de statut par fichier, plus un en-tête.
+    pas. Pour plusieurs vidéos, la file donne une entrée de statut par fichier, plus
+    un en-tête ; pour une seule, une entrée au nom du téléchargement, parfois sans
+    extension.
     """
+    titre = records[0].get("title")
     refus = [s.get("messages") or [] for s in records[0].get("statusMessages") or []
-             if os.path.splitext(s.get("title") or "")[1].lower() in VIDEO_EXTENSIONS]
+             if s.get("title") == titre or os.path.splitext(s.get("title") or "")[1].lower() in VIDEO_EXTENSIONS]
     refus = [m for m in refus if not any(_INUTILE_ECHANTILLON.search(x) for x in m)]
     if refus and all(any(_INUTILE_REJET.search(x) for x in m) for m in refus):
         return len(refus)

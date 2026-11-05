@@ -302,7 +302,7 @@ La table `arr_managed` liste les torrents pris par un *arr. Sont marqués :
 - les torrents hardlinkés dans `/data/Media/`, à chaque sync ;
 - l'historique des *arr, par `/bootstrap`.
 
-Un torrent qui n'est plus dans qBittorrent en sort. C'est elle qui distingue un torrent géré par les *arr d'un ajout manuel.
+Un torrent qui n'est plus dans qBittorrent en sort. C'est elle qui distingue un torrent géré par les *arr d'un ajout manuel. Elle ne dit pas tout : sans « On Grab », cas de Radarr dans la configuration conseillée, un torrent pris mais jamais importé n'y figure pas. La file de l'*arr, que lit l'assistant, reste la référence.
 
 **La base de cross-seed (`cross-seed.db`)**, maintenue par cross-seed, liste dans `client_searchee` tous les torrents de qBittorrent, avec leur nom, leur hash et leur catégorie. Elle permet de retrouver les torrents qui portent le même nom, donc le même contenu, que le torrent d'origine.
 
@@ -537,14 +537,14 @@ cleanup-linker ne vide jamais `cleanuparr-unlinked`. C'est le rôle de cleanupar
 
 ## L'assistant d'import
 
-Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file, à l'état `importBlocked`. L'*arr attend une intervention. Tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. Les téléchargements morts et les packs incomplets bloquent aussi des demandes, sans que l'*arr s'en plaigne. L'assistant examine ces téléchargements et règle ceux qui peuvent l'être sans risque.
+Un téléchargement terminé que Sonarr ou Radarr n'arrive pas à importer reste dans leur file. L'état dépend du nombre de vidéos : `importBlocked` en général, mais `importPending` avec un avertissement quand une vidéo unique est refusée ou qu'il n'y a rien à importer. L'*arr attend une intervention. Tant que le téléchargement y reste, il refuse les autres releases des mêmes épisodes. Les téléchargements morts et les packs incomplets bloquent aussi des demandes, sans que l'*arr s'en plaigne. L'assistant examine ces téléchargements et règle ceux qui peuvent l'être sans risque.
 
 Il lit les files avec les lignes sans média. Quand le média d'un téléchargement change, après un autre import par exemple, l'*arr relit le seul nom du torrent. S'il ne le reconnaît pas, il le détache de son film ou de sa série. L'assistant reprend ces lignes, à condition que l'historique de cet *arr montre leur grab : le média revient de ce grab. Les lignes sans média de l'autre *arr, qui voit les téléchargements d'une catégorie partagée, n'ont pas de grab ici : elles restent écartées.
 
 ### Déclenchement
 
 - **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
-- **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués. Un téléchargement mort ne déclenche aucun event : c'est ce passage, ou celui d'un autre event, qui le juge (règle 6). Avant chaque passage de renfort, l'assistant relance aussi un torrent dont la vérification de la règle 4 a été interrompue.
+- **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués. Un téléchargement mort ne déclenche aucun event, pas plus qu'une vidéo unique refusée : c'est ce passage, ou celui d'un autre event, qui les juge (règles 6 et 7). Avant chaque passage de renfort, l'assistant relance aussi un torrent dont la vérification de la règle 4 a été interrompue.
 - **L'event « On Grab »** de Sonarr lance tout de suite la vérification d'un pack de saison (règle 4), en arrière-plan, sans attendre de passage.
 - **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts :
   - sans paramètre, chaque règle suit son interrupteur ;
@@ -788,17 +788,20 @@ INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Parking.m
 ### Règle 7 · téléchargement inutile : la bibliothèque a déjà mieux
 
 Un téléchargement fini que l'*arr n'importera jamais, parce que la bibliothèque a déjà mieux, reste bloqué dans sa file indéfiniment. Jellyfin, s'il lit les dossiers de téléchargement, le montre en double. La règle le reconnaît de deux façons, quand aucune de ses vidéos n'est dans la bibliothèque :
-1. **l'*arr a refusé chacune de ses vidéos** parce qu'elle n'améliore pas le fichier en place (« Not an upgrade », « Not a Custom Format upgrade », « Not a quality revision upgrade »). La file donne une entrée de statut par fichier. Les échantillons refusés comme tels ne comptent pas. C'est le cas de Veronica Mars SN2P : un pack à 150, contre 160 à 235 pour les 72 épisodes en place ;
+1. **l'*arr a refusé chacune de ses vidéos** parce qu'elle n'améliore pas le fichier en place (« Not an upgrade », « Not a Custom Format upgrade », « Not a quality revision upgrade »). La file donne une entrée de statut par fichier, ou une seule au nom du téléchargement pour une vidéo unique, alors laissée en `importPending` avec un avertissement. Les échantillons refusés comme tels ne comptent pas. C'est le cas de Veronica Mars SN2P : un pack à 150, contre 160 à 235 pour les 72 épisodes en place. C'est aussi le cas de la SUPPLY de Resident Evil (2026) : une vidéo à 151, contre 231 en place ;
 2. **un téléchargement bloqué « matched by ID »** (règle 2), quand le fichier en place vaut au moins la release. Il faut une qualité de rang égal ou supérieur dans le profil, les qualités d'un groupe partageant son rang, et, à rang égal, un score de formats au moins égal. Pour une série, chaque épisode du téléchargement doit avoir un tel fichier. C'est le cas de la KyoGo de Resident Evil (2026) : WEBDL-1080p à 51, contre la kazui MULTi en place, WEBDL-1080p à 171. Dans le doute, par exemple si une note manque, la règle ne fait rien.
 
 La règle 6 lui confie aussi **un téléchargement mort**, avant le début d'une course, quand le fichier en place vaut au moins la release, selon la même comparaison. C'est le cas de L'invitée de l'hiver : un WEBDL-1080p à 39, mort depuis 101 jours, contre un Bluray-1080p à 60 en place.
 
 Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille, où **il continue de seeder**. Un téléchargement mort y est arrêté, puisqu'il n'a rien à seeder, sauf un torrent privé déjà entamé. Rien n'est supprimé. Verdict : `useless`.
 
+Une vidéo unique refusée pour un autre motif, un exécutable par exemple, ou un dossier sans rien à importer, n'est jamais touchée : l'assistant journalise le motif de l'*arr, une fois par jour, avec le verdict `ignored`.
+
 ```
 INFO     ✓ [règle 7 · téléchargement inutile] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : Sonarr refuse les 72 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : la bibliothèque a déjà mieux (WEBDL-1080p, score 171) que la release Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo (WEBDL-1080p, score 51) → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] L.invitee.de.l.hiver.1997.VOSTF.BR.1080P.HEVC.DTS-X-AZAZE.mkv : plus rien reçu depuis 101 j, et la bibliothèque a déjà mieux (Bluray-1080p, score 60) que cette release (WEBDL-1080p, score 39) → retiré de la file sans blacklist, en corbeille et arrêté : il n'a rien à seeder
+INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.MULTi.CA.1080p.WEB.H265-SUPPLY : Radarr refuse les 1 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 ```
 
 ---
