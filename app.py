@@ -2074,8 +2074,7 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
 
         verdicts_accord, ecartees = run_accord(apercu)
 
-        # Les files d'abord : sans téléchargement bloqué ni en cours, inutile de
-        # lister qBit. Une seule lecture par *arr : bloqués pour la règle 1, en
+        # Les files d'abord. Une seule lecture par *arr : bloqués pour la règle 1, en
         # cours pour la règle 6.
         bloques: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
         en_cours: list[tuple[str, str, str, dict[str, list[dict[str, Any]]]]] = []
@@ -2091,8 +2090,6 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
                 bloques.append((arr, url, cle, bloque))
             if cours:
                 en_cours.append((arr, url, cle, cours))
-        if not bloques and not en_cours:
-            return verdicts_accord
 
         try:
             with qbit_session() as s:
@@ -2132,6 +2129,9 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
         verdicts_morts, nouveaux_morts = run_dead_downloads(en_cours, ctx)
         verdicts += verdicts_morts
         nouveaux += nouveaux_morts
+        verdicts_oublies, nouveaux_oublies = run_forgotten({dl for *_, p in bloques + en_cours for dl in p}, ctx)
+        verdicts += verdicts_oublies
+        nouveaux += nouveaux_oublies
         if nouveaux:
             # Chaque ligne au-dessus dit sa règle, et si elle n'est qu'une simulation.
             log.info(
@@ -2618,6 +2618,15 @@ def _misnamed(
 # où il continue de seeder. Rien n'est supprimé. La règle 6 lui confie aussi un
 # téléchargement mort dont la bibliothèque a déjà mieux : inutile de le remplacer.
 # Une vidéo unique refusée n'émet aucun event : seul le passage de renfort la voit.
+#
+# Le filet hors file. La corbeille attend un signal : un event sur un fichier de la
+# bibliothèque, une ligne de file. Un signal raté n'est jamais rattrapé, et le
+# torrent reste rangé « après import » sans plus servir à rien : un import refusé
+# puis sorti de la file, un upgrade passé avant que l'index connaisse le fichier.
+# Le filet regarde l'état réel, à chaque passage.
+
+# Au plus tant de torrents par passage : une telle vague serait suspecte.
+_INUTILE_HORS_FILE_MAX = 10
 
 _INUTILE_REJET = re.compile(r"not an upgrade|not a custom format upgrade|not a quality revision upgrade",
                             re.IGNORECASE)
@@ -2697,25 +2706,121 @@ def _useless(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]
     """
     Règle 7 : retire de la file, sans blacklist, un téléchargement qui n'apporterait
     rien, et le met en corbeille. Il y continue de seeder, sauf `arreter` : un
-    téléchargement mort n'a rien à seeder.
+    téléchargement mort n'a rien à seeder. Une ligne sans id : il n'est déjà plus
+    dans la file (run_forgotten).
     """
     dry = ctx["apercu"] or IMPORT_ASSIST_INUTILE_DRY_RUN
     titre = records[0].get("title") or dl
+    en_file = bool(records[0].get("id"))
     corbeille = "en corbeille et arrêté : il n'a rien à seeder" if arreter else "en corbeille, où il continue de seeder"
-    details = f"{constat} → retiré de la file sans blacklist, {corbeille}"
+    details = f"{constat} → {'retiré de la file sans blacklist, ' if en_file else ''}{corbeille}"
     verdict.update(decision="useless", reason=details)
     if _assist_seen(dl, "useless", dry):
         return verdict, False
     if not dry:
-        _arr_request("DELETE", url, cle, f"queue/{records[0]['id']}",
-                     params={"removeFromClient": "false", "blocklist": "false", "skipRedownload": "true"})
+        if en_file:
+            _arr_request("DELETE", url, cle, f"queue/{records[0]['id']}",
+                         params={"removeFromClient": "false", "blocklist": "false", "skipRedownload": "true"})
         if not _assist_trash(t, arreter=arreter):
-            details = (f"{constat} → retiré de la file sans blacklist ; laissé dans sa catégorie, "
+            details = (f"{constat} → {'retiré de la file sans blacklist ; ' if en_file else ''}laissé dans sa catégorie, "
                        "son dossier est aussi celui d'un autre torrent")
             verdict["reason"] = details
     _assist_record(dl, arr, titre, "useless", details, dry, 7)
     _assist_log(7, "✓", arr, titre, details, dry)
     return verdict, True
+
+
+def _no_longer_used(t: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    """
+    L'*arr qui a pris ce torrent, et le constat, si la bibliothèque n'en utilise plus
+    rien et a tout par d'autres fichiers ; None sinon, ou dans le doute. Les inodes
+    sont lus sur le disque, pas dans l'index : un import à la main n'y figure qu'à
+    la sync suivante.
+    """
+    for arr, url, cle in _assist_arrs():
+        rep = _arr_request("GET", url, cle, "history",
+                           params={"downloadId": t["hash"].upper(), "pageSize": 200, "eventType": 1}) or {}
+        grabs = [g for g in rep.get("records") or [] if g.get("eventType") == "grabbed"]
+        if grabs:
+            break
+    else:
+        return None  # jamais pris par un *arr : un ajout manuel
+    cle_media, route = ("movieId", "movie") if arr == "radarr" else ("seriesId", "series")
+    media = grabs[0].get(cle_media)
+    dossier = (_arr_request("GET", url, cle, f"{route}/{media}") or {}).get("path") if media else ""
+    inodes = set(scan_video_files(dossier)) if dossier else set()
+    videos = _torrent_videos(t)
+    # Rien à juger, ou bibliothèque absente (montage perdu) : on ne conclut rien.
+    if not videos or not inodes or any(os.stat(v).st_ino in inodes for v in videos):
+        return None
+    if arr == "radarr":
+        en_place = _arr_request("GET", url, cle, "moviefile", params={"movieId": media}) or []
+    else:
+        voulus = {g.get("episodeId") for g in grabs if g.get("episodeId")}
+        fichiers = {f["id"]: f for f in _arr_request("GET", url, cle, "episodefile", params={"seriesId": media}) or []}
+        episodes = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": media}) or []
+                    if e.get("id") in voulus]
+        if len(episodes) != len(voulus):
+            return None
+        en_place = [fichiers.get(e.get("episodeFileId")) for e in episodes]
+    if not en_place or not all(f and os.path.exists(f.get("path") or "") for f in en_place):
+        return None
+    return arr, url, cle, (f"hors de la file, aucune de ses {len(videos)} vidéo(s) n'est dans la bibliothèque, "
+                           "qui a déjà tout par d'autres fichiers")
+
+
+def run_forgotten(en_file: set[str], ctx: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """
+    Règle 7, le filet hors file : un torrent fini depuis plus de CLEANUP_GRACE_HOURS,
+    rangé dans une catégorie après import, qu'un *arr a pris et que la bibliothèque
+    n'utilise plus. Il part en corbeille, où il continue de seeder. Un torrent qui en
+    est déjà sorti n'y retourne pas : quelqu'un l'a voulu. Retourne (verdicts,
+    journalisés maintenant).
+    """
+    try:
+        rangees: set[str] = set()
+        for arr, url, cle in _assist_arrs():
+            clients = _arr_request("GET", url, cle, "downloadclient") or []
+            rangees |= {c for c in (_imported_category(clients, x.get("name") or "") for x in clients) if c}
+    except Exception as e:
+        log.error("  ⚠ [%s] clients des *arr illisibles (%s)", _regle(7), e)
+        return [], 0
+    # L'index écarte d'emblée la plupart des torrents, sans appel à l'*arr.
+    with _db_lock:
+        with get_db() as conn:
+            utilises = {r[0] for r in conn.execute("SELECT DISTINCT torrent_hash FROM files WHERE path LIKE '/data/Media/%' "
+                                                   "AND stale = 0 AND torrent_hash IS NOT NULL")}
+            sortis = {r[0] for r in conn.execute("SELECT DISTINCT torrent_hash FROM cleanup_log")}
+    limite = time.time() - CLEANUP_GRACE_HOURS * 3600
+    candidats = sorted(
+        (t for h, t in ctx["torrents"].items()
+         if t.get("category") in rangees and (t.get("progress") or 0) >= 1 and 0 < (t.get("completion_on") or 0) <= limite
+         and h not in en_file and h not in utilises and h not in sortis),
+        key=lambda t: t["completion_on"],
+    )
+    verdicts: list[dict[str, Any]] = []
+    nouveaux = attente = 0
+    for t in candidats:
+        dl, titre = t["hash"].lower(), t.get("name") or t["hash"]
+        try:
+            inutile = _no_longer_used(t)
+            if not inutile:
+                continue
+            if nouveaux >= _INUTILE_HORS_FILE_MAX:
+                attente += 1
+                continue
+            arr, url, cle, constat = inutile
+            verdict, nouveau = _useless(arr, url, cle, dl, [{"title": titre}], t, ctx,
+                                        {"arr": arr, "download_id": dl, "title": titre}, constat)
+        except Exception as e:
+            # Un torrent en erreur n'empêche pas de traiter les suivants.
+            log.error("  ⚠ [%s] %s en erreur (%s)", _regle(7), titre, e)
+            continue
+        verdicts.append(verdict)
+        nouveaux += nouveau
+    if attente:
+        log.info("  [%s] %d autre(s) torrent(s) inutile(s) attendront le passage suivant", _regle(7), attente)
+    return verdicts, nouveaux
 
 
 # ── Assistant d'import, règle 4 : packs de saison partiels ──────────────────

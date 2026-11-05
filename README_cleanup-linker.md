@@ -133,7 +133,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `SYNC_INTERVAL_HOURS` | `12` | Intervalle entre deux syncs |
 | `BACKUP_DIR` | `/config/backups` | Dossier des sauvegardes de la base |
 | `BACKUP_RETENTION` | `5` | Nombre de sauvegardes gardées |
-| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`. `0` désactive ce délai |
+| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
 | `VIDEO_EXTENSIONS` | `.mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v` | Extensions indexées, séparées par des virgules. Le point initial et la casse sont facultatifs. Un fichier d'une autre extension est invisible pour tout le service |
 
 **Sonarr et Radarr**
@@ -797,11 +797,21 @@ Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le repr
 
 Une vidéo unique refusée pour un autre motif, un exécutable par exemple, ou un dossier sans rien à importer, n'est jamais touchée : l'assistant journalise le motif de l'*arr, une fois par jour, avec le verdict `ignored`.
 
+**Le filet hors file.** La corbeille attend un signal : un event sur un fichier de la bibliothèque, ou une ligne de file. Un signal raté n'est jamais rattrapé, et le torrent reste en seed sans plus servir à rien : un import refusé puis sorti de la file, un upgrade passé avant que l'index connaisse le fichier. À chaque passage, la règle regarde donc aussi l'état réel des torrents hors file. L'un d'eux part en corbeille, où il continue de seeder, s'il remplit toutes ces conditions :
+- il est fini depuis plus de `CLEANUP_GRACE_HOURS` (24 h) et rangé dans une catégorie après import d'un client Sonarr ou Radarr ;
+- un *arr l'a pris : son historique garde le grab. Un ajout manuel n'est jamais touché ;
+- aucune de ses vidéos n'est dans le dossier du média. C'est vérifié sur le disque, inode par inode, car l'index ne connaît un import à la main qu'à la sync suivante ;
+- la bibliothèque a déjà chaque épisode, ou le film, par un autre fichier présent sur le disque. Sinon, le torrent est peut-être la dernière copie ;
+- il n'est jamais sorti de la corbeille : si c'est le cas, quelqu'un l'a voulu.
+
+Si le dossier du média est vide, par exemple quand un montage manque, la règle ne conclut rien. Elle traite au plus 10 torrents par passage, les plus anciens d'abord. Comme ailleurs dans cette règle, les cross-seeds du torrent restent en place. Le verdict est le même : `useless`.
+
 ```
 INFO     ✓ [règle 7 · téléchargement inutile] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : Sonarr refuse les 72 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : la bibliothèque a déjà mieux (WEBDL-1080p, score 171) que la release Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo (WEBDL-1080p, score 51) → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] L.invitee.de.l.hiver.1997.VOSTF.BR.1080P.HEVC.DTS-X-AZAZE.mkv : plus rien reçu depuis 101 j, et la bibliothèque a déjà mieux (Bluray-1080p, score 60) que cette release (WEBDL-1080p, score 39) → retiré de la file sans blacklist, en corbeille et arrêté : il n'a rien à seeder
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.MULTi.CA.1080p.WEB.H265-SUPPLY : Radarr refuse les 1 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
+INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [sonarr] Lanterns.2026.S01E02.DV.HDR.2160p.WEB.H265-CAKES : hors de la file, aucune de ses 1 vidéo(s) n'est dans la bibliothèque, qui a déjà tout par d'autres fichiers → en corbeille, où il continue de seeder
 ```
 
 ---
