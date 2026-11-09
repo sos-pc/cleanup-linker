@@ -137,6 +137,16 @@ IMPORT_ASSIST_INUTILE_DRY_RUN = os.getenv("IMPORT_ASSIST_INUTILE_DRY_RUN", "true
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
+# Corbeille globale : à une vraie suppression ou à un upgrade, tous les noms du
+# fichier côté téléchargement passent en corbeille, y compris ceux qu'aucun
+# torrent ne tient, qui y entrent par un torrent de corbeille. « off » garde
+# l'ancien geste seul. « simulation », par défaut, le garde aussi, et journalise
+# ce que ferait le nouveau. « active » remplace l'ancien geste par le nouveau.
+# Une valeur inconnue vaut simulation.
+CORBEILLE_GLOBALE = os.getenv("CORBEILLE_GLOBALE", "simulation").strip().lower()
+if CORBEILLE_GLOBALE not in ("off", "simulation", "active"):
+    CORBEILLE_GLOBALE = "simulation"
+
 # ── Jellyfin ─────────────────────────────────────────────────────────────────
 # Optionnel : si JELLYFIN_URL/JELLYFIN_API_KEY sont absents, la route /jellyfin
 # répond 503 et l'indexation est simplement sautée à chaque sync.
@@ -304,6 +314,19 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_pack_new ON pack_replace(new_hash);
                 CREATE INDEX IF NOT EXISTS idx_pack_old ON pack_replace(old_hash);
+
+                -- Décisions de la corbeille globale, simulées ou réelles.
+                CREATE TABLE IF NOT EXISTS corbeille_log (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source    TEXT,
+                    motif     TEXT,
+                    chemin    TEXT,
+                    dry_run   INTEGER,
+                    resume    TEXT,
+                    decision  TEXT,
+                    ancien    INTEGER,
+                    at        INTEGER DEFAULT (strftime('%s','now'))
+                );
 
                 -- Courses de versions pour un téléchargement mort (règle 6).
                 CREATE TABLE IF NOT EXISTS dead_race (
@@ -1761,6 +1784,499 @@ def _check_hardlinks_active(root: str, inodes_to_ignore: list[int]) -> bool:
         pass
     return False
 
+
+# ── Corbeille globale ────────────────────────────────────────────────────────
+#
+# Un seul geste pour une vraie suppression ou un upgrade. Pour chaque fichier
+# touché, ses autres noms décident :
+#   - un autre nom dans /data/Media : une autre fiche ou bibliothèque l'utilise,
+#     rien de ce fichier ne part ;
+#   - un lien que l'index ne connaît pas (collection, dossier non scanné) : pareil ;
+#   - sinon, tous ses noms côté téléchargement partent. Un torrent qui en tient un
+#     part si aucune de ses autres vidéos ne sert encore. Un nom qu'aucun torrent ne
+#     tient entre dans un torrent de corbeille, qui le liste et se vide comme les autres.
+# « Tenu par un torrent » se lit dans la liste des fichiers du torrent, jamais dans
+# son dossier : un dossier peut contenir des fichiers qui n'en font pas partie. Les
+# cross-seeds suivent parce qu'ils partagent les mêmes fichiers, jamais par leur nom :
+# plusieurs torrents s'appellent « Season 2 » sans rien partager.
+#
+# Le torrent de corbeille liste des fichiers sans lire leurs données : ses empreintes
+# de pièces sont nulles. Ajouté sans vérification, arrêté, privé et sans tracker, il ne
+# parle à personne et ne sert qu'à vider ces fichiers depuis qBittorrent. Le retirer
+# sans ses fichiers annule le geste. Rien n'est supprimé par le service.
+
+_CROSSSEEDS_DIR = "/data/Multimedia/cross-seeds"
+_CORBEILLE_TAG = "sans-torrent"
+_CORBEILLE_PREFIXE = "[sans torrent] "
+# Une vidéo d'un torrent lue seulement dans un dossier de téléchargement, et de moins
+# d'un quart de la plus grosse, est un bonus de la même release (making-of, clip,
+# échantillon) : elle ne retient pas le torrent.
+_BONUS_RATIO = 4
+_CORBEILLE_PIECE = 1 << 24
+# Lignes de détail au plus par sorte, dans le journal.
+_CORBEILLE_LOG_MAX = 8
+
+
+def _bencode(x: Any) -> bytes:
+    """Encode en bencode : entiers, octets, chaînes UTF-8, listes, dictionnaires à clés triées."""
+    if isinstance(x, bool):
+        raise TypeError("bool")
+    if isinstance(x, int):
+        return b"i%de" % x
+    if isinstance(x, bytes):
+        return b"%d:%s" % (len(x), x)
+    if isinstance(x, str):
+        return _bencode(x.encode("utf-8"))
+    if isinstance(x, list):
+        return b"l" + b"".join(_bencode(v) for v in x) + b"e"
+    if isinstance(x, dict):
+        paires = sorted(((k.encode("utf-8") if isinstance(k, str) else k), v) for k, v in x.items())
+        return b"d" + b"".join(_bencode(k) + _bencode(v) for k, v in paires) + b"e"
+    raise TypeError(type(x).__name__)
+
+
+def _trash_torrent(racine: str, fichiers: list[str]) -> tuple[bytes, str]:
+    """
+    Le .torrent d'un torrent de corbeille : ces fichiers, sous `racine`, sans lire
+    leurs données. Retourne (contenu du .torrent, infohash v1).
+    """
+    nom = os.path.basename(racine)
+    if fichiers == [racine] and not os.path.isdir(racine):
+        total = os.path.getsize(racine)
+        info: dict[str, Any] = {"name": nom, "length": total}
+    else:
+        liste = [{"length": os.path.getsize(f), "path": os.path.relpath(f, racine).split(os.sep)}
+                 for f in sorted(fichiers)]
+        total = sum(e["length"] for e in liste)
+        info = {"name": nom, "files": liste}
+    pieces = max(1, -(-total // _CORBEILLE_PIECE))
+    info.update({"piece length": _CORBEILLE_PIECE, "pieces": b"\0" * 20 * pieces,
+                 "private": 1, "source": "cleanup-linker"})
+    return _bencode({"info": info, "created by": "cleanup-linker"}), hashlib.sha1(_bencode(info)).hexdigest()
+
+
+def _same_inode(chemin: str, inode: int) -> bool:
+    try:
+        return os.lstat(chemin).st_ino == inode
+    except OSError:
+        return False
+
+
+def _under(chemin: str, dossiers: set[str]) -> bool:
+    return any(chemin == d or chemin.startswith(d + "/") for d in dossiers)
+
+
+def _index_names(conn: sqlite3.Connection, inodes: set[int]) -> dict[int, set[str]]:
+    """Tous les noms que l'index connaît pour ces inodes."""
+    noms: dict[int, set[str]] = {}
+    liste = sorted(inodes)
+    for i in range(0, len(liste), _SQL_CHUNK):
+        lot = liste[i:i + _SQL_CHUNK]
+        for r in conn.execute(f"SELECT DISTINCT inode, path FROM files WHERE stale = 0 AND inode IN "
+                              f"({','.join('?' * len(lot))})", lot):
+            noms.setdefault(r["inode"], set()).add(r["path"])
+    return noms
+
+
+def _jellyfin_libraries() -> set[str] | None:
+    """Dossiers que lisent les bibliothèques Jellyfin, en chemins locaux. None si Jellyfin ne répond pas."""
+    if not jellyfin_enabled():
+        return set()
+    try:
+        r = requests.get(f"{JELLYFIN_URL}/Library/VirtualFolders", timeout=30,
+                         headers={"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'})
+        r.raise_for_status()
+        return {map_jellyfin_path(p).rstrip("/") for b in r.json() or [] for p in b.get("Locations") or []}
+    except Exception as e:
+        log.warning("  Corbeille globale : bibliothèques Jellyfin illisibles (%s)", e)
+        return None
+
+
+def _trash_group(nom: str, dossiers: set[str]) -> str | None:
+    """
+    Le dossier de release d'un nom : le premier niveau sous son dossier de
+    téléchargement, ou sous le tracker dans cross-seeds. Le fichier lui-même s'il
+    est posé directement dans ce dossier. None hors des dossiers de téléchargement.
+    """
+    base = max((d for d in dossiers if nom.startswith(d + "/")), key=len, default=None)
+    if base is None:
+        return None
+    morceaux = os.path.relpath(nom, base).split(os.sep)
+    niveaux = 2 if base == _CROSSSEEDS_DIR else 1
+    if len(morceaux) <= niveaux:
+        return nom
+    return os.path.join(base, *morceaux[:niveaux])
+
+
+def _trash_plan(chemins: list[str], s: requests.Session, lues: set[str] | None) -> dict[str, Any]:
+    """
+    Ce que la corbeille globale ferait pour ces chemins supprimés. Ne change rien.
+    `lues` : dossiers lus par Jellyfin, None s'il n'a pas répondu (on garde alors
+    tout torrent dont une autre vidéo pourrait être visible).
+    """
+    plan: dict[str, Any] = {"chemins": chemins, "touches": 0, "octets": 0, "torrents": [], "corbeilles": [],
+                            "restent": [], "gardes": {}, "deja": 0, "liberes": 0, "refus": ""}
+    for c in chemins:
+        if len(c.rstrip("/").split("/")) < _MIN_ROOT_DEPTH:
+            plan["refus"] = f"chemin trop haut pour un seul titre : {c}"
+            return plan
+
+    # 1. Les fichiers touchés, et tous les noms que l'index leur connaît.
+    ici: dict[int, set[str]] = {}
+    with _db_lock:
+        with get_db() as conn:
+            for c in chemins:
+                c = c.rstrip("/")
+                for r in conn.execute("SELECT DISTINCT inode, path FROM files WHERE stale = 0 AND (path = ? OR path LIKE ?)",
+                                      (c, c + "/%")):
+                    if r["path"] == c or r["path"].startswith(c + "/"):
+                        ici.setdefault(r["inode"], set()).add(r["path"])
+            connus = _index_names(conn, set(ici))
+    plan["touches"] = len(ici)
+    if not ici:
+        plan["refus"] = "aucun fichier connu de l'index sous ce chemin"
+        return plan
+
+    # 2. qBittorrent, lu maintenant : torrents, dossiers de téléchargement, listes de fichiers.
+    torrents = {t["hash"].lower(): t for t in qbit_get_torrents(s)}
+    r = s.get(f"{QBIT_URL}/api/v2/torrents/categories", timeout=10)
+    r.raise_for_status()
+    categories = {n: (i.get("savePath") or "").rstrip("/") for n, i in (r.json() or {}).items()}
+    r = s.get(f"{QBIT_URL}/api/v2/app/defaultSavePath", timeout=10)
+    r.raise_for_status()
+    defaut = r.text.strip().rstrip("/")
+    dossiers = {d for d in categories.values() if d} | {defaut, _CROSSSEEDS_DIR}
+    plan["dossier_corbeille"] = categories.get(TARGET_CAT) or f"{defaut}/{TARGET_CAT}"
+    racines: dict[str, list[str]] = {}
+    for h, t in torrents.items():
+        racines.setdefault(torrent_root(t), []).append(h)
+    listes: dict[str, set[str]] = {}
+
+    def fichiers_de(h: str) -> set[str]:
+        if h not in listes:
+            rep = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
+            rep.raise_for_status()
+            base = (torrents[h].get("save_path") or "").rstrip("/")
+            listes[h] = {os.path.join(base, f.get("name") or "") for f in rep.json() or []}
+        return listes[h]
+
+    memo: dict[str, set[str]] = {}
+
+    def tenu_par(nom: str) -> set[str]:
+        """Les torrents qui listent ce fichier, d'après leur liste de fichiers."""
+        if nom not in memo:
+            out: set[str] = set()
+            cur = nom
+            while True:
+                for h in racines.get(cur, []):
+                    if nom in fichiers_de(h):
+                        out.add(h)
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+            memo[nom] = out
+        return memo[nom]
+
+    # 3. Le verdict de chaque fichier touché.
+    jetes: set[int] = set()
+    gardes: dict[int, str] = {}
+    presents_de: dict[int, set[str]] = {}
+    orphelins: set[str] = set()
+    candidats: set[str] = set()
+    for i, noms_ici in ici.items():
+        presents = {n for n in connus.get(i, set()) | noms_ici if _same_inode(n, i)}
+        if not presents:
+            continue  # plus aucun nom sur le disque : il n'y a plus rien à jeter
+        st = os.lstat(next(iter(presents)))
+        plan["octets"] += st.st_size
+        presents_de[i] = presents
+        reste = presents - noms_ici
+        if st.st_nlink > len(presents):
+            gardes[i] = "un nom que l'index ne connaît pas (collection, autre dossier)"
+        elif any(n.startswith("/data/Media/") for n in reste):
+            gardes[i] = "un autre nom dans /data/Media"
+        else:
+            jetes.add(i)
+            for n in reste:
+                tenants = tenu_par(n)
+                if tenants:
+                    candidats |= tenants
+                else:
+                    orphelins.add(n)
+    for raison in gardes.values():
+        plan["gardes"][raison] = plan["gardes"].get(raison, 0) + 1
+
+    # 4. Un torrent part si aucune de ses autres vidéos ne sert encore.
+    partent: set[str] = set()
+    a_juger: dict[str, list[tuple[str, os.stat_result]]] = {}
+    for h in sorted(candidats):
+        t = torrents[h]
+        categorie = t.get("category") or ""
+        if categorie == TARGET_CAT:
+            plan["deja"] += 1
+            continue
+        if not categorie:
+            plan["restent"].append({"hash": h, "name": t.get("name"), "raison": "sans catégorie : jamais touché"})
+            continue
+        fichiers = []
+        for p in sorted(fichiers_de(h)):
+            if os.path.splitext(p)[1].lower() not in VIDEO_EXTENSIONS:
+                continue
+            try:
+                fichiers.append((p, os.lstat(p)))
+            except OSError:
+                continue
+        a_juger[h] = fichiers
+    autres = {st.st_ino for fs in a_juger.values() for _, st in fs} - set(ici)
+    if autres:
+        with _db_lock:
+            with get_db() as conn:
+                noms_autres = _index_names(conn, autres)
+    else:
+        noms_autres = {}
+    for h, fichiers in a_juger.items():
+        plus_gros = max((st.st_size for _, st in fichiers), default=0)
+        encore = ""
+        for p, st in fichiers:
+            j = st.st_ino
+            if j in jetes:
+                continue
+            if j in gardes:
+                encore = p
+                break
+            presents = {n for n in noms_autres.get(j, set()) if _same_inode(n, j)}
+            # Sans réponse de Jellyfin, chaque nom d'un dossier de téléchargement compte
+            # comme visible : seul un petit bonus ne retient alors pas le torrent.
+            visible = any(_under(n, lues) for n in presents) if lues is not None else bool(presents)
+            if (st.st_nlink > len(presents) or any(n.startswith("/data/Media/") for n in presents)
+                    or (visible and st.st_size * _BONUS_RATIO >= plus_gros)):
+                encore = p
+                break
+        t = torrents[h]
+        if encore:
+            plan["restent"].append({"hash": h, "name": t.get("name"),
+                                    "raison": f"une autre de ses vidéos sert encore : {encore}"})
+        else:
+            partent.add(h)
+            plan["torrents"].append({"hash": h, "name": t.get("name"), "category": t.get("category")})
+
+    # 5. Les noms sans torrent, réunis par dossier de release dans un torrent de corbeille.
+    groupes: dict[str, list[str]] = {}
+    hors: list[str] = []
+    corbeille = plan["dossier_corbeille"]
+    for n in orphelins:
+        g = _trash_group(n, dossiers)
+        # Jamais un dossier de téléchargement entier, ni le dossier de la corbeille.
+        if g is None or g in dossiers or _under(n, {corbeille}) or _under(corbeille, {g}):
+            hors.append(n)
+        else:
+            groupes.setdefault(g, []).append(n)
+    listes_corbeille: set[str] = set()
+    for g, noms in sorted(groupes.items()):
+        if os.path.isdir(g):
+            tous = sorted(os.path.join(d, f) for d, _, fs in os.walk(g) for f in fs)
+            autres_videos = [p for p in tous if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS and p not in noms]
+            # Un dossier qui ne garde aucune autre vidéo part entier, petits fichiers compris.
+            fichiers = sorted(noms) if autres_videos else [p for p in tous if os.path.isfile(p) and not os.path.islink(p)]
+            # Un fichier qu'un torrent liste n'entre jamais dans un torrent de corbeille.
+            fichiers = [p for p in fichiers if p in noms or not tenu_par(p)]
+        else:
+            fichiers = [g]
+        listes_corbeille.update(fichiers)
+        plan["corbeilles"].append({
+            "racine": g, "fichiers": fichiers, "videos": len(noms),
+            "autres": len(fichiers) - len(noms),
+            "visible": lues is not None and _under(g, lues),
+        })
+    if hors:
+        plan["restent"].append({"hash": "", "name": f"{len(hors)} nom(s) sans torrent",
+                                "raison": f"hors des dossiers de téléchargement, ex. {sorted(hors)[0]}"})
+
+    # 6. Ce que vider la corbeille libérerait : chaque fichier jeté dont plus aucun nom ne reste.
+    partiront = partent | {h for h, t in torrents.items() if t.get("category") == TARGET_CAT}
+    for i in jetes:
+        presents = presents_de[i]
+        st = os.lstat(next(iter(presents)))
+        if st.st_nlink == len(presents) and all(
+                n in ici[i] or n in listes_corbeille or tenu_par(n) & partiront for n in presents):
+            plan["liberes"] += st.st_size
+    # Les bonus d'un torrent qui part : libérés aussi, s'ils n'ont pas d'autre nom.
+    bonus_vus: set[int] = set()
+    for h in partent:
+        for _, st in a_juger.get(h, []):
+            j = st.st_ino
+            if j in ici or j in bonus_vus:
+                continue
+            presents = {n for n in noms_autres.get(j, set()) if _same_inode(n, j)}
+            if presents and st.st_nlink == len(presents) and all(tenu_par(n) & partiront for n in presents):
+                plan["liberes"] += st.st_size
+                bonus_vus.add(j)
+    if lues is None:
+        plan["jellyfin"] = "injoignable : toute vidéo d'un dossier de téléchargement a compté comme visible"
+    return plan
+
+
+def _trash_apply(plan: dict[str, Any], s: requests.Session, source: str) -> dict[str, int]:
+    """Exécute le plan : torrents en corbeille, torrents de corbeille ajoutés. Rien n'est supprimé."""
+    faits = {"torrents": 0, "corbeilles": 0}
+    lot = {t["hash"] for t in plan["torrents"]}
+    if lot:
+        # Comme ailleurs : un torrent dont le dossier est aussi celui d'un torrent hors du
+        # lot reste en place, sinon ATM emporterait les fichiers de l'autre.
+        partages = _shared_content(lot, qbit_get_torrents(s))
+        bouger = [t for t in plan["torrents"] if t["hash"] not in partages]
+        for t in plan["torrents"]:
+            if t["hash"] in partages:
+                t["garde"] = "dossier partagé avec un autre torrent"
+        if bouger:
+            r = s.post(f"{QBIT_URL}/api/v2/torrents/setCategory", timeout=10,
+                       data={"hashes": "|".join(t["hash"] for t in bouger), "category": TARGET_CAT})
+            r.raise_for_status()
+            for t in bouger:
+                log_move(t["hash"], t.get("name") or "", t.get("category") or "", source)
+            faits["torrents"] = len(bouger)
+    racines_vivantes = {torrent_root(t) for t in qbit_get_torrents(s)} if plan["corbeilles"] else set()
+    for c in plan["corbeilles"]:
+        contenu, h = _trash_torrent(c["racine"], c["fichiers"])
+        nom = _CORBEILLE_PREFIXE + os.path.basename(c["racine"])
+        data = {"category": TARGET_CAT, "tags": _CORBEILLE_TAG, "rename": nom, "savepath": os.path.dirname(c["racine"]),
+                "autoTMM": "false", "skip_checking": "true", "stopped": "true", "paused": "true", "contentLayout": "Original"}
+        r = s.post(f"{QBIT_URL}/api/v2/torrents/add", data=data, timeout=30,
+                   files={"torrents": (f"{h}.torrent", contenu, "application/x-bittorrent")})
+        r.raise_for_status()
+        present = False
+        for _ in range(10):
+            rep = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": h}, timeout=10)
+            rep.raise_for_status()
+            if rep.json():
+                present = True
+                break
+            time.sleep(1)
+        if not present:
+            log.error("  ⚠ Corbeille globale : qBittorrent n'a pas ajouté le torrent de corbeille %s", nom)
+            continue
+        c["hash"] = h
+        log_move(h, nom, "", source)
+        faits["corbeilles"] += 1
+        # Un nom lu par Jellyfin sort du dossier lu, comme le ferait ATM pour un torrent :
+        # le titre disparaît de la bibliothèque. Pas si un autre torrent occupe la même place.
+        cible = os.path.join(plan["dossier_corbeille"], os.path.basename(c["racine"]))
+        if c["visible"] and c["racine"] not in racines_vivantes and cible not in racines_vivantes:
+            r = s.post(f"{QBIT_URL}/api/v2/torrents/setLocation", timeout=30,
+                       data={"hashes": h, "location": plan["dossier_corbeille"]})
+            r.raise_for_status()
+    return faits
+
+
+def _trash_summary(plan: dict[str, Any]) -> str:
+    if plan["refus"]:
+        return f"rien à faire : {plan['refus']}"
+    noms = sum(c["videos"] for c in plan["corbeilles"])
+    morceaux = [f"{plan['touches']} fichier(s) touché(s)",
+                f"{len(plan['torrents'])} torrent(s) en corbeille"]
+    if plan["corbeilles"]:
+        morceaux.append(f"{len(plan['corbeilles'])} torrent(s) de corbeille pour {noms} nom(s) sans torrent")
+    if plan["deja"]:
+        morceaux.append(f"{plan['deja']} déjà en corbeille")
+    if plan["restent"]:
+        morceaux.append(f"{len(plan['restent'])} torrent(s) restent")
+    if plan["gardes"]:
+        morceaux.append(f"{sum(plan['gardes'].values())} fichier(s) gardés")
+    resume = (", ".join(morceaux) + f" ; {plan['liberes'] / 1e9:.1f} Go libérés au vidage, "
+              f"sur {plan['octets'] / 1e9:.1f} Go")
+    if plan.get("jellyfin"):
+        resume += f" (Jellyfin {plan['jellyfin']})"
+    return resume
+
+
+def _corbeille_record(source: str, motif: str, chemins: list[str], dry_run: bool,
+                      resume: str, plan: dict[str, Any] | None) -> int:
+    decision = None
+    if plan is not None:
+        decision = json.dumps({
+            "torrents": [{"name": t.get("name"), "category": t.get("category"), "garde": t.get("garde")}
+                         for t in plan.get("torrents", [])],
+            "corbeilles": [{"racine": c["racine"], "videos": c["videos"], "autres": c["autres"],
+                            "fichiers": [os.path.relpath(f, c["racine"]) if f != c["racine"] else os.path.basename(f)
+                                         for f in c["fichiers"]][:200]} for c in plan.get("corbeilles", [])],
+            "restent": [{"name": t.get("name"), "raison": t.get("raison")} for t in plan.get("restent", [])],
+            "gardes": plan.get("gardes", {}),
+            "liberes": plan.get("liberes", 0),
+            "octets": plan.get("octets", 0),
+        }, ensure_ascii=False)
+    with _db_lock:
+        with get_db() as conn:
+            cur = conn.execute(
+                "INSERT INTO corbeille_log (source, motif, chemin, dry_run, resume, decision) VALUES (?, ?, ?, ?, ?, ?)",
+                (source, motif, " | ".join(chemins)[:1000], int(dry_run), resume, decision),
+            )
+            return int(cur.lastrowid)
+
+
+def global_trash(chemins: list[str], source: str, motif: str, dry_run: bool,
+                 fichiers_gardes: bool = False) -> dict[str, Any]:
+    """
+    La corbeille globale pour des chemins de la bibliothèque qui viennent d'être
+    supprimés ou remplacés. `fichiers_gardes` : l'*arr a retiré sa fiche sans
+    supprimer les fichiers (case décochée), rien ne part. En simulation, rien ne
+    change : la décision est journalisée et tracée dans corbeille_log.
+    """
+    etiquette = "[SIMULATION] " if dry_run else ""
+    if fichiers_gardes:
+        resume = "fichiers gardés (case décochée) : rien ne part en corbeille"
+        log.info("  %s🗑 Corbeille globale (%s) : %s", etiquette, motif, resume)
+        return {"id": _corbeille_record(source, motif, chemins, dry_run, resume, None), "resume": resume}
+    try:
+        lues = _jellyfin_libraries()
+        with qbit_session() as s:
+            plan = _trash_plan(chemins, s, lues)
+            faits = _trash_apply(plan, s, source) if not dry_run and not plan["refus"] else {}
+    except Exception as e:
+        resume = f"erreur, rien n'a été fait : {e}"
+        log.error("  ⚠ %sCorbeille globale (%s) : %s", etiquette, motif, resume)
+        return {"id": _corbeille_record(source, motif, chemins, dry_run, resume, None), "resume": resume, "error": str(e)}
+    resume = _trash_summary(plan)
+    log.info("  %s🗑 Corbeille globale (%s) : %s", etiquette, motif, resume)
+    for t in plan["torrents"][:_CORBEILLE_LOG_MAX]:
+        log.info("      → torrent en corbeille : [%s] %s%s", t.get("category"), t.get("name"),
+                 f" (laissé en place : {t['garde']})" if t.get("garde") else "")
+    for c in plan["corbeilles"][:_CORBEILLE_LOG_MAX]:
+        log.info("      → torrent de corbeille : %s%s, %d vidéo(s)%s", _CORBEILLE_PREFIXE, os.path.basename(c["racine"]),
+                 c["videos"], f" et {c['autres']} autre(s) fichier(s)" if c["autres"] else "")
+    for t in plan["restent"][:_CORBEILLE_LOG_MAX]:
+        log.info("      → reste : %s : %s", t.get("name"), t.get("raison"))
+    for raison, n in plan["gardes"].items():
+        log.info("      → gardé : %d fichier(s), %s", n, raison)
+    rid = _corbeille_record(source, motif, chemins, dry_run, resume, plan)
+    return {"id": rid, "resume": resume, "plan": plan,
+            "moved": (faits.get("torrents", 0) + faits.get("corbeilles", 0)) if faits else 0}
+
+
+def _delete_gesture(chemins: list[str], source: str, motif: str, check_links: bool,
+                    deleted_files: bool | None = None, dry_run: bool = False,
+                    anciens: list[str] | None = None) -> int:
+    """
+    Le geste d'une suppression ou d'un upgrade, selon CORBEILLE_GLOBALE. Retourne le
+    nombre de torrents déplacés ou ajoutés.
+
+    `chemins` : les chemins réellement supprimés, et eux seuls — la corbeille globale
+    traite tout ce qu'ils contiennent comme parti. `anciens` : les chemins que
+    l'ancien geste reçoit, s'ils diffèrent (le dossier commun d'une suppression
+    Jellyfin). En simulation, la corbeille globale lit l'index avant l'ancien geste,
+    qui en retire les fichiers qu'il traite.
+    """
+    if CORBEILLE_GLOBALE == "active" and not dry_run:
+        return int(global_trash(chemins, source, motif, False, deleted_files is False).get("moved") or 0)
+    sim = global_trash(chemins, source, motif, True, deleted_files is False) if CORBEILLE_GLOBALE != "off" else None
+    n = sum(move_torrents_for_path(c, check_links=check_links, source=source, dry_run=dry_run)
+            for c in (anciens or chemins))
+    if sim and sim.get("id"):
+        with _db_lock:
+            with get_db() as conn:
+                conn.execute("UPDATE corbeille_log SET ancien = ? WHERE id = ?", (n, sim["id"]))
+        log.info("  [SIMULATION] Corbeille globale (%s) : l'ancien geste a déplacé %d torrent(s)", motif, n)
+    return n
 
 
 # ── Validation des payloads webhook ──────────────────────────────────────────
@@ -4390,14 +4906,15 @@ def webhook():
             return jsonify({"status": "ignored", "reason": "file still on disk", "path": path})
         if path:
             log.info("Sonarr %s: %s", event, path)
-            n = move_torrents_for_path(path)
+            n = _delete_gesture([path], "webhook", f"Sonarr {event}", check_links=True)
             return jsonify({"moved": n, "path": path})
 
     elif event == "SeriesDelete":
         path = data.get("series", {}).get("path")
         if path:
             log.info("Sonarr SeriesDelete: %s", path)
-            n = move_torrents_for_path(path, check_links=False)
+            n = _delete_gesture([path], "webhook", "Sonarr SeriesDelete", check_links=False,
+                                deleted_files=data.get("deletedFiles"))
             return jsonify({"moved": n, "path": path})
 
     # ── RADARR ───────────────────────────────────────────────────────────────
@@ -4413,14 +4930,15 @@ def webhook():
             return jsonify({"status": "ignored", "reason": "file still on disk", "path": path})
         if path:
             log.info("Radarr %s: %s", event, path)
-            n = move_torrents_for_path(path)
+            n = _delete_gesture([path], "webhook", f"Radarr {event}", check_links=True)
             return jsonify({"moved": n, "path": path})
 
     elif event == "MovieDelete":
         path = data.get("movie", {}).get("folderPath")
         if path:
             log.info("Radarr MovieDelete: %s", path)
-            n = move_torrents_for_path(path, check_links=False)
+            n = _delete_gesture([path], "webhook", "Radarr MovieDelete", check_links=False,
+                                deleted_files=data.get("deletedFiles"))
             return jsonify({"moved": n, "path": path})
 
     elif event == "Download":
@@ -4439,7 +4957,7 @@ def webhook():
                 path = df.get("path")
                 if path:
                     log.info("Fichier remplacé: %s", path)
-                    moved += move_torrents_for_path(path)
+                    moved += _delete_gesture([path], "webhook", "upgrade", check_links=True)
 
         return jsonify({"moved": moved, "event": "DownloadUpgrade", "rows": indexed})
 
@@ -4577,7 +5095,10 @@ def jellyfin_webhook():
 
     if root:
         log.info("  Jellyfin ItemDeleted (%s) %s: %s", resolution, item_type or "?", root)
-        moved = move_torrents_for_path(root, source="jellyfin", dry_run=dry_run)
+        # La corbeille globale ne reçoit que les chemins disparus : le dossier commun
+        # peut contenir des fichiers encore en place.
+        moved = _delete_gesture(list(disparus), "jellyfin", f"Jellyfin ItemDeleted {item_type or '?'}",
+                                check_links=True, dry_run=dry_run, anciens=[root])
     else:
         # Les chemins ne partagent pas de dossier commun assez profond : on traite
         # chacun séparément plutôt que de risquer un préfixe trop large.
@@ -4585,9 +5106,8 @@ def jellyfin_webhook():
             "  Pas de dossier commun sûr pour %d chemins — traitement individuel",
             len(disparus),
         )
-        moved = sum(
-            move_torrents_for_path(p, source="jellyfin", dry_run=dry_run) for p in disparus
-        )
+        moved = _delete_gesture(list(disparus), "jellyfin", f"Jellyfin ItemDeleted {item_type or '?'}",
+                                check_links=True, dry_run=dry_run)
 
     return jsonify({
         "moved": moved,
@@ -4979,6 +5499,20 @@ def restore_last_cleanup():
                 restored: list[dict[str, str]] = []
                 for cat, cat_torrents in by_cat.items():
                     hashes = "|".join(t["hash"] for t in cat_torrents)
+                    if not cat:
+                        # Torrent de corbeille de la corbeille globale : le retirer sans
+                        # ses fichiers laisse leurs noms en place, comme avant le geste.
+                        try:
+                            rep = s.post(f"{QBIT_URL}/api/v2/torrents/delete", timeout=10,
+                                         data={"hashes": hashes, "deleteFiles": "false"})
+                            rep.raise_for_status()
+                        except requests.RequestException as e:
+                            log.error("  ✗ Retrait des torrents de corbeille impossible : %s", e)
+                            continue
+                        for t in cat_torrents:
+                            log.info("  ↩ Retiré [%s] %s, fichiers gardés", TARGET_CAT, t["name"])
+                            restored.append(t)
+                        continue
                     try:
                         rep = s.post(
                             f"{QBIT_URL}/api/v2/torrents/setCategory",
@@ -5182,6 +5716,26 @@ def history():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/corbeille/history")
+def corbeille_history():
+    """Décisions de la corbeille globale, simulées ou réelles, les plus récentes d'abord."""
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        limit = min(int(request.args.get("limit", 50)), 500)
+    except (ValueError, TypeError):
+        limit = 50
+    with _db_lock:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, source, motif, chemin, dry_run, resume, decision, ancien, "
+                "datetime(at, 'unixepoch') AS at FROM corbeille_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return jsonify([{**dict(r), "decision": json.loads(r["decision"]) if r["decision"] else None} for r in rows])
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
@@ -5231,6 +5785,8 @@ def stats():
 def create_app() -> Flask:
     """Factory pour gunicorn : `gunicorn 'app:create_app()'`."""
     init_db()
+    log.info("Corbeille globale : %s", {"off": "désactivée", "simulation": "en simulation",
+                                       "active": "ACTIVE"}[CORBEILLE_GLOBALE])
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=import_assist_loop, daemon=True).start()
     return app

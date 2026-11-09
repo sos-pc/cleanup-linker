@@ -134,6 +134,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `BACKUP_DIR` | `/config/backups` | Dossier des sauvegardes de la base |
 | `BACKUP_RETENTION` | `5` | Nombre de sauvegardes gardées |
 | `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
+| `CORBEILLE_GLOBALE` | `simulation` | Corbeille globale, voir plus bas. `off` : ancien geste seul. `simulation` : ancien geste, plus le journal de ce que ferait le nouveau. `active` : le nouveau geste remplace l'ancien. Une valeur inconnue vaut `simulation` |
 | `VIDEO_EXTENSIONS` | `.mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v` | Extensions indexées, séparées par des virgules. Le point initial et la casse sont facultatifs. Un fichier d'une autre extension est invisible pour tout le service |
 
 **Sonarr et Radarr**
@@ -533,6 +534,58 @@ Sans ce bornage, tout ce qui est dans la corbeille et figure au journal repartir
 
 cleanup-linker ne vide jamais `cleanuparr-unlinked`. C'est le rôle de cleanuparr, qui supprime selon sa propre logique, par exemple quand la place manque. Sans lui, la corbeille ne fait que grossir : ses torrents seedent, et leurs fichiers occupent toujours le disque.
 
+### La corbeille globale
+
+**Le problème.** Le geste habituel ne passe que par les torrents. Or un fichier de la bibliothèque peut avoir gardé, côté téléchargement, un nom que plus aucun torrent ne liste : le torrent a été retiré de qBittorrent, le fichier est resté. Personne ne retire ce nom, ni l'*arr qui ne connaît que celui de `/data/Media`, ni la corbeille. Supprimer le titre ne libère alors rien. Sur l'installation de référence, 2 580 noms sous fiche sont dans ce cas, soit 3,8 To de données.
+
+**Le geste.** À une vraie suppression ou à un upgrade, chaque fichier touché est jugé d'après ses autres noms :
+
+| Ses autres noms | Décision |
+|---|---|
+| Un nom ailleurs dans `/data/Media` : une autre fiche ou bibliothèque | rien ne part pour ce fichier |
+| Un lien que l'index ne connaît pas : collection, dossier non scanné | rien ne part pour ce fichier |
+| Sinon, un nom tenu par un torrent | le torrent part, si aucune de ses autres vidéos ne sert encore |
+| Sinon, un nom qu'aucun torrent ne tient | il entre dans un torrent de corbeille |
+
+Une autre vidéo d'un torrent sert encore si elle a un nom dans `/data/Media`, un lien inconnu, ou un nom lu par Jellyfin. Un petit fichier lu seulement dans un dossier de téléchargement, de moins d'un quart du plus gros du torrent, est un bonus de la même release : il ne retient pas le torrent. Un torrent sans catégorie n'est jamais touché.
+
+« Tenu par un torrent » se lit dans la liste des fichiers du torrent, jamais dans son dossier : un dossier peut contenir des fichiers qui n'en font pas partie. Les cross-seeds suivent parce qu'ils partagent les mêmes fichiers. Ils ne sont plus cherchés par leur nom, car plusieurs torrents s'appellent `Season 2` sans rien partager.
+
+**Le torrent de corbeille.** Les noms sans torrent d'un même dossier de release entrent dans un torrent ajouté à qBittorrent :
+- il s'appelle `[sans torrent] <dossier>`, porte le tag `sans-torrent`, et va dans la catégorie de la corbeille ;
+- il liste exactement ces fichiers, plus les petits fichiers du dossier (.nfo, .jpg) quand le dossier ne garde aucune autre vidéo ;
+- ses empreintes de pièces sont nulles : il est ajouté sans vérification, donc sans relire les données, même pour un pack de 300 Go. Il est privé, sans tracker, et jamais démarré : il ne parle à personne. Une revérification forcée l'afficherait à 0 %, sans toucher aux fichiers ;
+- s'il est dans un dossier lu par Jellyfin, il est déplacé dans le dossier de la corbeille, comme ATM le fait pour un torrent : le titre disparaît de la bibliothèque. Ce n'est pas le cas si un autre torrent occupe la même place.
+
+Il se vide comme les autres, depuis qBittorrent, torrent et fichiers. Le retirer sans ses fichiers annule le geste, et c'est ce que fait `/restore`. Le service ne supprime toujours aucun fichier.
+
+**Quand.**
+
+| Geste | Décision |
+|---|---|
+| Suppression d'une série ou d'un film, case des fichiers cochée | geste complet |
+| Même suppression, case décochée (`deletedFiles` à `false`) | rien : les fichiers restent, leurs torrents aussi |
+| Suppression d'un épisode ou d'un fichier, fichier disparu signalé par l'*arr | geste sur ce fichier |
+| Upgrade | geste sur l'ancien fichier |
+| Suppression depuis Jellyfin d'un titre sans fiche | geste sur les chemins disparus |
+| Fichier toujours sur le disque (réaffectation) | rien, comme avant |
+
+**Simulation d'abord.** Par défaut, `CORBEILLE_GLOBALE=simulation` : l'ancien geste agit comme avant, et le nouveau journalise ce qu'il ferait, avant lui, puisque l'ancien geste retire de l'index les fichiers qu'il traite. Chaque décision est tracée dans la table `corbeille_log`, avec le nombre de torrents que l'ancien geste a déplacés, et `/corbeille/history` la relit.
+
+```
+INFO   [SIMULATION] 🗑 Corbeille globale (Sonarr SeriesDelete) : 7 fichier(s) touché(s), 6 torrent(s) en corbeille, 1 torrent(s) de corbeille pour 3 nom(s) sans torrent ; 4.4 Go libérés au vidage, sur 4.4 Go
+INFO       → torrent en corbeille : [cross-seed-link] Le College Noir Complainte D'auvergne.S01.TRUEFRENCH.1080p.WEB.x264-FTMVHD
+INFO       → torrent de corbeille : [sans torrent] Le College Noir Complainte D'auvergne.S01.TRUEFRENCH.1080p.WEB.x264-FTMVHD, 3 vidéo(s)
+INFO   [SIMULATION] Corbeille globale (Sonarr SeriesDelete) : l'ancien geste a déplacé 6 torrent(s)
+```
+
+```bash
+# Les 20 dernières décisions de la corbeille globale
+curl -s 'http://192.168.1.111:5001/corbeille/history?token=VOTRE_TOKEN&limit=20' | python3 -m json.tool
+```
+
+`/cleanup`, le filet de la règle 7 et les règles 4, 6 et 7 de l'assistant gardent pour l'instant leur propre geste.
+
 ---
 
 ## L'assistant d'import
@@ -858,7 +911,7 @@ Chaque event Sonarr/Radarr qui porte un `downloadId` marque d'abord le torrent d
 |---|---|---|
 | `EpisodeFileDelete` | Suppression d'un épisode | Corbeille. Ignoré si le fichier est toujours sur le disque : il a été réaffecté (`manualOverride`, règle 5) |
 | `EpisodeFileDelete` deleteReason=upgrade | On Episode File Delete For Upgrade, s'il est coché | Corbeille, avant l'import du nouveau fichier |
-| `SeriesDelete` | Suppression d'une série entière | Corbeille de tous les torrents du dossier |
+| `SeriesDelete` | Suppression d'une série entière | Corbeille de tous les torrents du dossier. Avec `CORBEILLE_GLOBALE=active`, corbeille globale, et rien si `deletedFiles` vaut `false` |
 | `Download` isUpgrade=false | Import (On File Import) | Fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `Download` avec `episodeFiles` | On Import Complete, s'il est coché | Fichiers importés indexés |
@@ -872,7 +925,7 @@ Chaque event Sonarr/Radarr qui porte un `downloadId` marque d'abord le torrent d
 |---|---|---|
 | `MovieFileDelete` | Suppression d'un film | Corbeille. Ignoré si le fichier est toujours sur le disque |
 | `MovieFileDelete` deleteReason=upgrade | On Movie File Delete For Upgrade, s'il est coché | Corbeille, avant l'import du nouveau fichier |
-| `MovieDelete` | Suppression d'un film entier | Corbeille de tous les torrents du dossier |
+| `MovieDelete` | Suppression d'un film entier | Corbeille de tous les torrents du dossier. Avec `CORBEILLE_GLOBALE=active`, corbeille globale, et rien si `deletedFiles` vaut `false` |
 | `Download` isUpgrade=false | Import (On File Import) | Fichier importé indexé tout de suite |
 | `Download` isUpgrade=true | Upgrade (On File Upgrade) | Nouveau fichier indexé, puis chaque `deletedFiles` traité comme une suppression |
 | `Grab` | Release prise (On Grab) | Seulement le marquage `arr_managed` |
@@ -903,6 +956,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `/assist` | POST | `dry_run` | Lance un passage de l'assistant d'import et renvoie ses verdicts. `409` pendant un autre passage |
 | `/assist/history` | GET | `limit` (50, 500 au plus), `rule` | Derniers verdicts de l'assistant, avec la règle qui les a rendus |
 | `/history` | GET | `limit` (50, 500 au plus) | Derniers moves vers la corbeille |
+| `/corbeille/history` | GET | `limit` (50, 500 au plus) | Dernières décisions de la corbeille globale, simulées ou réelles |
 | `/stats` | GET | — | Statistiques de la base |
 | `/health` | GET | — | Healthcheck, sans token |
 
@@ -917,6 +971,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `assist_log` | Les verdicts de l'assistant : téléchargement, *arr, titre, décision, détails, simulation ou non, règle, date |
 | `pack_replace` | Les remplacements de packs de la règle 4 |
 | `dead_race` | Les courses de versions de la règle 6 : original, versions essayées, torrents de la course, dernière tentative |
+| `corbeille_log` | Les décisions de la corbeille globale : source, geste, chemins, simulation ou non, résumé, détail, torrents déplacés par l'ancien geste, date |
 
 ---
 
@@ -943,6 +998,13 @@ La suppression ne déplace alors rien, et le torrent devenu orphelin attend le p
 **`/cleanup` est un balayage aveugle.** Il ne regarde ni les files des *arr, ni l'utilité d'un téléchargement : tout torrent pris par un *arr et sans lien vers la bibliothèque depuis 24 h part en corbeille. Il n'est lancé par aucune tâche.
 
 **La corbeille n'est vidée que par cleanuparr.** Sans lui, elle grossit indéfiniment.
+
+**Corbeille globale : ce qu'elle ne couvre pas.**
+- Un nom caché dans `/data/Media`, sans fiche, comme celui d'un film rangé dans `Media/Films` mais lu par Jellyfin dans `Multimedia/Films` : qBittorrent ne voit que `/data/Multimedia`, et un torrent de corbeille ne peut pas le lister. Le fichier est gardé, et seul un import dans Radarr règle le cas.
+- Un fichier qui n'a que son nom dans `/data/Media` n'a rien à mettre en corbeille : l'*arr ou Jellyfin le suppriment directement.
+- Un upgrade d'épisode ne libère rien tant que son pack sert encore aux autres épisodes : un torrent ne se vide pas à moitié.
+- Si Jellyfin ne répond pas, chaque vidéo d'un dossier de téléchargement compte comme visible. Seul un petit bonus ne retient alors pas son torrent, et un torrent de corbeille n'est pas déplacé.
+- Un lien créé depuis la dernière sync, un cross-seed injecté entre-temps par exemple, est inconnu de l'index : son fichier est gardé.
 
 **Passage d'assistant perdu.** Le passage programmé par un event vit dans le worker gunicorn qui a reçu l'event. Si ce worker redémarre dans les deux minutes, le passage est perdu, et le téléchargement attend le passage de renfort suivant.
 
