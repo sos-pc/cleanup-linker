@@ -133,8 +133,8 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `SYNC_INTERVAL_HOURS` | `12` | Intervalle entre deux syncs |
 | `BACKUP_DIR` | `/config/backups` | Dossier des sauvegardes de la base |
 | `BACKUP_RETENTION` | `5` | Nombre de sauvegardes gardées |
-| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
-| `CORBEILLE_GLOBALE` | `simulation` | Corbeille globale, voir plus bas. `off` : ancien geste seul. `simulation` : ancien geste, plus le journal de ce que ferait le nouveau. `active` : le nouveau geste remplace l'ancien. Une valeur inconnue vaut `simulation` |
+| `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé, ou un fichier dont les liens ont changé, puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
+| `CORBEILLE_GLOBALE` | `simulation` | Corbeille globale, voir plus bas. `off` : ancien geste seul. `simulation` : ancien geste, plus le journal de ce que ferait le nouveau, aux suppressions, aux upgrades et à `/cleanup`. `active` : le nouveau geste remplace l'ancien, `/cleanup` compris. Une valeur inconnue vaut `simulation` |
 | `VIDEO_EXTENSIONS` | `.mkv,.mp4,.avi,.ts,.m2ts,.mov,.wmv,.flv,.iso,.m4v` | Extensions indexées, séparées par des virgules. Le point initial et la casse sont facultatifs. Un fichier d'une autre extension est invisible pour tout le service |
 
 **Sonarr et Radarr**
@@ -489,14 +489,15 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 
 Un torrent peut rester hors de la corbeille alors que plus rien ne s'en sert : webhook raté, suppression avant indexation, ou téléchargement jamais importé. `/cleanup` le rattrape. Il **n'est lancé par aucune tâche** : on l'appelle à la main, de préférence en simulation d'abord (`&dry_run=true`).
 
-Il commence par refuser de tourner si la dernière sync réussie date de plus de deux intervalles, ou si elle a perdu plus de la moitié des lignes. Il relance une sync si la dernière a plus de 2 minutes. Puis :
+Il commence par refuser de tourner si la dernière sync réussie date de plus de deux intervalles, ou si elle a perdu plus de la moitié des lignes. Il relance une sync si la dernière a plus de 2 minutes. Il lit ensuite les files de Sonarr et de Radarr, éléments inconnus compris : si l'une ne répond pas, il s'arrête sans rien déplacer. Puis :
 1. il retient les torrents `arr_managed` qui n'ont aucun fichier dans `/data/Media/` et ne sont pas déjà dans la corbeille ;
 2. il y ajoute leurs **cross-seeds**, qui partagent leurs inodes. Il fait de même pour les cross-seeds des torrents déjà en corbeille, qu'un move précédent a pu laisser derrière. Un voisin qui garde d'autres fichiers dans `/data/Media` reste en place. Sans cette étape, les cross-seeds ne partiraient jamais : ils ne sont pas dans `arr_managed`, puisque c'est cross-seed qui les ajoute ;
 3. il épargne les torrents terminés depuis moins de `CLEANUP_GRACE_HOURS` (24 h), dont l'import est probablement en attente ;
-4. il écarte les dossiers partagés avec un torrent hors du lot, comme le webhook ;
-5. il passe le reste en corbeille.
+4. il épargne aussi les téléchargements encore dans la file d'un *arr, même bloqués depuis des jours : on attend qu'ils soient importés ou retirés ;
+5. il écarte les dossiers partagés avec un torrent hors du lot, comme le webhook ;
+6. il passe le reste en corbeille.
 
-`/cleanup` ne regarde pas les files de Sonarr et de Radarr. Un téléchargement bloqué depuis plus de 24 h, qu'on attend d'importer à la main, part donc en corbeille comme les autres. Il continue d'y seeder, et `/restore` le remet en place.
+Avec la corbeille globale, `/cleanup` juge aussi avec sa règle, au repos : voir [La corbeille globale](#la-corbeille-globale). En simulation, il trace ce qu'elle ferait avant l'ancien balayage, qui agit seul ; active, elle le remplace.
 
 ### Historique et restauration
 
@@ -552,8 +553,9 @@ Une autre vidéo d'un torrent sert encore si elle a un nom dans `/data/Media`, u
 « Tenu par un torrent » se lit dans la liste des fichiers du torrent, jamais dans son dossier : un dossier peut contenir des fichiers qui n'en font pas partie. Les cross-seeds suivent parce qu'ils partagent les mêmes fichiers. Ils ne sont plus cherchés par leur nom, car plusieurs torrents s'appellent `Season 2` sans rien partager.
 
 **Le torrent de corbeille.** Les noms sans torrent d'un même dossier de release entrent dans un torrent ajouté à qBittorrent :
-- il s'appelle `[sans torrent] <dossier>`, porte le tag `sans-torrent`, et va dans la catégorie de la corbeille ;
-- il liste exactement ces fichiers, plus les petits fichiers du dossier (.nfo, .jpg) quand le dossier ne garde aucune autre vidéo ;
+- il s'appelle `[sans torrent] <dossier>`, porte le tag `sans-torrent`, et va dans la catégorie de la corbeille. Si le dossier garde d'autres vidéos, son nom le dit : `[sans torrent] Scissor Seven (24 vidéo(s) sur 58)`. Les 34 autres restent ;
+- il liste exactement ces fichiers, plus les petits fichiers du dossier (.nfo, .jpg, .srt) quand le dossier ne garde aucune autre vidéo. Une vidéo qui part avec son torrent, ou qui est déjà en corbeille, ne retient pas le dossier ;
+- il y en a un par dossier. Un upgrade arrive épisode par épisode : à chaque fois, le nouveau torrent de corbeille reprend le contenu du précédent, qui est retiré sans ses fichiers. Au dernier épisode, le dossier part entier. Un fichier qu'un autre torrent liste n'est jamais repris ;
 - ses empreintes de pièces sont nulles : il est ajouté sans vérification, donc sans relire les données, même pour un pack de 300 Go. Il est privé, sans tracker, et jamais démarré : il ne parle à personne. Une revérification forcée l'afficherait à 0 %, sans toucher aux fichiers ;
 - s'il est dans un dossier lu par Jellyfin, il est déplacé dans le dossier de la corbeille, comme ATM le fait pour un torrent : le titre disparaît de la bibliothèque. Ce n'est pas le cas si un autre torrent occupe la même place.
 
@@ -569,6 +571,30 @@ Il se vide comme les autres, depuis qBittorrent, torrent et fichiers. Le retirer
 | Upgrade | geste sur l'ancien fichier |
 | Suppression depuis Jellyfin d'un titre sans fiche | geste sur les chemins disparus |
 | Fichier toujours sur le disque (réaffectation) | rien, comme avant |
+| `/cleanup` | passage au repos, ci-dessous |
+
+**Au repos, avec `/cleanup`.** Sans geste, le passage cherche ce qu'un geste passé a laissé, par exemple un upgrade fait avant la corbeille globale. Un fichier ne sert plus s'il n'a :
+- aucun nom dans `/data/Media` ;
+- aucun lien que l'index ne connaît pas, comme une collection ;
+- aucun nom lu par Jellyfin ;
+- et s'il n'a pas bougé depuis `CLEANUP_GRACE_HOURS`.
+
+Alors :
+- un torrent part si aucune de ses vidéos ne le retient, comme au geste. Seuls sont regardés ceux qu'un *arr a pris (`arr_managed`) et les cross-seeds, jamais un ajout à la main ;
+- un torrent attend s'il est encore dans la file d'un *arr, s'il a fini depuis moins de 24 h, ou si son téléchargement n'est pas fini (cross-seeds exceptés) ;
+- les noms sans torrent d'un fichier qui ne sert plus entrent dans un torrent de corbeille ;
+- sauf si un torrent qui reste tient encore ce fichier : rien ne se libérerait. Ces noms attendent que ce torrent parte, comme les OAV d'un pack dont les épisodes servent.
+
+Si Jellyfin ne répond pas, le passage ne jette rien : on ne saurait pas ce qu'il montre. Les moves sont tracés avec la source `cleanup`, et `/restore` les défait comme les autres.
+
+```
+INFO   [SIMULATION] 🗑 Corbeille globale (cleanup) : 59 fichier(s) ne servent plus, 1 torrent(s) en corbeille, 4 torrent(s) de corbeille pour 49 nom(s) sans torrent, 4 en attente ; 215.8 Go libérés au vidage, sur 215.8 Go
+INFO       → torrent en corbeille : [cross-seed-link] Dark Season 01
+INFO       → torrent de corbeille : [sans torrent] Scissor Seven (24 vidéo(s) sur 58), 24 vidéo(s)
+INFO       → attend : Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION.mkv : encore dans la file d'un *arr
+INFO       → attend : 24 nom(s) sans torrent : un torrent qui sert encore tient leurs fichiers : rien ne se libérerait
+INFO   [SIMULATION] Corbeille globale (cleanup) : l'ancien /cleanup aurait déplacé 0 torrent(s)
+```
 
 **Simulation d'abord.** Par défaut, `CORBEILLE_GLOBALE=simulation` : l'ancien geste agit comme avant, et le nouveau journalise ce qu'il ferait, avant lui, puisque l'ancien geste retire de l'index les fichiers qu'il traite. Chaque décision est tracée dans la table `corbeille_log`, avec le nombre de torrents que l'ancien geste a déplacés, et `/corbeille/history` la relit.
 
@@ -584,7 +610,7 @@ INFO   [SIMULATION] Corbeille globale (Sonarr SeriesDelete) : l'ancien geste a d
 curl -s 'http://192.168.1.111:5001/corbeille/history?token=VOTRE_TOKEN&limit=20' | python3 -m json.tool
 ```
 
-`/cleanup`, le filet de la règle 7 et les règles 4, 6 et 7 de l'assistant gardent pour l'instant leur propre geste.
+Le filet de la règle 7 et les règles 4, 6 et 7 de l'assistant gardent pour l'instant leur propre geste.
 
 ---
 
@@ -950,7 +976,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `/jellyfin` | POST | `dry_run` | Reçoit les events Jellyfin |
 | `/sync` | POST | — | Force une resync immédiate |
 | `/jellyfin/index` | POST | — | Force la réindexation Jellyfin |
-| `/cleanup` | POST | `dry_run` | Met en corbeille les torrents *arr orphelins |
+| `/cleanup` | POST | `dry_run` | Met en corbeille les torrents *arr orphelins ; avec la corbeille globale, ce qui ne sert plus au repos |
 | `/restore` | POST | `since` (timestamp Unix) | Restaure les torrents du dernier `/cleanup`, ou tout ce qui a été tracé depuis `since` |
 | `/bootstrap` | POST | `dry_run` | Peuple `arr_managed` depuis l'historique des *arr |
 | `/assist` | POST | `dry_run` | Lance un passage de l'assistant d'import et renvoie ses verdicts. `409` pendant un autre passage |
@@ -995,7 +1021,7 @@ La suppression ne déplace alors rien, et le torrent devenu orphelin attend le p
 
 **Emplacement d'un torrent.** Le champ `name` de l'API qBittorrent est un nom d'affichage. Il diffère du dossier réel dès que le `.torrent` porte un titre différent de son contenu, ou qu'un torrent a été renommé (règle 2). C'est `content_path` qui fait foi. Sur l'installation de référence, 308 torrents sur 3269 sont dans ce cas : reconstruire le chemin avec `save_path` et `name` les rendait introuvables, donc non indexés.
 
-**`/cleanup` est un balayage aveugle.** Il ne regarde ni les files des *arr, ni l'utilité d'un téléchargement : tout torrent pris par un *arr et sans lien vers la bibliothèque depuis 24 h part en corbeille. Il n'est lancé par aucune tâche.
+**L'ancien `/cleanup` ne juge pas l'utilité d'un téléchargement.** Tout torrent pris par un *arr, sans lien vers la bibliothèque depuis 24 h et absent des files des *arr, part en corbeille, même si Jellyfin le lit. La corbeille globale au repos juge, elle, chaque vidéo. Aucune tâche ne lance `/cleanup`.
 
 **La corbeille n'est vidée que par cleanuparr.** Sans lui, elle grossit indéfiniment.
 
