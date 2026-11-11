@@ -1815,6 +1815,9 @@ _BONUS_RATIO = 4
 _CORBEILLE_PIECE = 1 << 24
 # Lignes de détail au plus par sorte, dans le journal.
 _CORBEILLE_LOG_MAX = 8
+# Au-delà, un passage au repos qui voit autant de torrents sans plus aucune vidéo
+# soupçonne un disque démonté, et n'en met aucun en corbeille.
+_PERDUS_MAX = 20
 
 
 def _bencode(x: Any) -> bytes:
@@ -2198,6 +2201,10 @@ def _rest_plan(s: requests.Session, lues: set[str], en_file: set[str], geres: se
     Les noms sans torrent d'un fichier qui ne sert plus vont dans un torrent de
     corbeille, sauf si un torrent qui reste tient encore ce fichier : rien ne se
     libérerait, ils attendent que ce torrent parte.
+    Un torrent qui listait des vidéos et n'en a plus aucune sur le disque
+    (`missingFiles`) part aussi, même ajouté à la main : il ne peut plus seeder et il
+    n'y a plus rien à protéger. Pas si son dossier manque (disque démonté), ni si
+    plus de _PERDUS_MAX sont dans ce cas à la fois.
     """
     plan = _plan_vide([])
     plan["repos"] = True
@@ -2233,17 +2240,28 @@ def _rest_plan(s: requests.Session, lues: set[str], en_file: set[str], geres: se
     # 2. Les torrents qu'aucune vidéo ne retient plus.
     partent: set[str] = set()
     a_juger: dict[str, list[tuple[str, os.stat_result]]] = {}
+    perdus: list[str] = []
     for h in sorted(vue.torrents):
         t = vue.torrents[h]
         categorie = vue.categorie(h)
         if not categorie or categorie == TARGET_CAT:
             continue
         cross = _under(torrent_root(t), {_CROSSSEEDS_DIR})
-        if h not in geres and not cross:
-            continue  # un ajout à la main n'est jamais touché au repos
+        disparu = t.get("state") == "missingFiles"
+        # Un ajout à la main n'est jamais touché au repos, sauf s'il n'a plus rien : la garde
+        # est plus bas, une fois ses vidéos lues. Celle-ci évite seulement de lire sa liste.
+        if h not in geres and not cross and not disparu:
+            continue
         fichiers = _videos_de(vue, h)
         if not fichiers:
+            # Plus aucune de ses vidéos sur le disque : rien ne le retient, il ne peut plus
+            # seeder. Un torrent sans vidéo (musique, livres) n'est pas regardé.
+            if (disparu and h not in en_file and os.path.isdir(t.get("save_path") or "")
+                    and any(os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS for p in vue.fichiers_de(h))):
+                perdus.append(h)
             continue
+        if h not in geres and not cross:
+            continue  # il garde des vidéos : un ajout à la main reste hors de portée
         plus_gros = max(st.st_size for _, st in fichiers)
         if any(_video_retient(st, presents_de.get(st.st_ino, set()), lues, plus_gros) for _, st in fichiers):
             continue
@@ -2265,6 +2283,14 @@ def _rest_plan(s: requests.Session, lues: set[str], en_file: set[str], geres: se
         partent.add(h)
         a_juger[h] = fichiers
         plan["torrents"].append({"hash": h, "name": t.get("name"), "category": categorie})
+    if len(perdus) > _PERDUS_MAX:
+        plan["restent"].append({"hash": "", "name": f"{len(perdus)} torrent(s) sans plus aucune vidéo",
+                                "raison": f"plus de {_PERDUS_MAX} à la fois : un disque démonté ? aucun ne part"})
+    else:
+        for h in perdus:
+            partent.add(h)
+            plan["torrents"].append({"hash": h, "name": vue.torrents[h].get("name"), "category": vue.categorie(h),
+                                     "note": "ses vidéos ont disparu du disque"})
 
     # 3. Les fichiers qui ne servent plus et que ce passage libère : leurs noms sans
     #    torrent partent si chaque nom tenu l'est par un torrent qui part ou déjà en corbeille.
@@ -2363,7 +2389,8 @@ def _trash_summary(plan: dict[str, Any]) -> str:
         return f"rien à faire : {plan['refus']}"
     noms = sum(c["videos"] for c in plan["corbeilles"])
     repos = plan.get("repos")
-    morceaux = [f"{plan['touches']} fichier(s) " + ("ne servent plus" if repos else "touché(s)"),
+    morceaux = [f"{plan['touches']} fichier(s) " + ("ne servent plus" if repos else "touché(s)")
+                + f" ({plan['octets'] / 1e9:.1f} Go)",
                 f"{len(plan['torrents'])} torrent(s) en corbeille"]
     if plan["corbeilles"]:
         morceaux.append(f"{len(plan['corbeilles'])} torrent(s) de corbeille pour {noms} nom(s) sans torrent")
@@ -2373,8 +2400,9 @@ def _trash_summary(plan: dict[str, Any]) -> str:
         morceaux.append(f"{len(plan['restent'])} " + ("en attente" if repos else "torrent(s) restent"))
     if plan["gardes"]:
         morceaux.append(f"{sum(plan['gardes'].values())} fichier(s) gardés")
-    resume = (", ".join(morceaux) + f" ; {plan['liberes'] / 1e9:.1f} Go libérés au vidage, "
-              f"sur {plan['octets'] / 1e9:.1f} Go")
+    # Ce que le vidage libère peut dépasser les fichiers touchés : un torrent qui part
+    # emporte aussi ses autres vidéos et ses bonus.
+    resume = ", ".join(morceaux) + f" ; {plan['liberes'] / 1e9:.1f} Go libérés au vidage"
     if plan.get("jellyfin"):
         resume += f" (Jellyfin {plan['jellyfin']})"
     return resume
@@ -2385,8 +2413,8 @@ def _corbeille_record(source: str, motif: str, chemins: list[str], dry_run: bool
     decision = None
     if plan is not None:
         decision = json.dumps({
-            "torrents": [{"name": t.get("name"), "category": t.get("category"), "garde": t.get("garde")}
-                         for t in plan.get("torrents", [])],
+            "torrents": [{"name": t.get("name"), "category": t.get("category"), "garde": t.get("garde"),
+                          "note": t.get("note")} for t in plan.get("torrents", [])],
             "corbeilles": [{"racine": c["racine"], "nom": c.get("nom"), "videos": c["videos"], "autres": c["autres"],
                             "fusion": c.get("fusion", 0),
                             "fichiers": [os.path.relpath(f, c["racine"]) if f != c["racine"] else os.path.basename(f)
@@ -2437,7 +2465,8 @@ def _trash_report(plan: dict[str, Any], source: str, motif: str, chemins: list[s
     resume = _trash_summary(plan)
     log.info("  %s🗑 Corbeille globale (%s) : %s", etiquette, motif, resume)
     for t in plan["torrents"][:_CORBEILLE_LOG_MAX]:
-        log.info("      → torrent en corbeille : [%s] %s%s", t.get("category"), t.get("name"),
+        log.info("      → torrent en corbeille : [%s] %s%s%s", t.get("category"), t.get("name"),
+                 f" ({t['note']})" if t.get("note") else "",
                  f" (laissé en place : {t['garde']})" if t.get("garde") else "")
     for c in plan["corbeilles"][:_CORBEILLE_LOG_MAX]:
         log.info("      → torrent de corbeille : %s, %d vidéo(s)%s%s", c["nom"], c["videos"],
@@ -4393,6 +4422,53 @@ def _sonarr_blocklist(url: str, cle: str, serie_id: int, dl: str) -> bool:
     return False
 
 
+def _pure_crossseeds(s: requests.Session, t: dict[str, Any], tous: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Les torrents dont chaque vidéo est un lien d'une vidéo de `t` : ses cross-seeds, ou la
+    même release prise sur un autre tracker. Ils ne servent à rien de plus que lui. Lus
+    dans les listes de fichiers ; les candidats viennent de l'index et du nom, jamais du
+    nom seul (plusieurs torrents s'appellent « Season 2 » sans rien partager).
+    """
+    def videos(h: str, base: str) -> set[int]:
+        rep = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
+        rep.raise_for_status()
+        inodes: set[int] = set()
+        for f in rep.json() or []:
+            p = os.path.join(base.rstrip("/"), f.get("name") or "")
+            if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS:
+                try:
+                    inodes.add(os.lstat(p).st_ino)
+                except OSError:
+                    continue
+        return inodes
+
+    par_hash = {x["hash"].lower(): x for x in tous}
+    h = t["hash"].lower()
+    moi = par_hash.get(h, t)
+    mes = videos(h, moi.get("save_path") or "")
+    if not mes:
+        return []
+    candidats = {x for x, o in par_hash.items() if o.get("name") == moi.get("name")}
+    liste = sorted(mes)
+    with _db_lock:
+        with get_db() as conn:
+            for i in range(0, len(liste), _SQL_CHUNK):
+                lot = liste[i:i + _SQL_CHUNK]
+                candidats |= {r[0].lower() for r in conn.execute(
+                    f"SELECT DISTINCT torrent_hash FROM files WHERE stale = 0 AND torrent_hash IS NOT NULL "
+                    f"AND inode IN ({','.join('?' * len(lot))})", lot)}
+    candidats.discard(h)
+    out = []
+    for c in sorted(candidats):
+        o = par_hash.get(c)
+        if not o or not o.get("category") or o.get("category") == TARGET_CAT:
+            continue
+        siennes = videos(c, o.get("save_path") or "")
+        if siennes and siennes <= mes:
+            out.append(o)
+    return out
+
+
 def _assist_trash(t: dict[str, Any], arreter: bool = True) -> bool:
     """
     Le torrent part en corbeille, arrêté : un pack partiel à peine entamé, un
@@ -4400,18 +4476,43 @@ def _assist_trash(t: dict[str, Any], arreter: bool = True) -> bool:
     Sauf s'il partage son dossier avec un autre torrent — un pack complet publié
     sous le même nom : ATM emporterait les fichiers de l'autre dans le dossier de
     la corbeille. Il reste alors dans sa catégorie. True s'il est parti.
+
+    Ses cross-seeds aux mêmes fichiers le suivent (_pure_crossseeds) : un média part
+    dans toutes ses versions. Un cross-seed fini continue de seeder dans la corbeille.
+    Si leur recherche échoue, le torrent part seul, comme avant.
     """
+    jumeaux: list[dict[str, Any]] = []
     with qbit_session() as s:
-        partage = _shared_content({t["hash"]}, qbit_get_torrents(s))
+        tous = qbit_get_torrents(s)
+        partage = _shared_content({t["hash"]}, tous)
         actions = [("stop", {"hashes": t["hash"]})] if arreter else []
         if not partage:
             actions.insert(0, ("setCategory", {"hashes": t["hash"], "category": TARGET_CAT}))
         for action, data in actions:
             r = s.post(f"{QBIT_URL}/api/v2/torrents/{action}", data=data, timeout=10)
             r.raise_for_status()
+        if not partage:
+            try:
+                candidats = _pure_crossseeds(s, t, tous)
+            except Exception as e:
+                log.warning("  Cross-seeds de %s non cherchés : %s", t.get("name"), e)
+                candidats = []
+            # Comme pour lui : un cross-seed dont le dossier est celui d'un autre torrent reste.
+            partages = _shared_content({t["hash"]} | {c["hash"] for c in candidats}, tous)
+            jumeaux = [c for c in candidats if c["hash"].lower() not in partages]
+            for c in jumeaux:
+                r = s.post(f"{QBIT_URL}/api/v2/torrents/setCategory", timeout=10,
+                           data={"hashes": c["hash"], "category": TARGET_CAT})
+                r.raise_for_status()
+                if arreter and not _must_seed(c):
+                    r = s.post(f"{QBIT_URL}/api/v2/torrents/stop", data={"hashes": c["hash"]}, timeout=10)
+                    r.raise_for_status()
     if partage:
         return False
     log_move(t["hash"], t.get("name", ""), t.get("category", ""), "assist")
+    for c in jumeaux:
+        log_move(c["hash"], c.get("name", ""), c.get("category", ""), "assist")
+        log.info("    + en corbeille aussi, mêmes fichiers : [%s] %s", c.get("category"), c.get("name"))
     return True
 
 
