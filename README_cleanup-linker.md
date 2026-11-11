@@ -533,7 +533,7 @@ Sans ce bornage, tout ce qui est dans la corbeille et figure au journal repartir
 
 ### Après la corbeille
 
-cleanup-linker ne vide jamais `cleanuparr-unlinked`. C'est le rôle de cleanuparr, qui supprime selon sa propre logique, par exemple quand la place manque. Sans lui, la corbeille ne fait que grossir : ses torrents seedent, et leurs fichiers occupent toujours le disque.
+cleanup-linker ne vide jamais `cleanuparr-unlinked`. On la vide à la main depuis qBittorrent, en supprimant les torrents avec leurs fichiers, ou un outil comme cleanuparr s'en charge selon sa propre logique, par exemple quand la place manque. Sans l'un ni l'autre, la corbeille ne fait que grossir : ses torrents seedent, et leurs fichiers occupent toujours le disque.
 
 ### La corbeille globale
 
@@ -583,12 +583,13 @@ Alors :
 - un torrent part si aucune de ses vidéos ne le retient, comme au geste. Seuls sont regardés ceux qu'un *arr a pris (`arr_managed`) et les cross-seeds, jamais un ajout à la main ;
 - un torrent attend s'il est encore dans la file d'un *arr, s'il a fini depuis moins de 24 h, ou si son téléchargement n'est pas fini (cross-seeds exceptés) ;
 - les noms sans torrent d'un fichier qui ne sert plus entrent dans un torrent de corbeille ;
-- sauf si un torrent qui reste tient encore ce fichier : rien ne se libérerait. Ces noms attendent que ce torrent parte, comme les OAV d'un pack dont les épisodes servent.
+- sauf si un torrent qui reste tient encore ce fichier : rien ne se libérerait. Ces noms attendent que ce torrent parte, comme les OAV d'un pack dont les épisodes servent ;
+- un torrent qui listait des vidéos et n'en a plus aucune sur le disque (`missingFiles`) part aussi, même ajouté à la main : il ne peut plus seeder, et il n'y a plus rien à protéger. Il reste si son dossier manque, ce qui signale un disque démonté, ou si plus de 20 torrents sont dans ce cas à la fois. Un torrent qui garde une partie de ses vidéos est jugé comme les autres : une vidéo que Jellyfin lit le retient.
 
 Si Jellyfin ne répond pas, le passage ne jette rien : on ne saurait pas ce qu'il montre. Les moves sont tracés avec la source `cleanup`, et `/restore` les défait comme les autres.
 
 ```
-INFO   [SIMULATION] 🗑 Corbeille globale (cleanup) : 59 fichier(s) ne servent plus, 1 torrent(s) en corbeille, 4 torrent(s) de corbeille pour 49 nom(s) sans torrent, 4 en attente ; 215.8 Go libérés au vidage, sur 215.8 Go
+INFO   [SIMULATION] 🗑 Corbeille globale (cleanup) : 59 fichier(s) ne servent plus (215.8 Go), 1 torrent(s) en corbeille, 4 torrent(s) de corbeille pour 49 nom(s) sans torrent, 4 en attente ; 215.8 Go libérés au vidage
 INFO       → torrent en corbeille : [cross-seed-link] Dark Season 01
 INFO       → torrent de corbeille : [sans torrent] Scissor Seven (24 vidéo(s) sur 58), 24 vidéo(s)
 INFO       → attend : Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION.mkv : encore dans la file d'un *arr
@@ -599,7 +600,7 @@ INFO   [SIMULATION] Corbeille globale (cleanup) : l'ancien /cleanup aurait dépl
 **Simulation d'abord.** Par défaut, `CORBEILLE_GLOBALE=simulation` : l'ancien geste agit comme avant, et le nouveau journalise ce qu'il ferait, avant lui, puisque l'ancien geste retire de l'index les fichiers qu'il traite. Chaque décision est tracée dans la table `corbeille_log`, avec le nombre de torrents que l'ancien geste a déplacés, et `/corbeille/history` la relit.
 
 ```
-INFO   [SIMULATION] 🗑 Corbeille globale (Sonarr SeriesDelete) : 7 fichier(s) touché(s), 6 torrent(s) en corbeille, 1 torrent(s) de corbeille pour 3 nom(s) sans torrent ; 4.4 Go libérés au vidage, sur 4.4 Go
+INFO   [SIMULATION] 🗑 Corbeille globale (Sonarr SeriesDelete) : 7 fichier(s) touché(s) (4.4 Go), 6 torrent(s) en corbeille, 1 torrent(s) de corbeille pour 3 nom(s) sans torrent ; 4.4 Go libérés au vidage
 INFO       → torrent en corbeille : [cross-seed-link] Le College Noir Complainte D'auvergne.S01.TRUEFRENCH.1080p.WEB.x264-FTMVHD
 INFO       → torrent de corbeille : [sans torrent] Le College Noir Complainte D'auvergne.S01.TRUEFRENCH.1080p.WEB.x264-FTMVHD, 3 vidéo(s)
 INFO   [SIMULATION] Corbeille globale (Sonarr SeriesDelete) : l'ancien geste a déplacé 6 torrent(s)
@@ -610,7 +611,9 @@ INFO   [SIMULATION] Corbeille globale (Sonarr SeriesDelete) : l'ancien geste a d
 curl -s 'http://192.168.1.111:5001/corbeille/history?token=VOTRE_TOKEN&limit=20' | python3 -m json.tool
 ```
 
-Le filet de la règle 7 et les règles 4, 6 et 7 de l'assistant gardent pour l'instant leur propre geste.
+Le résumé donne la taille des fichiers touchés, puis ce que le vidage libérera. Le second chiffre peut être plus grand : un torrent qui part emporte aussi ses autres vidéos et ses bonus.
+
+Les règles 4, 6 et 7 de l'assistant, filet de la règle 7 compris, gardent leur propre geste : le torrent qu'elles écartent part en corbeille. Ses cross-seeds le suivent désormais, c'est-à-dire les torrents dont chaque vidéo est un lien d'une des siennes, y compris la même release prise sur un autre tracker. Ils sont trouvés par l'index et par le nom, puis confirmés par leurs listes de fichiers. Un cross-seed fini continue de seeder dans la corbeille.
 
 ---
 
@@ -1023,7 +1026,7 @@ La suppression ne déplace alors rien, et le torrent devenu orphelin attend le p
 
 **L'ancien `/cleanup` ne juge pas l'utilité d'un téléchargement.** Tout torrent pris par un *arr, sans lien vers la bibliothèque depuis 24 h et absent des files des *arr, part en corbeille, même si Jellyfin le lit. La corbeille globale au repos juge, elle, chaque vidéo. Aucune tâche ne lance `/cleanup`.
 
-**La corbeille n'est vidée que par cleanuparr.** Sans lui, elle grossit indéfiniment.
+**Personne d'autre que vous ne vide la corbeille**, sauf un outil comme cleanuparr. Sans vidage, elle grossit indéfiniment.
 
 **Corbeille globale : ce qu'elle ne couvre pas.**
 - Un nom caché dans `/data/Media`, sans fiche, comme celui d'un film rangé dans `Media/Films` mais lu par Jellyfin dans `Multimedia/Films` : qBittorrent ne voit que `/data/Multimedia`, et un torrent de corbeille ne peut pas le lister. Le fichier est gardé, et seul un import dans Radarr règle le cas.
