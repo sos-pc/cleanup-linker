@@ -95,6 +95,11 @@ IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360"))
 # release désigne à lui seul le même média. Le torrent est renommé avec ce titre,
 # et l'*arr importe lui-même. Simulation propre, dans les mêmes conditions.
 IMPORT_ASSIST_NOM_DRY_RUN = os.getenv("IMPORT_ASSIST_NOM_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+# Règle 2, identité confirmée : quand le titre de la release ne désigne pas le
+# média à lui seul (titre français, mots en plus, titre d'épisode collé, année
+# absente), l'assistant confirme l'identité sans l'identifiant de l'indexeur, puis
+# donne au torrent un nom que l'*arr relit comme ce média. Simulation propre.
+IMPORT_ASSIST_IDENTITE_DRY_RUN = os.getenv("IMPORT_ASSIST_IDENTITE_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 
 # Règle 4 de l'assistant (pack incomplet) : un pack de saison partiel est
 # remplacé par un pack complet, cherché dans Prowlarr. Sa propre simulation,
@@ -129,11 +134,20 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 IMPORT_ASSIST_MORT_DRY_RUN = os.getenv("IMPORT_ASSIST_MORT_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 IMPORT_ASSIST_MORT_JOURS = float(os.getenv("IMPORT_ASSIST_MORT_JOURS", "3"))
 IMPORT_ASSIST_MORT_ESSAIS = int(os.getenv("IMPORT_ASSIST_MORT_ESSAIS", "5"))
+# Un torrent qui n'a jamais rien reçu ni jamais vu de copie complète depuis son
+# ajout est mort-né : la course commence après ce nombre d'heures, sans attendre
+# IMPORT_ASSIST_MORT_JOURS. Simulation propre.
+IMPORT_ASSIST_MORT_JAMAIS_HEURES = float(os.getenv("IMPORT_ASSIST_MORT_JAMAIS_HEURES", "12"))
+IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN = os.getenv("IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 
 # Règle 7 de l'assistant (téléchargement inutile) : un téléchargement bloqué qui
 # n'apporterait rien, la bibliothèque ayant déjà mieux, sort de la file sans
 # blacklist et part en corbeille, où il continue de seeder. Simulation propre.
 IMPORT_ASSIST_INUTILE_DRY_RUN = os.getenv("IMPORT_ASSIST_INUTILE_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+# Règle 7, release piégée : un torrent sans aucune vidéo, avec un exécutable ou un
+# script. Le grab du même nom est marqué échoué dans l'*arr (liste noire, nouvelle
+# recherche), et le torrent part en corbeille, arrêté. Simulation propre.
+IMPORT_ASSIST_PIEGE_DRY_RUN = os.getenv("IMPORT_ASSIST_PIEGE_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 
 CROSSSEED_DB = os.getenv("CROSSSEED_DB", "/config/crossseed/cross-seed.db")
 
@@ -2681,9 +2695,11 @@ def _assist_modes() -> str:
     r4 = (mode(IMPORT_ASSIST_PACK_DRY_RUN) if sonarr and PROWLARR_URL and PROWLARR_API_KEY
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
-    return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)}, "
-            f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)}, "
-            f"{_regle(7)} {mode(IMPORT_ASSIST_INUTILE_DRY_RUN)}")
+    return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)} "
+            f"(identité confirmée {mode(IMPORT_ASSIST_IDENTITE_DRY_RUN)}), "
+            f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)} "
+            f"(mort-nés après {IMPORT_ASSIST_MORT_JAMAIS_HEURES:g} h {mode(IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN)}), "
+            f"{_regle(7)} {mode(IMPORT_ASSIST_INUTILE_DRY_RUN)} (releases piégées {mode(IMPORT_ASSIST_PIEGE_DRY_RUN)})")
 
 
 @contextmanager
@@ -3085,6 +3101,10 @@ def _assist_download(
     if videos is None:
         return ecarte("données du torrent introuvables sur le disque")
     if not videos:
+        # Règle 7 : sans vidéo, un exécutable ou un script fait une release piégée.
+        pieges = [n for n in _suspects(dl) if os.path.splitext(n)[1].lower() in _PIEGE_EXTENSIONS]
+        if pieges:
+            return _trapped(arr, url, cle, dl, records, t, ctx, verdict, pieges)
         return ecarte("aucune vidéo dans le torrent")
     lies = 0
     for v in videos:
@@ -3263,12 +3283,15 @@ def import_assist_loop() -> None:
 _NOM_BLOCAGE = re.compile(r"matched to (movie|series) by id", re.IGNORECASE)
 # Exécutables, scripts, raccourcis et archives : une fausse release les glisse à
 # côté d'une vidéo leurre. Sonarr et Radarr ne les signalent que si rien d'autre
-# n'est importé ; renommer un tel torrent ferait importer le leurre.
-_NOM_SUSPECTS = {
+# n'est importé ; renommer un tel torrent ferait importer le leurre. Sans aucune
+# vidéo, un exécutable fait une release piégée (règle 7) ; une archive seule non :
+# une release de scène peut être en RAR.
+_PIEGE_EXTENSIONS = frozenset({
     ".exe", ".msi", ".bat", ".cmd", ".com", ".sh", ".ps1", ".scr", ".pif", ".lnk", ".url", ".vbs", ".vbe",
     ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar", ".dll", ".cpl", ".reg", ".apk",
-    ".zip", ".zipx", ".rar", ".r00", ".7z", ".arj", ".lzh", ".gz", ".bz2", ".tar", ".tgz",
-}
+})
+_ARCHIVE_EXTENSIONS = frozenset({".zip", ".zipx", ".rar", ".r00", ".7z", ".arj", ".lzh", ".gz", ".bz2", ".tar", ".tgz"})
+_NOM_SUSPECTS = _PIEGE_EXTENSIONS | _ARCHIVE_EXTENSIONS
 # L'*arr relit le nom du torrent à son rafraîchissement suivant, chaque minute :
 # passé ce délai, le renommage n'a pas suffi.
 _NOM_DELAI = 600
@@ -3293,11 +3316,229 @@ def _suspects(dl: str) -> list[str]:
     return [os.path.basename(n) for n in noms if os.path.splitext(n)[1].lower() in _NOM_SUSPECTS]
 
 
+# ── Assistant d'import, règle 2 : identité confirmée ────────────────────────
+#
+# Sonarr et Radarr n'importent seuls un téléchargement rattaché à son média par
+# l'identifiant de l'indexeur que si son nom redonne, après leur normalisation,
+# exactement un titre qu'ils connaissent. Le moindre écart bloque : « N.A » lu
+# comme un sigle quand le titre dit « n'a », « Film 14 » en plus, le titre de
+# l'épisode collé à celui de la série, une série enregistrée avec son année. Dans
+# tous les cas relevés, l'identifiant était juste. L'assistant confirme alors
+# l'identité sans lui : tous les mots utiles d'un titre connu du média (de l'*arr,
+# ou de Seerr en français et en anglais), dans l'ordre, dans la partie titre du
+# nom ; l'année du nom, s'il en porte une, à un an près ; des vidéos d'une taille
+# plausible pour leur qualité. Le nom est refait : sa partie titre devient le
+# titre de l'*arr, le reste (année, numérotation, qualité, langue, groupe) ne
+# bouge pas. L'*arr relit ce nom avant tout renommage : il doit y voir le même
+# média, la même qualité et les épisodes de la file. Il importe ensuite lui-même,
+# avec tous ses contrôles.
+
+# Articles et liaisons : ils varient d'une langue ou d'une release à l'autre.
+_ID_VIDES = frozenset({"le", "la", "les", "un", "une", "des", "de", "du", "et", "au", "aux", "en",
+                       "the", "an", "of", "and", "or", "on", "to", "in"})
+# Ce qui suit la partie titre d'un nom de release : année, numérotation, qualité, source, langue.
+_ID_SUITE = re.compile(
+    r"^(19\d\d|20\d\d|s\d{1,2}(e\d{1,3})*|e\d{1,3}|saison|season|integrale|complete|\d{3,4}p|web|webrip|webdl|"
+    r"bluray|bdrip|brrip|hdtv|dvdrip|remux|x264|x265|h264|h265|hevc|avc|multi|french|truefrench|vff|vfq|vf2|"
+    r"vostfr|subfrench|vo|dual|amzn|nf|dsnp|hmax|cr)$")
+_ID_NUMERO = re.compile(r"(?<![a-z0-9])(s\d{1,2}(e\d{1,3})*|\d{1,2}x\d{2,3})(?![a-z0-9])", re.IGNORECASE)
+_ID_ANNEE_OU_NUMERO = re.compile(r"(?<![a-z0-9])((19|20)\d\d|s\d{1,2}(e\d{1,3})*)(?![a-z0-9])", re.IGNORECASE)
+# Source de chaque qualité *arr, ajoutée au nom refait si l'*arr y lisait une autre qualité.
+_ID_SOURCES = (("remux", "BluRay Remux"), ("bluray", "BluRay"), ("webdl", "WEB-DL"), ("webrip", "WEBRip"),
+               ("hdtv", "HDTV"), ("dvd", "DVDRip"))
+
+
+def _id_mots(texte: str) -> list[str]:
+    """Mots d'un texte, en minuscules, sans accents ni ponctuation."""
+    s = unicodedata.normalize("NFKD", texte or "").encode("ascii", "ignore").decode().lower()
+    return re.findall(r"[a-z0-9]+", s)
+
+
+def _id_utiles(mots: list[str]) -> list[str]:
+    """Les mots qui distinguent un titre : les nombres, et les mots de deux lettres ou plus hors articles."""
+    return [m for m in mots if m.isdigit() or (len(m) > 1 and m not in _ID_VIDES)]
+
+
+def _id_zone(nom: str) -> list[str]:
+    """Mots de la partie titre d'un nom de release : ce qui précède l'année, la numérotation ou la qualité."""
+    mots = _id_mots(nom)
+    for i, m in enumerate(mots):
+        if i and _ID_SUITE.match(m):
+            return mots[:i]
+    return mots
+
+
+def _id_dans_l_ordre(cherches: list[str], mots: list[str]) -> bool:
+    reste = iter(mots)
+    return all(any(c == m for m in reste) for c in cherches)
+
+
+def _id_annees(nom: str) -> list[int]:
+    return [int(a) for a in re.findall(r"(?<!\d)(19\d\d|20\d\d)(?!\d)", nom or "")]
+
+
+def _id_titre_reconnu(nom: str, titres: list[str], annee: int | None) -> str | None:
+    """
+    Le titre connu dont tous les mots utiles sont, dans l'ordre, dans la partie titre
+    du nom ; None sinon. L'année du nom, s'il en porte une, doit être celle du média
+    à un an près. Un titre d'un seul mot utile exige cette année dans le nom.
+    """
+    annees = _id_annees(nom)
+    if annees and annee and not any(abs(a - annee) <= 1 for a in annees):
+        return None
+    zone = _id_utiles(_id_zone(nom))
+    for t in titres:
+        cherches = _id_utiles(_id_mots(re.sub(r"\(\d{4}\)", " ", t or "")))
+        if not cherches or (len(cherches) == 1 and not annees):
+            continue
+        if _id_dans_l_ordre(cherches, zone):
+            return t
+    return None
+
+
+def _id_nom_refait(nom: str, titre_arr: str, annee: int | None = None, code: str = "") -> str:
+    """
+    Le nom de release dont la partie titre devient le titre de l'*arr ; le reste est
+    gardé tel quel. Pour un film, `annee` est ajoutée si le reste ne commence pas par
+    une année ; pour une série, `code` (S01, S01E02) si le nom n'a pas de numérotation.
+    """
+    base, ext = os.path.splitext(nom or "")
+    origine = base if ext.lower() in VIDEO_EXTENSIONS else (nom or "")
+    debut = next((m.start() for i, m in enumerate(re.finditer(r"[^\W_]+", origine))
+                  if i and _ID_SUITE.match((_id_mots(m.group()) or [""])[0])), len(origine))
+    reste = origine[debut:]
+    if annee and not re.match(r"(19|20)\d\d", reste):
+        reste = f"{annee} {reste}"
+    if code and not _ID_NUMERO.search(reste):
+        reste = f"{code} {reste}"
+    titre = re.sub(r"[:/\\]", " ", re.sub(r"\((\d{4})\)", r"\1", titre_arr or ""))
+    return re.sub(r"\s+", " ", f"{titre} {reste}").strip()
+
+
+def _id_avec_source(nom_refait: str, qualite: str) -> str | None:
+    """Le nom refait, avec la source de `qualite` juste après l'année ou la numérotation ; None si elle est inconnue."""
+    q = (qualite or "").lower().replace("-", "")
+    source = next((s for cle_q, s in _ID_SOURCES if cle_q in q), None)
+    if not source:
+        return None
+    m = _ID_ANNEE_OU_NUMERO.search(nom_refait)
+    if not m:
+        return f"{nom_refait} {source}"
+    return f"{nom_refait[:m.end()]} {source}{nom_refait[m.end():]}"
+
+
+def _id_titres(arr: str, media: dict[str, Any], ctx: dict[str, Any]) -> list[str]:
+    """Titres connus du média : ceux de l'*arr, puis ceux de Seerr (TMDB) en français et en anglais."""
+    titres = [media.get("title"), media.get("originalTitle")]
+    titres += [a.get("title") for a in media.get("alternateTitles") or []]
+    tmdb = media.get("tmdbId")
+    if tmdb and SEERR_URL and SEERR_API_KEY:
+        cache = ctx.setdefault("titres_seerr", {})
+        if (arr, tmdb) not in cache:
+            trouves: list[str] = []
+            for langue in ("fr", "en"):
+                try:
+                    info = _seerr_get(f"{'movie' if arr == 'radarr' else 'tv'}/{tmdb}", language=langue) or {}
+                except Exception as e:
+                    log.warning("  Titres Seerr de %s illisibles (%s)", media.get("title"), e)
+                    continue
+                trouves += [info.get("title") or info.get("name"), info.get("originalTitle") or info.get("originalName")]
+            cache[(arr, tmdb)] = trouves
+        titres += cache[(arr, tmdb)]
+    return list(dict.fromkeys(t for t in titres if t))
+
+
+def _id_minimum(url: str, cle: str, qualite: str, ctx: dict[str, Any]) -> float:
+    """Taille minimale de cette qualité dans l'*arr, en Mo par minute ; 0 si elle n'en a pas."""
+    cache = ctx.setdefault("qualites", {})
+    if url not in cache:
+        cache[url] = {d["quality"]["name"]: d.get("minSize") or 0
+                      for d in _arr_request("GET", url, cle, "qualitydefinition") or [] if d.get("quality")}
+    return float(cache[url].get(qualite) or 0)
+
+
+def _id_taille(videos: list[str]) -> int:
+    total = 0
+    for v in videos:
+        try:
+            total += os.path.getsize(v)
+        except OSError:
+            continue
+    return total
+
+
+def _id_code(url: str, cle: str, serie_id: int, records: list[dict[str, Any]]) -> str:
+    """S01, ou S01E02 pour un seul épisode : la numérotation des épisodes de la file."""
+    voulus = {r.get("episodeId") for r in records if r.get("episodeId")}
+    eps = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": serie_id}) or []
+           if e.get("id") in voulus]
+    saisons = {e.get("seasonNumber") for e in eps}
+    if len(saisons) != 1:
+        return ""
+    s = saisons.pop()
+    return f"S{s:02d}E{eps[0]['episodeNumber']:02d}" if len(eps) == 1 else f"S{s:02d}"
+
+
+def _id_confirmee(
+    arr: str, url: str, cle: str, media_id: int, records: list[dict[str, Any]], t: dict[str, Any],
+    release: str, ctx: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]] | str:
+    """
+    Identité confirmée (voir plus haut) : (nom refait, preuve, lecture de ce nom par
+    l'*arr), ou la raison pour laquelle l'identité reste à vérifier à la main.
+    """
+    media = _arr_request("GET", url, cle, f"{'movie' if arr == 'radarr' else 'series'}/{media_id}") or {}
+    annee = media.get("year") or None
+    titres = _id_titres(arr, media, ctx)
+    nom, reconnu = next(((n, r) for n in dict.fromkeys(x for x in (t.get("name") or "", release) if x)
+                         for r in [_id_titre_reconnu(n, titres, annee)] if r), ("", None))
+    if not reconnu:
+        return (f"aucun titre connu de {media.get('title')} dans le nom, à la bonne année : seul l'identifiant "
+                "de l'indexeur relie ce téléchargement au média")
+    videos = _torrent_videos(t) or []
+    if not videos:
+        return "aucune vidéo dans le torrent"
+    info = "parsedMovieInfo" if arr == "radarr" else "parsedEpisodeInfo"
+    lu = _arr_request("GET", url, cle, "parse", params={"title": nom}) or {}
+    qualite = (((lu.get(info) or {}).get("quality") or {}).get("quality") or {}).get("name") or ""
+    duree = (media.get("runtime") or 0) * (max(1, len(records)) if arr == "sonarr" else 1)
+    if duree and qualite:
+        mini = _id_minimum(url, cle, qualite, ctx)
+        par_minute = _id_taille(videos) / 1e6 / duree
+        if mini and par_minute < mini:
+            return (f"vidéos trop petites pour du {qualite} : {par_minute:.1f} Mo par minute attendue, "
+                    f"{arr.capitalize()} en demande au moins {mini:g}")
+    code = _id_code(url, cle, media_id, records) if arr == "sonarr" and not _ID_NUMERO.search(nom) else ""
+    refait = _id_nom_refait(nom, media.get("title") or "", annee if arr == "radarr" else None, code)
+    attendus = {r.get("episodeId") for r in records if r.get("episodeId")}
+    raison = ""
+    for essai in dict.fromkeys(x for x in (refait, _id_avec_source(refait, qualite)) if x):
+        p = _arr_request("GET", url, cle, "parse", params={"title": essai}) or {}
+        cible = p.get("movie" if arr == "radarr" else "series") or {}
+        lue = (((p.get(info) or {}).get("quality") or {}).get("quality") or {}).get("name") or ""
+        if cible.get("id") != media_id:
+            raison = f"{arr.capitalize()} ne relit pas le nom refait « {essai} » comme {media.get('title')}"
+        elif arr == "sonarr" and not attendus <= {e.get("id") for e in p.get("episodes") or []}:
+            raison = f"le nom refait « {essai} » ne couvre pas les épisodes de la file"
+        elif lue != qualite:
+            raison = f"le nom refait « {essai} » changerait la qualité lue ({qualite} → {lue})"
+        else:
+            an = _id_annees(nom)
+            preuve = f"identité confirmée, « {reconnu} » dans « {nom} »" + (f", année {an[-1]}" if an else "")
+            return essai, preuve, p
+    return raison
+
+
 def _misnamed(
     arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
     media_id: int, ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any,
 ) -> tuple[dict[str, Any], bool]:
-    """Règle 2 sur un téléchargement bloqué « matched by ID », dont rien n'est dans la bibliothèque."""
+    """
+    Règle 2 sur un téléchargement bloqué « matched by ID », dont rien n'est dans la
+    bibliothèque. Le torrent prend le titre de la release, s'il désigne à lui seul ce
+    média ; sinon un nom refait, si l'identité est confirmée (_id_confirmee), sous
+    l'interrupteur de simulation de l'identité confirmée.
+    """
     dry = ctx["apercu"] or IMPORT_ASSIST_NOM_DRY_RUN
     titre = records[0].get("title") or dl
 
@@ -3316,29 +3557,46 @@ def _misnamed(
     if not grabs:
         return ecarte("aucun grab dans l'historique : rien ne prouve le média", 2, dry)
     release = max(grabs, key=lambda g: g.get("date") or "")["sourceTitle"]
-
-    if _sans_extension(release) == _sans_extension(t.get("name") or ""):
-        renomme = _assist_last(dl, "rename", False)
-        if renomme is None:
-            return ecarte("le nom du torrent est déjà le titre de la release : seul l'identifiant "
-                          "de l'indexeur relie ce téléchargement au média", 2, dry)
-        if time.time() - renomme < _NOM_DELAI:
-            verdict.update(decision="rename-pending", reason="renommé à l'instant, pas encore relu par l'*arr")
-            return verdict, False
-        return signaler("rename-blocked", f"renommé {release}, mais {arr.capitalize()} le bloque toujours : "
-                                          "import à faire à la main")
+    nom_actuel = t.get("name") or ""
+    renomme = _assist_last(dl, "rename", False)
 
     suspects = _suspects(dl)
     if suspects:
         return signaler("rename-suspect", f"{', '.join(suspects[:3])} dans le torrent : release suspecte, "
                                           "rien n'est renommé")
 
-    # Le titre de la release doit désigner ce média sans l'aide de l'identifiant.
-    p = _arr_request("GET", url, cle, "parse", params={"title": release}) or {}
+    # Le nom à donner : le titre de la release, s'il désigne ce média sans l'aide de
+    # l'identifiant ; sinon un nom refait, une fois l'identité confirmée sans lui.
+    cible_nom, p, preuve = "", {}, ""
+    if _sans_extension(release) != _sans_extension(nom_actuel):
+        lu = _arr_request("GET", url, cle, "parse", params={"title": release}) or {}
+        autre = lu.get("movie" if arr == "radarr" else "series") or {}
+        if autre.get("id") == media_id:
+            cible_nom, p = release, lu
+        elif autre:
+            return ecarte(f"le titre de la release désigne un autre média ({autre.get('title')})", 2, dry)
+    elif renomme is not None:
+        cible_nom = release  # déjà renommé avec le titre de la release : en attente, ou bloqué malgré tout
+    if not cible_nom:
+        confirme = _id_confirmee(arr, url, cle, media_id, records, t, release, ctx)
+        if isinstance(confirme, str):
+            return ecarte(confirme, 2, dry)
+        cible_nom, preuve, p = confirme
+        dry = dry or IMPORT_ASSIST_IDENTITE_DRY_RUN
+        # Tant que l'identité confirmée est en simulation, rien de ce qui en découle n'agit.
+        if IMPORT_ASSIST_IDENTITE_DRY_RUN:
+            ctx = dict(ctx, apercu=True)
+
+    if _sans_extension(cible_nom) == _sans_extension(nom_actuel):
+        if renomme is None:
+            return ecarte(f"le torrent porte déjà le nom « {cible_nom} », que {arr.capitalize()} bloque pourtant", 2, dry)
+        if time.time() - renomme < _NOM_DELAI:
+            verdict.update(decision="rename-pending", reason="renommé à l'instant, pas encore relu par l'*arr")
+            return verdict, False
+        return signaler("rename-blocked", f"renommé {cible_nom}, mais {arr.capitalize()} le bloque toujours : "
+                                          "import à faire à la main")
+
     cible = p.get("movie" if arr == "radarr" else "series") or {}
-    if cible.get("id") != media_id:
-        autre = f" ({cible.get('title')})" if cible else ""
-        return ecarte(f"le titre de la release ne désigne pas ce média à lui seul{autre}", 2, dry)
     if arr == "sonarr":
         attendus = {r["episodeId"] for r in records if r.get("episodeId")}
         if not attendus <= {e.get("id") for e in p.get("episodes") or []}:
@@ -3363,15 +3621,16 @@ def _misnamed(
                                          "renommer ne suffirait plus, import manuel à faire")
 
     nom = f"{cible.get('title')} ({cible.get('year')})" if arr == "radarr" else cible.get("title")
-    details = f"le titre de la release désigne bien {nom} : torrent renommé {release} → {arr.capitalize()} l'importera seul"
-    verdict.update(decision="rename", reason=details, release=release)
+    preuve = preuve or f"le titre de la release désigne bien {nom}"
+    details = f"{preuve} : torrent renommé {cible_nom} → {arr.capitalize()} l'importera seul"
+    verdict.update(decision="rename", reason=details, release=cible_nom)
     if _assist_seen(dl, "rename", dry):
         return verdict, False
     if not dry:
         try:
-            _qbit_post("rename", {"hash": dl, "name": release})
+            _qbit_post("rename", {"hash": dl, "name": cible_nom})
         except Exception as e:
-            return signaler("rename-failed", f"renommage en {release} impossible ({e}) : import à faire à la main")
+            return signaler("rename-failed", f"renommage en {cible_nom} impossible ({e}) : import à faire à la main")
     _assist_record(dl, arr, titre, "rename", details, dry, 2)
     _assist_log(2, "✓", arr, titre, details, dry)
     return verdict, True
@@ -3497,6 +3756,69 @@ def _useless(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]
             verdict["reason"] = details
     _assist_record(dl, arr, titre, "useless", details, dry, 7)
     _assist_log(7, "✓", arr, titre, details, dry)
+    return verdict, True
+
+
+# Une release piégée n'a souvent aucun grab à son identifiant : le hash annoncé par
+# l'indexeur n'est pas celui du torrent reçu. Son grab se retrouve alors à son nom,
+# parmi les prises récentes du média dont le hash n'est celui d'aucun torrent.
+_PIEGE_JOURS = 14
+
+
+def _trap_grab(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+               ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Le grab de cette release, par son identifiant, sinon par son nom (voir plus haut) ; None s'il est introuvable."""
+    rep = _arr_request("GET", url, cle, "history", params={"downloadId": dl.upper(), "pageSize": 50}) or {}
+    grabs = [g for g in rep.get("records") or [] if g.get("eventType") == "grabbed"]
+    if not grabs:
+        route, cle_media = ("history/movie", "movieId") if arr == "radarr" else ("history/series", "seriesId")
+        media = records[0].get(cle_media)
+        if not media:
+            return None
+        depuis = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - _PIEGE_JOURS * 86400))
+        grabs = [g for g in _arr_request("GET", url, cle, route, params={cle_media: media}) or []
+                 if g.get("eventType") == "grabbed" and (g.get("date") or "") >= depuis
+                 and _nom_compact(g.get("sourceTitle") or "") == _nom_compact(t.get("name") or "")
+                 and (g.get("downloadId") or "").lower() not in ctx["torrents"]]
+    return max(grabs, key=lambda g: g.get("date") or "") if grabs else None
+
+
+def _nom_compact(nom: str) -> str:
+    """Un nom de release sans extension, ponctuation, espaces ni accents : « DDP5 1 » et « DDP 5.1 » se valent."""
+    base, ext = os.path.splitext(nom)
+    return "".join(_id_mots(base if ext.lower() in VIDEO_EXTENSIONS | _NOM_SUSPECTS else nom))
+
+
+def _trapped(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+             ctx: dict[str, Any], verdict: dict[str, Any], pieges: list[str]) -> tuple[dict[str, Any], bool]:
+    """
+    Règle 7, release piégée : aucune vidéo, mais un exécutable ou un script. Le
+    réglage « Fail Downloads » de l'*arr ne s'applique pas quand il ne relie pas le
+    téléchargement à son grab. Le grab est marqué échoué dans l'*arr (liste noire,
+    nouvelle recherche s'il est réglé pour), et le torrent part en corbeille, arrêté.
+    Rien n'est supprimé : les fichiers partent au vidage de la corbeille.
+    """
+    dry = ctx["apercu"] or IMPORT_ASSIST_PIEGE_DRY_RUN
+    titre = records[0].get("title") or dl
+    grab = _trap_grab(arr, url, cle, dl, records, t, ctx)
+    if grab:
+        geste = (f"grab ({(grab.get('data') or {}).get('indexer') or 'indexeur inconnu'}) marqué échoué dans "
+                 f"{arr.capitalize()}, qui met la release en liste noire")
+    else:
+        geste = f"aucun grab de ce nom dans {arr.capitalize()} pour la liste noire"
+    constat = f"{', '.join(pieges[:3])} et aucune vidéo : release piégée"
+    details = f"{constat} → {geste}, torrent arrêté et mis en corbeille"
+    verdict.update(decision="trap", reason=details)
+    if _assist_seen(dl, "trap", dry):
+        return verdict, False
+    if not dry:
+        if grab:
+            _arr_request("POST", url, cle, f"history/failed/{grab['id']}", retries=0)
+        if not _assist_trash(t, arreter=True):
+            details = f"{constat} → {geste} ; torrent arrêté, laissé dans sa catégorie : son dossier est aussi celui d'un autre torrent"
+            verdict["reason"] = details
+    _assist_record(dl, arr, titre, "trap", details, dry, 7)
+    _assist_log(7, "⚠", arr, titre, details, dry)
     return verdict, True
 
 
@@ -4872,6 +5194,25 @@ def _dead_since(t: dict[str, Any] | None, maintenant: float) -> float | None:
     return maintenant - max(t.get("last_activity") or 0, t["added_on"])
 
 
+def _never_started(t: dict[str, Any] | None) -> bool:
+    """Rien reçu depuis son ajout, et aucune copie complète jamais vue : un torrent mort-né."""
+    return bool(t) and not (t.get("downloaded") or 0) and not (t.get("completed") or 0) \
+        and (t.get("seen_complete") or 0) <= 0
+
+
+def _dead_threshold(t: dict[str, Any] | None, court: bool) -> float:
+    """Inactivité au-delà de laquelle ce torrent est mort : IMPORT_ASSIST_MORT_JAMAIS_HEURES pour un mort-né si `court`."""
+    jours = IMPORT_ASSIST_MORT_JOURS * 86400
+    return min(jours, IMPORT_ASSIST_MORT_JAMAIS_HEURES * 3600) if court and _never_started(t) else jours
+
+
+def _dead_desc(t: dict[str, Any] | None, inactif: float) -> str:
+    if not _never_started(t):
+        return f"plus rien reçu depuis {inactif / 86400:.0f} j"
+    duree = f"{inactif / 3600:.0f} h" if inactif < 2 * 86400 else f"{inactif / 86400:.0f} j"
+    return f"rien reçu depuis son ajout il y a {duree}, aucune copie complète jamais vue"
+
+
 def _must_seed(t: dict[str, Any]) -> bool:
     """Un torrent fini, ou un privé entamé (hit-and-run), continue de seeder dans la corbeille."""
     progres = t.get("progress") or 0
@@ -4923,14 +5264,18 @@ def run_dead_downloads(
                 log.error("  ⚠ [%s] [%s] course %s en erreur (%s)", _regle(6), course["arr"], course["original"], e)
 
     # 2. Les téléchargements morts : une course commence, ou repart avec la version
-    #    suivante quand tous ses téléchargements sont morts depuis une période.
+    #    suivante quand tous ses téléchargements sont morts depuis une période. Un
+    #    mort-né est jugé après IMPORT_ASSIST_MORT_JAMAIS_HEURES, sous sa propre
+    #    simulation tant qu'il n'a pas atteint IMPORT_ASSIST_MORT_JOURS.
+    court_actif = not IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN
     courses = _races()
     files = {arr: par_dl for arr, _, _, par_dl in en_cours}
     morts = []
     for arr, url, cle, par_dl in en_cours:
         for dl, records in par_dl.items():
-            inactif = _dead_since(ctx["torrents"].get(dl), maintenant)
-            if inactif is not None and inactif >= seuil and dl not in sortis:
+            t = ctx["torrents"].get(dl)
+            inactif = _dead_since(t, maintenant)
+            if inactif is not None and inactif >= _dead_threshold(t, True) and dl not in sortis:
                 morts.append((inactif, arr, url, cle, dl, records))
     morts.sort(key=lambda m: -m[0])
     vues: set[int] = set()
@@ -4941,15 +5286,21 @@ def run_dead_downloads(
             if course["id"] in vues:
                 continue
             vues.add(course["id"])
-            inactifs = [_dead_since(ctx["torrents"][h], maintenant) for h in json.loads(course["hashes"])
-                        if h in ctx["torrents"]]
-            if any(d is None or d < seuil for d in inactifs) or maintenant - (course["last_try"] or 0) < seuil:
+            presents = [ctx["torrents"][h] for h in json.loads(course["hashes"]) if h in ctx["torrents"]]
+            inactifs = [_dead_since(x, maintenant) for x in presents]
+            seuil_course = max(_dead_threshold(x, court_actif) for x in presents)
+            if any(d is None or d < _dead_threshold(x, court_actif) for x, d in zip(presents, inactifs, strict=True)) \
+                    or maintenant - (course["last_try"] or 0) < seuil_course:
                 continue
             inactif = min(inactifs)
             if course["original"] in files[arr]:
                 # La course se poursuit au nom de l'original, dont le titre est alors exclu.
                 dl, records = course["original"], files[arr][course["original"]]
-        if _assist_recent(dl, ("dead-race", "dead-wait"), dry, seuil) or _assist_seen(dl, "dead-error", dry):
+        # Un mort-né pas encore mort depuis IMPORT_ASSIST_MORT_JOURS : délai court, simulation propre.
+        court = inactif < seuil
+        seuil_dl = _dead_threshold(ctx["torrents"].get(dl), True) if court else seuil
+        dry_dl = dry or (court and IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN)
+        if _assist_recent(dl, ("dead-race", "dead-wait"), dry_dl, seuil_dl) or _assist_seen(dl, "dead-error", dry_dl):
             continue  # déjà cherché il y a moins d'une période, ou en erreur il y a moins de 24 h
         # Une course qui a épuisé ses essais ne cherche plus : elle ne prend pas de place.
         cherche = course is None or len(json.loads(course["tried"])) < IMPORT_ASSIST_MORT_ESSAIS
@@ -4958,12 +5309,14 @@ def run_dead_downloads(
             continue
         lancees += cherche
         try:
-            noter(*_race_try(arr, url, cle, dl, records, course, inactif, dry, ctx))
+            # En simulation du délai court, rien de ce qui en découle n'agit, règle 7 comprise.
+            ctx_dl = dict(ctx, apercu=True) if court and IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN else ctx
+            noter(*_race_try(arr, url, cle, dl, records, course, inactif, dry_dl, ctx_dl))
         except Exception as e:
             # Journalisé : sans ça, chaque passage relancerait une recherche sur tous les indexeurs.
             titre = records[0].get("title") or dl
             log.error("  ⚠ [%s] [%s] %s en erreur (%s)", _regle(6), arr, titre, e)
-            _assist_record(dl, arr, titre, "dead-error", str(e), dry, 6)
+            _assist_record(dl, arr, titre, "dead-error", str(e), dry_dl, 6)
             noter({"arr": arr, "download_id": dl, "title": titre, "decision": "dead-error", "reason": str(e)}, True)
     if attente:
         log.info("  [%s] %d autre(s) téléchargement(s) mort(s) attendront le passage suivant", _regle(6), attente)
@@ -5039,7 +5392,7 @@ def _race_try(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any
         media = records[0].get("movieId") if arr == "radarr" else records[0].get("seriesId")
         episodes = {r["episodeId"] for r in records if r.get("episodeId")} if arr == "sonarr" else set()
     verdict: dict[str, Any] = {"arr": arr, "download_id": dl, "title": titre}
-    depuis = f"plus rien reçu depuis {inactif / 86400:.0f} j"
+    depuis = _dead_desc(ctx["torrents"].get(dl), inactif)
     if not course:
         # La qualité et le score que l'*arr donne à cette release, tels que les lit _library_better.
         info = "parsedMovieInfo" if arr == "radarr" else "parsedEpisodeInfo"
