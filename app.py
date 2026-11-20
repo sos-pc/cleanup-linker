@@ -1598,15 +1598,38 @@ def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str
 
     Retourne None si le média n'est géré par aucun *arr — l'appelant retombe
     alors sur le déplacement direct des torrents.
+
+    Les fichiers disparus sont élargis à leurs autres noms (_arr_candidate_paths),
+    pour retrouver la copie que l'*arr connaît quand Jellyfin lit le dossier du
+    torrent : la bibliothèque « Films » voit le torrent, Radarr son hardlink.
+    Un autre nom encore lu par une bibliothèque Jellyfin est écarté de cet
+    élargissement. C'est une autre copie, toujours visible : un doublon, ou le
+    nouveau nom d'un dossier déplacé. Par lui, l'*arr retrouverait la fiche de
+    cette copie et la supprimerait avec ses fichiers (incident Westworld du
+    2026-11-12). Si les bibliothèques Jellyfin sont illisibles, aucun autre nom
+    n'est retenu : la fiche ne peut venir que des chemins supprimés eux-mêmes.
     """
     try:
         candidats = _arr_candidate_paths(paths)
     except Exception as e:
         log.error("  Résolution des hardlinks impossible, chemins Jellyfin seuls : %s", e)
         candidats = list(paths)
-    if len(candidats) > len(paths):
-        log.info("  %d autre(s) chemin(s) du même fichier, via l'inode : %s",
-                 len(candidats) - len(paths), candidats[len(paths)])
+    autres = candidats[len(paths):]
+    if autres:
+        lues = _jellyfin_libraries()
+        if lues is None:
+            log.warning("  Bibliothèques Jellyfin illisibles : %d autre(s) nom(s) écarté(s), délégation par les "
+                        "seuls chemins supprimés", len(autres))
+            autres = []
+        else:
+            visibles = [p for p in autres if _under(p, lues)]
+            if visibles:
+                log.warning("  %d autre(s) nom(s) encore lu(s) par Jellyfin écarté(s), dont %s : une autre copie reste "
+                            "visible, sa fiche n'est pas touchée", len(visibles), visibles[0])
+            autres = [p for p in autres if not _under(p, lues)]
+        candidats = list(paths) + autres
+    if autres:
+        log.info("  %d autre(s) chemin(s) du même fichier, via l'inode : %s", len(autres), autres[0])
 
     try:
         if item_type in ("Series", "Season", "Episode"):

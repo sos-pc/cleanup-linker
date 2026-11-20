@@ -458,6 +458,8 @@ Les chemins supprimés sont donc d'abord complétés par **tous les autres chemi
 
 Un lien n'est retenu que si **son inode sur le disque est toujours celui de la base**. Un fichier remplacé depuis la dernière sync, par un upgrade par exemple, est un autre fichier : une suppression Jellyfin ne doit pas l'emporter. Et quand Radarr détient une autre release que celle supprimée, aucun chemin `/data/Media` ne partage l'inode du fichier supprimé : rien n'est délégué, et la release de Radarr reste en place.
 
+**Un autre nom encore lu par Jellyfin n'est jamais retenu.** C'est une autre copie, toujours visible : un doublon dans une autre bibliothèque, ou le nouveau nom d'un dossier déplacé. Passer par lui ferait retrouver et supprimer la fiche de cette copie, avec ses fichiers. C'est arrivé le 2026-11-12 avec Westworld, visible dans deux bibliothèques sur les mêmes inodes. La copie de `meuhmeuh` a été retirée, et la porte a retrouvé, par l'autre nom, la fiche Sonarr de la copie de `Séries`, puis l'a supprimée. Le même piège existait pour Dragon Ball : retirer la copie « Dragon Ball Kai » faisait supprimer la fiche « Dragon Ball Z » de l'autre copie. Seule restait retenue la fiche dont le dossier est le plus long. Désormais, la délégation ne passe que par les chemins supprimés et par les noms qu'aucune bibliothèque ne lit, comme le hardlink de Radarr derrière la bibliothèque « Films ». Si les bibliothèques Jellyfin sont illisibles, aucun autre nom n'est retenu.
+
 L'ordre compte : on dé-monitore **avant** de supprimer, sinon l'*arr peut relancer une recherche entre les deux appels et retélécharger ce qu'on vient de retirer. Le dé-monitorage passe par les endpoints à charge minimale, `episode/monitor`, `series/editor` et `movie/editor`. Jamais par un `PUT` sur la ressource, qui exigerait de renvoyer l'objet complet, et risquerait d'abîmer une fiche sur un champ mal repris.
 
 | Event Jellyfin | Action *arr |
@@ -959,7 +961,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Les tests de bout en bout passent par le vrai code de l'assistant, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
