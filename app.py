@@ -63,6 +63,11 @@ WEBHOOK_TOKEN = _require_env("WEBHOOK_TOKEN")
 TARGET_CAT = os.getenv("TARGET_CATEGORY", "cleanuparr-unlinked")
 DB_PATH = os.getenv("DB_PATH", "/config/db.sqlite")
 SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL_HOURS", "12")) * 3600
+# Garde-fou de la sync : une lecture qui ferait perdre à l'index plus de ce pourcentage de
+# ses lignes, ou de ses chemins /data/Media, est refusée, et l'index reste tel quel. Sans
+# lui, un montage perdu ou un qBittorrent qui répond vide remplaçait l'index par du vide,
+# avec le statut « success ». 0 le désactive. POST /sync?force=true passe outre, une fois.
+SYNC_MAX_DROP_PERCENT = float(os.getenv("SYNC_MAX_DROP_PERCENT", "50"))
 BACKUP_RETENTION = int(os.getenv("BACKUP_RETENTION", "5"))
 
 # Délai de grâce du /cleanup. Un torrent tout juste terminé est déjà marqué
@@ -795,7 +800,61 @@ _UPSERT_FILES = """
 """
 
 
-def sync_db() -> None:
+# Racine de la bibliothèque des *arr, lue par la sync et surveillée par son garde-fou.
+_SYNC_MEDIA_ROOT = "/data/Media"
+# En dessous de ce nombre de lignes, l'index est trop petit pour juger une chute : une
+# installation neuve se remplit sans être bloquée.
+_SYNC_MIN_ROWS = 500
+# Après une sync ratée ou refusée : nouvel essai au bout de 5 min, 15 min, 30 min, puis
+# toutes les heures, jamais plus tard que SYNC_INTERVAL.
+_SYNC_RETRY_DELAYS = (300, 900, 1800, 3600)
+
+
+def _sync_drop(avant: int, apres: int, media_avant: int, media_apres: int) -> str:
+    """
+    La raison de refuser une sync qui ferait trop maigrir l'index, ou "" : l'index
+    entier, ou ses seuls chemins de bibliothèque, perdraient plus de
+    SYNC_MAX_DROP_PERCENT %. Un montage /data/Media perdu ne fait perdre que la part
+    de la bibliothèque : il est vu par le second compte.
+    """
+    part = SYNC_MAX_DROP_PERCENT / 100
+    if part <= 0:
+        return ""
+
+    def chute(a: int, b: int) -> bool:
+        return a >= _SYNC_MIN_ROWS and b < a * (1 - part)
+
+    if chute(avant, apres):
+        return f"l'index passerait de {avant} à {apres} lignes"
+    if chute(media_avant, media_apres):
+        return (f"les chemins de {_SYNC_MEDIA_ROOT} passeraient de {media_avant} à {media_apres} "
+                "(montage perdu ?)")
+    return ""
+
+
+def _sync_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Lignes vivantes de l'index, et parmi elles celles de _SYNC_MEDIA_ROOT."""
+    # Préfixe exact, pas LIKE : « _ » et « % » y seraient des jokers.
+    racine = _SYNC_MEDIA_ROOT + "/"
+    total, media = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(substr(path, 1, ?) = ?), 0) FROM files WHERE stale = 0",
+        (len(racine), racine),
+    ).fetchone()
+    return total, media
+
+
+def _sync_delay(statut: str, echecs: int) -> int:
+    """
+    Attente avant la sync suivante : SYNC_INTERVAL après une réussite. Après un échec
+    ou un refus, `echecs` étant le nombre d'échecs qui le précèdent, de plus en plus
+    long (_SYNC_RETRY_DELAYS), jamais plus que SYNC_INTERVAL.
+    """
+    if statut == "success":
+        return SYNC_INTERVAL
+    return min(SYNC_INTERVAL, _SYNC_RETRY_DELAYS[min(echecs, len(_SYNC_RETRY_DELAYS) - 1)])
+
+
+def sync_db(force: bool = False) -> str:
     """
     Sync complète (atomique avec soft delete) :
     1. Backup la DB
@@ -804,6 +863,10 @@ def sync_db() -> None:
     4. Pour chaque torrent → stat() les fichiers → inode
     5. Scanne /data/Media pour trouver les hardlinks côté *arr
     6. Soft delete (stale=1) + insert nouvelles rows + purge stale
+
+    Dans la même transaction que l'étape 6, le garde-fou (_sync_drop) refuse un index
+    qui aurait trop maigri : la transaction est annulée et l'index reste tel quel,
+    sauf `force`. Retourne "success", "failed" (qBittorrent injoignable) ou "refused".
     """
     log.info("=== Début sync DB ===")
     start = time.time()
@@ -825,7 +888,7 @@ def sync_db() -> None:
     except Exception as e:
         log.error("Erreur connexion qBit: %s", e)
         _log_sync_end(sync_id, "failed", rows_before, 0, time.time() - start)
-        return
+        return "failed"
 
     # ── Étape 1 : construire inode → torrent depuis qBit ─────────────────────
     inode_to_torrent: dict[int, list[dict[str, str]]] = {}
@@ -845,8 +908,8 @@ def sync_db() -> None:
     log.info("qBit : %d torrents, %d fichiers indexés", len(torrents), files_scanned)
 
     # ── Étape 2 : scanner /data/Media pour les hardlinks *arr ─────────────────
-    media_inode_map = scan_video_files("/data/Media")
-    log.info("/data/Media : %d inodes trouvés", len(media_inode_map))
+    media_inode_map = scan_video_files(_SYNC_MEDIA_ROOT)
+    log.info("%s : %d inodes trouvés", _SYNC_MEDIA_ROOT, len(media_inode_map))
 
     # ── Étape 3 : construire les rows ─────────────────────────────────────────
     rows: list[tuple[int, str, str | None, str | None, str | None]] = []
@@ -884,6 +947,8 @@ def sync_db() -> None:
     # ── Étape 4 : soft delete + insert (atomique) ─────────────────────────────
     with _db_lock:
         with get_db() as conn:
+            avant, media_avant = _sync_counts(conn)
+
             # Marque toutes les rows existantes comme stale
             conn.execute("UPDATE files SET stale = 1")
 
@@ -893,8 +958,24 @@ def sync_db() -> None:
             # Purge les rows stale (plus présentes sur le filesystem)
             stale_count = conn.execute("SELECT COUNT(*) FROM files WHERE stale = 1").fetchone()[0]
             conn.execute("DELETE FROM files WHERE stale = 1")
+            # Le compte réel de l'index, pas la longueur de la liste lue : les lignes sans
+            # torrent ne sont jamais dédoublonnées (UNIQUE ne compare pas NULL).
+            rows_after, media_apres = _sync_counts(conn)
 
-    rows_after = len(rows)
+            # Garde-fou, jugé sur l'index tel qu'il serait : un refus annule tout.
+            refus = _sync_drop(avant, rows_after, media_avant, media_apres)
+            bloquee = bool(refus) and not force
+            if bloquee:
+                conn.rollback()
+
+    if bloquee:
+        log.error("⛔ Sync refusée, l'index est gardé tel quel : %s. Si la chute est voulue, "
+                  "POST /sync?force=true", refus)
+        _log_sync_end(sync_id, "refused", avant, len(torrents), time.time() - start)
+        return "refused"
+    if refus:
+        log.warning("⚠️ Sync forcée malgré le garde-fou : %s", refus)
+
     elapsed = time.time() - start
 
     # Vérification d'intégrité : alerte si chute > 30%
@@ -938,10 +1019,12 @@ def sync_db() -> None:
             sync_jellyfin_ids()
         except Exception as e:
             log.error("Erreur indexation Jellyfin: %s", e)
+    return "success"
 
 
 def sync_loop() -> None:
-    """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes.
+    """Lance la sync au démarrage puis toutes les SYNC_INTERVAL secondes, plus tôt après
+    un échec ou un refus (_sync_delay).
     Utilise _sync_started pour éviter les doubles sync_loop (multi-workers gunicorn)."""
     if _sync_started.is_set():
         log.info("sync_loop déjà active dans un autre worker, skip")
@@ -949,13 +1032,17 @@ def sync_loop() -> None:
     _sync_started.set()
 
     time.sleep(5)
+    echecs = 0
     while True:
         try:
-            sync_db()
+            statut = sync_db()
         except Exception as e:
             log.error("Erreur sync: %s", e)
-        log.info("Prochaine sync dans %dh", SYNC_INTERVAL // 3600)
-        time.sleep(SYNC_INTERVAL)
+            statut = "failed"
+        delai = _sync_delay(statut, echecs)
+        echecs = 0 if statut == "success" else echecs + 1
+        log.info("Prochaine sync dans %s", f"{delai // 3600} h" if delai >= 3600 else f"{delai // 60} min")
+        time.sleep(delai)
 
 
 # ── Cross-seed DB ────────────────────────────────────────────────────────────
@@ -5839,12 +5926,13 @@ def health():
 
 @app.route("/sync", methods=["POST"])
 def trigger_sync():
-    """Endpoint pour forcer une sync manuelle."""
+    """Endpoint pour forcer une sync manuelle. `force=true` passe outre son garde-fou, une fois."""
     token = request.args.get("token") or request.headers.get("X-Token")
     if not verify_token(token):
         return jsonify({"error": "Unauthorized"}), 401
-    threading.Thread(target=sync_db, daemon=True).start()
-    return jsonify({"status": "sync started"})
+    force = request.args.get("force", "false").lower() in ("1", "true", "yes")
+    threading.Thread(target=sync_db, kwargs={"force": force}, daemon=True).start()
+    return jsonify({"status": "sync started", "force": force})
 
 
 
@@ -5870,6 +5958,30 @@ def _trace_ancien(sim: dict[str, Any] | None, n: int, dry_run: bool) -> None:
              "aurait déplacé" if dry_run else "a déplacé", n)
 
 
+def _cleanup_refus() -> str:
+    """
+    La raison de refuser /cleanup d'après la dernière sync réussie, ou "" : trop
+    vieille (plus de deux SYNC_INTERVAL), ou qui a fait perdre plus de la moitié de
+    l'index, jusqu'à le vider. Sans sync réussie, rien n'est refusé : /cleanup en
+    lance une avant de juger.
+    """
+    with _db_lock:
+        with get_db() as conn:
+            dernier = conn.execute(
+                "SELECT finished_at, rows_before, rows_after FROM sync_log "
+                "WHERE status = 'success' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    if not dernier:
+        return ""
+    age, max_age = int(time.time()) - (dernier["finished_at"] or 0), SYNC_INTERVAL * 2
+    if age > max_age:
+        return f"dernière sync réussie il y a {age // 3600} h (max {max_age // 3600} h). Lancez /sync d'abord"
+    avant, apres = dernier["rows_before"] or 0, dernier["rows_after"] or 0
+    if avant and apres < avant * 0.5:
+        return f"la dernière sync a perdu {(1 - apres / avant) * 100:.0f} % des lignes ({avant} → {apres}). Vérifiez la base"
+    return ""
+
+
 @app.route("/cleanup", methods=["POST"])
 def cleanup_orphans():
     """
@@ -5888,35 +6000,10 @@ def cleanup_orphans():
         log.info("=== %sDébut du nettoyage des orphelins ===", prefix)
 
         # ── Garde-fou : vérifier que la dernière sync est récente et OK ───────
-        with _db_lock:
-            with get_db() as conn:
-                last_sync = conn.execute(
-                    "SELECT finished_at, status, rows_before, rows_after "
-                    "FROM sync_log WHERE status = 'success' ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-
-        if last_sync:
-            sync_age = int(time.time()) - (last_sync["finished_at"] or 0)
-            max_age = SYNC_INTERVAL * 2  # 2x l'intervalle = trop vieux
-            if sync_age > max_age:
-                log.warning(
-                    "⚠️ Cleanup refusé : dernière sync réussie il y a %dh (max %dh). "
-                    "Lancez /sync d'abord.",
-                    sync_age // 3600, max_age // 3600
-                )
-                return
-
-            # Vérifier que les rows n'ont pas chuté anormalement
-            if last_sync["rows_before"] and last_sync["rows_after"]:
-                ratio = last_sync["rows_after"] / max(last_sync["rows_before"], 1)
-                if ratio < 0.5:
-                    log.warning(
-                        "⚠️ Cleanup refusé : la dernière sync a perdu %.0f%% des rows "
-                        "(%d → %d). Vérifiez la DB.",
-                        (1 - ratio) * 100,
-                        last_sync["rows_before"], last_sync["rows_after"]
-                    )
-                    return
+        refus = _cleanup_refus()
+        if refus:
+            log.warning("⚠️ Cleanup refusé : %s", refus)
+            return
 
         # B1 : sync fraîche seulement si > 2 min depuis la dernière
         with _db_lock:
@@ -5928,7 +6015,11 @@ def cleanup_orphans():
         if last_ok and (int(time.time()) - (last_ok["finished_at"] or 0)) < cooldown:
             log.info("Sync récente (<2 min), skip re-sync avant cleanup")
         else:
-            sync_db()
+            statut = sync_db()
+            if statut != "success":
+                # Un index refusé ou une sync ratée ne disent pas l'état réel des liens.
+                log.warning("⚠️ Cleanup interrompu : la sync préalable n'a pas réussi (%s)", statut)
+                return
 
         # Un téléchargement qu'un *arr suit encore dans sa file n'est jamais orphelin,
         # même bloqué depuis des jours : on attend qu'il soit importé ou retiré.

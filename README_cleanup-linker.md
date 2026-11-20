@@ -22,7 +22,7 @@ Trois principes valent partout :
 
 | Fonction | Déclencheur | Automatique |
 |---|---|---|
-| Index des fichiers par inode | Au démarrage, puis toutes les `SYNC_INTERVAL_HOURS` h. Chaque import est indexé tout de suite | Oui |
+| Index des fichiers par inode | Au démarrage, puis toutes les `SYNC_INTERVAL_HOURS` h, plus tôt après un échec ou un refus. Chaque import est indexé tout de suite | Oui |
 | Index Jellyfin | Après chaque sync, ou par `/jellyfin/index` | Oui |
 | Sauvegarde de la base | Avant chaque sync | Oui |
 | Corbeille après une suppression ou un upgrade dans Sonarr/Radarr | Webhook Sonarr/Radarr | Oui |
@@ -134,6 +134,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `DB_PATH` | `/config/db.sqlite` | Base locale |
 | `CROSSSEED_DB` | `/config/crossseed/cross-seed.db` | Base de cross-seed |
 | `SYNC_INTERVAL_HOURS` | `12` | Intervalle entre deux syncs |
+| `SYNC_MAX_DROP_PERCENT` | `50` | Garde-fou de la sync : au-delà de cette perte, en lignes de l'index ou en chemins `/data/Media`, la sync est refusée et l'index gardé tel quel. `0` le désactive |
 | `BACKUP_DIR` | `/config/backups` | Dossier des sauvegardes de la base |
 | `BACKUP_RETENTION` | `5` | Nombre de sauvegardes gardées |
 | `CLEANUP_GRACE_HOURS` | `24` | Délai avant qu'un torrent terminé, ou un fichier dont les liens ont changé, puisse être vu comme orphelin par `/cleanup`, ou comme inutile par le filet de la règle 7. `0` désactive ce délai |
@@ -327,6 +328,12 @@ L'étape 6 est un filet contre les webhooks ratés : service arrêté pendant un
 
 La purge se fonde sur la **liste des torrents qBittorrent**, pas sur la table `files`. Un torrent présent dans le client mais dont les fichiers ont disparu du disque n'a aucune ligne dans `files`, et serait retiré à tort. Sans cette purge, une release re-téléchargée plus tard reprendrait le même hash, et serait d'emblée considérée comme gérée par un *arr, même ajoutée à la main.
 
+**Le garde-fou de la sync.** L'index est remplacé d'un bloc, dans une seule transaction. Avant de la valider, la sync compte l'index tel qu'il serait. S'il perd plus de `SYNC_MAX_DROP_PERCENT` % (50 par défaut) de ses lignes, ou de ses chemins `/data/Media`, elle annule tout et garde l'ancien index. C'est ce qui arrive quand le montage `/data/Media` est perdu, ou quand qBittorrent répond vide. Les étapes 6 et 7 ne passent pas non plus : une liste qBittorrent vide aurait vidé `arr_managed`. Le journal note `refused`, et le log le dit (`⛔ Sync refusée…`). En dessous de 500 lignes, rien n'est refusé : une installation neuve se remplit librement. Si la chute est voulue, après avoir retiré plus de la moitié de la bibliothèque par exemple, `POST /sync?force=true` passe outre, une fois.
+
+Le journal compte l'index réel. Avant, il notait la longueur de la liste lue, doublons compris : environ 23 % de plus sur l'installation de référence (120 091 lignes notées pour 97 343).
+
+Après un échec ou un refus, la sync suivante n'attend pas `SYNC_INTERVAL_HOURS` : elle repasse au bout de 5 min, puis 15 min, 30 min, puis toutes les heures, jusqu'à une réussite.
+
 **L'indexation à l'import.** L'event `Download` (« On File Import ») fait indexer le fichier importé tout de suite. Il est rattaché au torrent dont il est un hardlink, à partir de son inode et du `downloadId`. Une suppression qui suit avant la prochaine sync le retrouve donc.
 
 ### Suppression ou upgrade dans Sonarr / Radarr
@@ -498,7 +505,7 @@ curl -XPOST 'http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN&dry_run=true' 
 
 Un torrent peut rester hors de la corbeille alors que plus rien ne s'en sert : webhook raté, suppression avant indexation, ou téléchargement jamais importé. `/cleanup` le rattrape. Il **n'est lancé par aucune tâche** : on l'appelle à la main, de préférence en simulation d'abord (`&dry_run=true`).
 
-Il commence par refuser de tourner si la dernière sync réussie date de plus de deux intervalles, ou si elle a perdu plus de la moitié des lignes. Il relance une sync si la dernière a plus de 2 minutes. Il lit ensuite les files de Sonarr et de Radarr, éléments inconnus compris : si l'une ne répond pas, il s'arrête sans rien déplacer. Puis :
+Il commence par refuser de tourner si la dernière sync réussie date de plus de deux intervalles, ou si elle a perdu plus de la moitié des lignes, jusqu'à toutes. Il relance une sync si la dernière a plus de 2 minutes, et s'arrête si elle échoue ou est refusée. Il lit ensuite les files de Sonarr et de Radarr, éléments inconnus compris : si l'une ne répond pas, il s'arrête sans rien déplacer. Puis :
 1. il retient les torrents `arr_managed` qui n'ont aucun fichier dans `/data/Media/` et ne sont pas déjà dans la corbeille ;
 2. il y ajoute leurs **cross-seeds**, qui partagent leurs inodes. Il fait de même pour les cross-seeds des torrents déjà en corbeille, qu'un move précédent a pu laisser derrière. Un voisin qui garde d'autres fichiers dans `/data/Media` reste en place. Sans cette étape, les cross-seeds ne partiraient jamais : ils ne sont pas dans `arr_managed`, puisque c'est cross-seed qui les ajoute ;
 3. il épargne les torrents terminés depuis moins de `CLEANUP_GRACE_HOURS` (24 h), dont l'import est probablement en attente ;
@@ -939,6 +946,9 @@ INFO     [SIMULATION] ⚠ [règle 7 · téléchargement inutile] [sonarr] South 
 # Forcer une resync
 curl -XPOST 'http://192.168.1.111:5001/sync?token=VOTRE_TOKEN'
 
+# Resync qui passe outre le garde-fou, une fois : seulement si la chute est voulue
+curl -XPOST 'http://192.168.1.111:5001/sync?token=VOTRE_TOKEN&force=true'
+
 # État de la base
 curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.tool
 
@@ -961,7 +971,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
@@ -1019,7 +1029,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 |---|---|---|---|
 | `/webhook` | POST | — | Reçoit les events Sonarr/Radarr |
 | `/jellyfin` | POST | `dry_run` | Reçoit les events Jellyfin |
-| `/sync` | POST | — | Force une resync immédiate |
+| `/sync` | POST | `force` | Force une resync immédiate. `force=true` passe outre son garde-fou, une fois |
 | `/jellyfin/index` | POST | — | Force la réindexation Jellyfin |
 | `/cleanup` | POST | `dry_run` | Met en corbeille les torrents *arr orphelins ; avec la corbeille globale, ce qui ne sert plus au repos |
 | `/restore` | POST | `since` (timestamp Unix) | Restaure les torrents du dernier `/cleanup`, ou tout ce qui a été tracé depuis `since` |
@@ -1038,7 +1048,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `files` | Chaque chemin vidéo indexé : inode, hash et nom du torrent, catégorie, identifiants Jellyfin |
 | `arr_managed` | Les hashes des torrents pris par un *arr |
 | `cleanup_log` | Les moves vers la corbeille : hash, nom, catégorie d'origine, source, date |
-| `sync_log` | Les syncs : début, fin, statut, lignes avant et après, torrents, durée |
+| `sync_log` | Les syncs : début, fin, statut (`success`, `failed`, `refused`), lignes avant et après, torrents, durée |
 | `assist_log` | Les verdicts de l'assistant : téléchargement, *arr, titre, décision, détails, simulation ou non, règle, date |
 | `pack_replace` | Les remplacements de packs de la règle 4 |
 | `dead_race` | Les courses de versions de la règle 6 : original, versions essayées, torrents de la course, dernière tentative |
