@@ -14,7 +14,26 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Les tests passent avant toute image : un échec bloque la construction.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
   build-and-push-image:
+    needs: tests
     runs-on: ubuntu-latest
     # Donne les permissions nécessaires pour pousser sur le GitHub Container Registry
     permissions:

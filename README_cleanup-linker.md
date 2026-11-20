@@ -97,10 +97,13 @@ services:
       # Assistant d'import : chaque règle reste en simulation tant qu'on ne la passe pas à false
       - IMPORT_ASSIST_DRY_RUN=false          # règle 1 · débloquer la file
       - IMPORT_ASSIST_NOM_DRY_RUN=false      # règle 2 · torrent mal nommé
+      - IMPORT_ASSIST_IDENTITE_DRY_RUN=false # règle 2 · identité confirmée
       - IMPORT_ASSIST_PACK_DRY_RUN=false     # règle 4 · pack incomplet
       - IMPORT_ASSIST_ACCORD_DRY_RUN=false   # règle 5 · bonne saison
       - IMPORT_ASSIST_MORT_DRY_RUN=false     # règle 6 · téléchargement mort
+      - IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN=false  # règle 6 · mort-nés jugés plus tôt
       - IMPORT_ASSIST_INUTILE_DRY_RUN=false  # règle 7 · téléchargement inutile
+      - IMPORT_ASSIST_PIEGE_DRY_RUN=false    # règle 7 · release piégée
 
 networks:
   default:
@@ -166,17 +169,21 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Intervalle du passage de renfort, qui rattrape les events manqués. `0` le désactive, et `/assist` reste utilisable |
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Simulation de la règle 1 · débloquer la file |
 | `IMPORT_ASSIST_NOM_DRY_RUN` | `true` | Simulation de la règle 2 · torrent mal nommé |
+| `IMPORT_ASSIST_IDENTITE_DRY_RUN` | `true` | Simulation de l'identité confirmée de la règle 2 : le renommage d'un torrent dont le titre de release ne désigne pas le média à lui seul. Tant qu'elle simule, rien de ce qui en découle n'agit, règle 7 comprise |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Simulation de la règle 4 · pack incomplet |
 | `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
 | `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Simulation de la règle 5 · bonne saison |
-| `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes. Vide = règle 5 désactivée |
+| `SEERR_URL` | — | URL Seerr, d'où la règle 5 lit les demandes, et la règle 2 les titres français et anglais d'un média. Vide = règle 5 désactivée, et la règle 2 se contente des titres de l'*arr |
 | `SEERR_API_KEY` | — | Clé API Seerr (Paramètres → Général) |
 | `IMPORT_ASSIST_MORT_DRY_RUN` | `true` | Simulation de la règle 6 · téléchargement mort |
 | `IMPORT_ASSIST_MORT_JOURS` | `3` | Jours sans rien recevoir, sans source connectée, au bout desquels un téléchargement est jugé mort. C'est aussi l'écart minimal entre deux recherches d'une autre version |
 | `IMPORT_ASSIST_MORT_ESSAIS` | `5` | Nombre maximal d'autres versions essayées pour un même téléchargement mort |
+| `IMPORT_ASSIST_MORT_JAMAIS_HEURES` | `12` | Heures au bout desquelles un torrent mort-né, qui n'a jamais rien reçu ni jamais vu de copie complète, est jugé mort, sans attendre `IMPORT_ASSIST_MORT_JOURS` |
+| `IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN` | `true` | Simulation de ce délai court. Passé `IMPORT_ASSIST_MORT_JOURS`, un mort-né suit la règle 6 comme les autres |
 | `IMPORT_ASSIST_INUTILE_DRY_RUN` | `true` | Simulation de la règle 7 · téléchargement inutile |
+| `IMPORT_ASSIST_PIEGE_DRY_RUN` | `true` | Simulation de la release piégée de la règle 7 : un torrent sans vidéo, avec un exécutable ou un script |
 
 ### Webhooks Sonarr et Radarr
 
@@ -643,15 +650,15 @@ Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lanc
 | Règle | Interrupteur | Ce qu'elle fait |
 |-------|--------------|-----------------|
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
-| 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false` | Renomme avec le titre de sa release un torrent que l'*arr ne reconnaît pas, pour qu'il l'importe lui-même |
+| 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false`, et `IMPORT_ASSIST_IDENTITE_DRY_RUN=false` pour l'identité confirmée | Renomme un torrent que l'*arr ne reconnaît pas, avec le titre de sa release, ou avec un nom refait une fois l'identité confirmée sans l'identifiant de l'indexeur, pour qu'il l'importe lui-même |
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet, ou comble ses trous |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
-| 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false` | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
-| 7 · téléchargement inutile | `IMPORT_ASSIST_INUTILE_DRY_RUN=false` | Sort de la file, sans blacklist, un téléchargement bloqué qui n'apporterait rien, et le met en corbeille, où il continue de seeder |
+| 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false`, et `IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN=false` pour les mort-nés | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
+| 7 · téléchargement inutile | `IMPORT_ASSIST_INUTILE_DRY_RUN=false`, et `IMPORT_ASSIST_PIEGE_DRY_RUN=false` pour les releases piégées | Sort de la file, sans blacklist, un téléchargement bloqué qui n'apporterait rien, et le met en corbeille, où il continue de seeder. Une release piégée, elle, est blacklistée par l'*arr et arrêtée |
 
 Principes communs :
-- **pas de blacklist sans raison**, car une release écartée à tort ne revient plus. Seule la règle 4 blackliste le pack partiel qu'elle remplace ;
-- **la corbeille continue de seeder.** Un torrent privé déjà entamé n'est jamais arrêté, à cause du hit-and-run ;
+- **pas de blacklist sans raison**, car une release écartée à tort ne revient plus. Seules la règle 4, pour le pack partiel qu'elle remplace, et la règle 7, pour une release piégée, blacklistent ;
+- **la corbeille continue de seeder**, sauf une release piégée, arrêtée. Un torrent privé déjà entamé n'est jamais arrêté, à cause du hit-and-run ;
 - **un dossier partagé avec un autre torrent reste dans sa catégorie** ;
 - **un téléchargement en erreur n'empêche pas de traiter les suivants** ;
 - **un même verdict n'est journalisé qu'une fois par jour**, et une action réelle n'est jamais rejouée dans ce délai.
@@ -659,9 +666,9 @@ Principes communs :
 **Lire les logs.** Chaque ligne de l'assistant porte le nom de sa règle, et `[SIMULATION]` quand elle n'a rien changé. Au démarrage, une ligne résume ce que fait chaque règle :
 
 ```
-INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 2 · torrent mal nommé ACTIVE, règle 4 · pack incomplet ACTIVE, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort ACTIVE, règle 7 · téléchargement inutile ACTIVE
+INFO   Assistant d'import : règle 1 · débloquer la file ACTIVE, règle 2 · torrent mal nommé ACTIVE (identité confirmée en simulation), règle 4 · pack incomplet ACTIVE, règle 5 · bonne saison ACTIVE, règle 6 · téléchargement mort ACTIVE (mort-nés après 12 h en simulation), règle 7 · téléchargement inutile ACTIVE (releases piégées en simulation)
 INFO     ✓ [règle 7 · téléchargement inutile] [sonarr] Veronica.Mars.iNTEGRALE.MULTi.WEBRiP.1080p.x265-SN2P : Sonarr refuse les 72 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
-INFO     ⏭ [règle 2 · torrent mal nommé] [sonarr] Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION : le nom du torrent est déjà le titre de la release : seul l'identifiant de l'indexeur relie ce téléchargement au média
+INFO     ⏭ [règle 2 · torrent mal nommé] [sonarr] Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION : aucun titre connu de Ghosts (US) dans le nom, à la bonne année : seul l'identifiant de l'indexeur relie ce téléchargement au média
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01...-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01...-T3KASHi (C411, 15 sources, score 195)
 INFO   === Assistant d'import (passage de renfort) : 3 téléchargement(s) bloqué(s), 0 mort(s), 2 nouveau(x) verdict(s) ===
 ```
@@ -711,7 +718,22 @@ Elle n'agit que sur un téléchargement bloqué « matched … by ID », complet
 
   Une fausse release les glisse à côté d'une vidéo leurre. Or Sonarr et Radarr ne les signalent que si rien d'autre n'est importé : une fois renommé, le leurre serait importé. Un tel torrent reste bloqué, avec un avertissement `rename-suspect`.
 
-Un titre de release identique au nom du torrent ne prouve rien de plus. C'est le cas de `Ghosts.S06E01.NORDiC…` : « Ghosts » désigne six séries sur TVDB, et seul l'identifiant de l'indexeur relie ce téléchargement à Ghosts (US). Il reste bloqué.
+**Identité confirmée : quand le titre de la release ne suffit pas.** Souvent, le titre de la release ne désigne pas non plus le média pour l'*arr, alors que l'identifiant de l'indexeur était juste. Sonarr et Radarr exigent que le nom redonne exactement, après leur normalisation, un titre qu'ils connaissent, et le moindre écart bloque :
+- *Celles qu'on n'a pas eues* : Radarr connaît le titre français, mais lit « N.A. » comme un sigle et garde son « a », alors qu'il retire celui de « n'a » ;
+- `Pokémon.Film.14.Noir…` : « Film 14 » en plus et « le » en moins, face à « Pokémon, le film : Noir » ;
+- `Le.College.Noir.Complainte.D.Auvergne.S02E06…` : le titre de l'épisode collé à celui de la série ;
+- `L.Attaque.Des.Titans.2013.S03…` : le titre français d'Attack on Titan ;
+- `Devil.May.Cry.S01…` : la série est enregistrée sous « Devil May Cry (2025) » ;
+- `[PM]Pocket Monsters XY Movie 17 Premiere Special with TV Special - Diancie, Princess of the Ore Country…` : un titre alternatif au milieu d'un long nom.
+
+La règle confirme alors l'identité **sans l'identifiant de l'indexeur** :
+1. tous les mots utiles d'un titre connu du média sont, dans l'ordre, dans la partie titre du nom du torrent ou du titre de la release. Les titres connus sont ceux de l'*arr (titre, titre original, titres alternatifs) et ceux de Seerr en français et en anglais. Les accents, la ponctuation, la casse et les articles ne comptent pas, les nombres si : « Partie 2 » n'est pas « Partie 1 » ;
+2. si le nom porte une année, c'est celle du média, à un an près. Un titre d'un seul mot, comme « Ghosts », qui désigne six séries sur TVDB, exige cette année dans le nom ;
+3. le torrent a au moins une vidéo, aucun fichier suspect, et ses vidéos pèsent au moins le minimum de leur qualité dans l'*arr, en Mo par minute de la durée attendue.
+
+Le torrent prend alors un **nom refait** : la partie titre devient le titre de l'*arr, le reste (année, numérotation, qualité, langue, groupe) ne bouge pas, par exemple `The Ones That Got Away 1981.TRUEFRENCH.1080p.CNLP.WEB.x264.EAC3-STORiES`. Avant tout renommage, l'*arr relit ce nom (`/parse`) : il doit y voir le même média, la même qualité et les épisodes de la file. Si seule la qualité lue change, un second essai ajoute la source d'origine (`WEB-DL`, `BluRay`…) juste après l'année ou la numérotation. Le reste ne change pas : l'*arr importe lui-même, avec ses contrôles habituels, et la règle 7 retire ce qui n'améliorerait rien.
+
+Elle a son propre interrupteur, `IMPORT_ASSIST_IDENTITE_DRY_RUN`, en simulation par défaut. Tant qu'il simule, rien de ce qui découle d'une identité confirmée n'agit, règle 7 comprise. Sinon, rien ne bouge, et la raison est journalisée : aucun titre connu dans le nom, année différente, vidéos trop petites, nom refait que l'*arr ne relit pas comme ce média.
 
 Si l'*arr bloque toujours le torrent 10 minutes après le renommage, l'avertissement `rename-blocked` le signale, et l'import reste à faire à la main. Le torrent n'est jamais renommé deux fois.
 
@@ -723,7 +745,8 @@ Verdicts : `rename` (torrent renommé), `rename-suspect`, `rename-blocked`, `ren
 
 ```
 INFO     ✓ [règle 2 · torrent mal nommé] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : le titre de la release désigne bien Resident Evil (2026) : torrent renommé Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo → Radarr l'importera seul
-INFO     ⏭ [règle 2 · torrent mal nommé] [sonarr] Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION.mkv : le nom du torrent est déjà le titre de la release : seul l'identifiant de l'indexeur relie ce téléchargement au média
+INFO     [SIMULATION] ✓ [règle 2 · torrent mal nommé] [radarr] Celles.Qu.On.N.A.Pas.Eues.1981.TRUEFRENCH.1080p.CNLP.WEB.x264.EAC3-STORiES.mkv : identité confirmée, « Celles qu'on n'a pas eues » dans « Celles.Qu.On.N.A.Pas.Eues.1981.TRUEFRENCH.1080p.CNLP.WEB.x264.EAC3-STORiES.mkv », année 1981 : torrent renommé The Ones That Got Away 1981.TRUEFRENCH.1080p.CNLP.WEB.x264.EAC3-STORiES → Radarr l'importera seul
+INFO     ⏭ [règle 2 · torrent mal nommé] [sonarr] Ghosts.S06E01.NORDiC.1080p.VIAP.WEB-DL.DDP5.1.H.264-ADDICTION.mkv : aucun titre connu de Ghosts (US) dans le nom, à la bonne année : seul l'identifiant de l'indexeur relie ce téléchargement au média
 ```
 
 ### Règle 4 · pack incomplet : pack de saison partiel
@@ -832,6 +855,8 @@ Un torrent sans source reste dans la file de Sonarr ou de Radarr indéfiniment. 
 
 Un torrent mis en pause à la main compte aussi : s'il ne reçoit plus rien, il bloque la demande comme les autres.
 
+**Un mort-né n'attend pas 3 jours.** Un torrent qui n'a jamais rien reçu depuis son ajout, et dont aucune copie complète n'a jamais été vue, est jugé mort au bout de `IMPORT_ASSIST_MORT_JAMAIS_HEURES` (12 h par défaut). C'est le cas d'une release grabbée sans aucun seeder, comme les épisodes FW de StuGo sur TR4KER, ou d'un magnet dont les métadonnées n'arrivent jamais. Ce délai court a sa propre simulation, `IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN`. Tant qu'il simule, rien de ce qui en découle n'agit, règle 7 comprise. Passé `IMPORT_ASSIST_MORT_JOURS`, le torrent suit la règle comme les autres.
+
 **Rien à remplacer.** Si le fichier en place vaut déjà au moins la release morte, aucune recherche n'a lieu : la règle 7 retire le téléchargement (voir plus bas). Cela ne vaut qu'avant le début d'une course.
 
 **La course.** Sinon, le téléchargement mort n'est **ni blacklisté ni retiré**, car un seeder peut revenir, même après des mois. L'assistant lance une course :
@@ -864,7 +889,7 @@ Les courses sont dans la table `dead_race`.
 
 ```
 INFO     [SIMULATION] ✓ [règle 6 · téléchargement mort] [radarr] Féroce.2017.FRENCH.1080p.WEB.H264-ViVENDi : plus rien reçu depuis 14 j → autre version prise en plus, Feroce.2017.MUET.VO.1080p.WEB.AAC.2.0.H264-FABZ (C411 (Prowlarr), 18 source(s), score 101) ; la première finie gagnera
-INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Parking.mkv : plus rien reçu depuis 23 j, aucune autre version trouvée : on attend, le torrent reste en route
+INFO     [SIMULATION] ⏭ [règle 6 · téléchargement mort] [radarr] Parking.mkv : rien reçu depuis son ajout il y a 39 j, aucune copie complète jamais vue, aucune autre version trouvée : on attend, le torrent reste en route
 ```
 
 ### Règle 7 · téléchargement inutile : la bibliothèque a déjà mieux
@@ -877,7 +902,14 @@ La règle 6 lui confie aussi **un téléchargement mort**, avant le début d'une
 
 Le téléchargement sort alors de la file **sans blacklist** : l'*arr ne le reprendra pas, puisqu'il n'est pas un upgrade. Le torrent part en corbeille, où **il continue de seeder**. Un téléchargement mort y est arrêté, puisqu'il n'a rien à seeder, sauf un torrent privé déjà entamé. Rien n'est supprimé. Verdict : `useless`.
 
-Une vidéo unique refusée pour un autre motif, un exécutable par exemple, ou un dossier sans rien à importer, n'est jamais touchée : l'assistant journalise le motif de l'*arr, une fois par jour, avec le verdict `ignored`.
+Une vidéo unique refusée pour un autre motif, ou un dossier sans rien à importer, n'est jamais touché : l'assistant journalise le motif de l'*arr, une fois par jour, avec le verdict `ignored`. Seule exception, la release piégée, plus bas.
+
+**La release piégée.** Un torrent sans aucune vidéo, mais avec un exécutable, un script ou un raccourci (`.exe`, `.scr`, `.lnk`…), est un piège. Il en arrive sur les indexeurs publics dans les heures qui suivent la diffusion d'un épisode ou la sortie d'un film : `South Park S29E06 1080p WEB H264-MeGusta.scr` sur 1337x, par exemple. Sonarr et Radarr les bloquent, mais leur réglage « Fail Downloads » ne les fait pas échouer. Le hash annoncé par l'indexeur n'est pas celui du torrent reçu, donc l'*arr ne relie pas le téléchargement à son grab : il ignore de quel indexeur il vient. La règle :
+1. retrouve le grab : par l'identifiant du téléchargement, sinon au même nom, pour le même média, dans les 14 derniers jours, parmi les grabs dont le hash n'est celui d'aucun torrent de qBittorrent. Une vraie release du même nom, présente dans qBittorrent, n'est jamais visée ;
+2. le marque échoué dans l'*arr (`/history/failed`), qui met la release en liste noire et en cherche une autre, selon son réglage « Redownload Failed » ;
+3. arrête le torrent et le met en corbeille. Rien n'est supprimé : les fichiers partent au vidage de la corbeille.
+
+Une archive seule (`.rar`, `.zip`…) n'est pas un piège : une release de scène peut être en RAR. Elle a son propre interrupteur, `IMPORT_ASSIST_PIEGE_DRY_RUN`, en simulation par défaut. Verdict : `trap`.
 
 **Le filet hors file.** La corbeille attend un signal : un event sur un fichier de la bibliothèque, ou une ligne de file. Un signal raté n'est jamais rattrapé, et le torrent reste en seed sans plus servir à rien : un import refusé puis sorti de la file, un upgrade passé avant que l'index connaisse le fichier. À chaque passage, la règle regarde donc aussi l'état réel des torrents hors file. L'un d'eux part en corbeille, où il continue de seeder, s'il remplit toutes ces conditions :
 - il est fini depuis plus de `CLEANUP_GRACE_HOURS` (24 h) et rangé dans une catégorie après import d'un client Sonarr ou Radarr ;
@@ -894,6 +926,7 @@ INFO     ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] L.invitee.de.l.hiver.1997.VOSTF.BR.1080P.HEVC.DTS-X-AZAZE.mkv : plus rien reçu depuis 101 j, et la bibliothèque a déjà mieux (Bluray-1080p, score 60) que cette release (WEBDL-1080p, score 39) → retiré de la file sans blacklist, en corbeille et arrêté : il n'a rien à seeder
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [radarr] Resident.Evil.2026.MULTi.CA.1080p.WEB.H265-SUPPLY : Radarr refuse les 1 vidéo(s) : la bibliothèque a déjà mieux pour chacune → retiré de la file sans blacklist, en corbeille, où il continue de seeder
 INFO     [SIMULATION] ✓ [règle 7 · téléchargement inutile] [sonarr] Lanterns.2026.S01E02.DV.HDR.2160p.WEB.H265-CAKES : hors de la file, aucune de ses 1 vidéo(s) n'est dans la bibliothèque, qui a déjà tout par d'autres fichiers → en corbeille, où il continue de seeder
+INFO     [SIMULATION] ⚠ [règle 7 · téléchargement inutile] [sonarr] South Park S29E06 1080p WEB H264-MeGusta : South Park S29E06 1080p WEB H264-MeGusta.scr et aucune vidéo : release piégée → grab (1337x (Prowlarr)) marqué échoué dans Sonarr, qui met la release en liste noire, torrent arrêté et mis en corbeille
 ```
 
 ---
@@ -924,6 +957,13 @@ docker logs cleanup-linker -f
 ```bash
 docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
+```
+
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Les tests de bout en bout passent par le vrai code de l'assistant, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest -q tests
 ```
 
 ---
