@@ -572,10 +572,14 @@ Une autre vidéo d'un torrent sert encore si elle a un nom dans `/data/Media`, u
 - il s'appelle `[sans torrent] <dossier>`, porte le tag `sans-torrent`, et va dans la catégorie de la corbeille. Si le dossier garde d'autres vidéos, son nom le dit : `[sans torrent] Scissor Seven (24 vidéo(s) sur 58)`. Les 34 autres restent ;
 - il liste exactement ces fichiers, plus les petits fichiers du dossier (.nfo, .jpg, .srt) quand le dossier ne garde aucune autre vidéo. Une vidéo qui part avec son torrent, ou qui est déjà en corbeille, ne retient pas le dossier ;
 - il y en a un par dossier. Un upgrade arrive épisode par épisode : à chaque fois, le nouveau torrent de corbeille reprend le contenu du précédent, qui est retiré sans ses fichiers. Au dernier épisode, le dossier part entier. Un fichier qu'un autre torrent liste n'est jamais repris ;
+- son infohash dépend du dossier. Deux dossiers jumeaux, la même release sous deux trackers de cross-seeds, donnent donc deux torrents. Avant, ils donnaient le même : qBittorrent 5 refusait le second (409), et le geste s'arrêtait là. Sur l'installation de référence, 469 des 819 dossiers de release de cross-seeds avaient un tel jumeau ;
+- un torrent de corbeille déjà présent pour ce dossier n'est ni réajouté ni recompté. Un refus de qBittorrent, ou un fichier disparu depuis la décision, ne vaut que pour ce torrent-là : les suivants sont faits ;
 - ses empreintes de pièces sont nulles : il est ajouté sans vérification, donc sans relire les données, même pour un pack de 300 Go. Il est privé, sans tracker, et jamais démarré : il ne parle à personne. Une revérification forcée l'afficherait à 0 %, sans toucher aux fichiers ;
-- s'il est dans un dossier lu par Jellyfin, il est déplacé dans le dossier de la corbeille, comme ATM le fait pour un torrent : le titre disparaît de la bibliothèque. Ce n'est pas le cas si un autre torrent occupe la même place.
+- s'il est dans un dossier lu par Jellyfin, il est déplacé dans le dossier de la corbeille, comme ATM le fait pour un torrent : le titre disparaît de la bibliothèque. Ce n'est pas le cas si un autre torrent a ce dossier, ou si la place dans la corbeille est déjà prise, par un jumeau déplacé juste avant ou par un dossier resté sur le disque : les deux se mêleraient. Le log le dit (`↷ … reste à sa place`), et le titre reste visible jusqu'au vidage.
 
 Il se vide comme les autres, depuis qBittorrent, torrent et fichiers. Le retirer sans ses fichiers annule le geste, et c'est ce que fait `/restore`. Le service ne supprime toujours aucun fichier.
+
+**Une erreur au milieu du geste.** Le journal dit ce qui a déjà changé, par exemple « erreur après 1 torrent(s) mis en corbeille et 1 torrent(s) de corbeille ajouté(s) : … ». Avant, il disait « rien n'a été fait », alors que des torrents avaient déjà changé de catégorie. Chaque déplacement est noté dans `cleanup_log` au moment où il est fait.
 
 **Quand.**
 
@@ -971,7 +975,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
