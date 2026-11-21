@@ -547,6 +547,8 @@ curl -XPOST "http://192.168.1.111:5001/restore?token=VOTRE_TOKEN&since=$(date -d
 
 Sans ce bornage, tout ce qui est dans la corbeille et figure au journal repartirait : des mois de suppressions légitimes, plus les torrents qu'on y laisse seeder pour honorer les trackers.
 
+Un torrent de corbeille se reconnaît à son tag `sans-torrent` : il est retiré sans ses fichiers, ce qui défait son ajout. Un vrai torrent revient dans sa catégorie d'origine, même vide : il retrouve alors « sans catégorie », et n'est jamais retiré de qBittorrent. Avant, une catégorie d'origine vide suffisait à faire retirer le torrent, et un vrai torrent sans catégorie perdait son seed.
+
 ### Après la corbeille
 
 cleanup-linker ne vide jamais `cleanuparr-unlinked`. On la vide à la main depuis qBittorrent, en supprimant les torrents avec leurs fichiers, ou un outil comme cleanuparr s'en charge selon sa propre logique, par exemple quand la place manque. Sans l'un ni l'autre, la corbeille ne fait que grossir : ses torrents seedent, et leurs fichiers occupent toujours le disque.
@@ -975,7 +977,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest

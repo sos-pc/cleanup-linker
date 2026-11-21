@@ -6305,6 +6305,9 @@ def restore_last_cleanup():
     Le bornage compte : sans lui, tout ce qui est dans la catégorie cible et figure au
     journal repartirait. Ça représente des mois de suppressions légitimes, plus les
     torrents qu'on y laisse seeder pour honorer les trackers.
+
+    Un torrent de corbeille (tag sans-torrent) est retiré sans ses fichiers. Un vrai
+    torrent revient dans sa catégorie d'origine, même vide.
     """
     token = request.args.get("token") or request.headers.get("X-Token")
     if not verify_token(token):
@@ -6384,8 +6387,10 @@ def restore_last_cleanup():
                     {h for h in hash_to_cat if h in in_target}, all_torrents
                 )
 
-                # Regroupe par catégorie d'origine
-                by_cat: dict[str, list[dict[str, str]]] = {}
+                # Regroupe par catégorie d'origine. Un torrent de corbeille se reconnaît à son
+                # tag, jamais à une catégorie d'origine vide : un vrai torrent noté sans
+                # catégorie revient sans catégorie, il n'est pas retiré de qBittorrent.
+                by_cat: dict[str | None, list[dict[str, str]]] = {}
                 for h, (name, cat) in hash_to_cat.items():
                     if h not in in_target:
                         continue
@@ -6394,7 +6399,8 @@ def restore_last_cleanup():
                         log.info("  ⏭ [%s] %s non restauré (fichiers partagés avec [%s] %s)",
                                  TARGET_CAT, name, autre.get("category", "?"), autre.get("name", "?"))
                         continue
-                    by_cat.setdefault(cat, []).append({"hash": h, "name": name})
+                    cle = None if _CORBEILLE_TAG in _tags(in_target[h]) else (cat or "")
+                    by_cat.setdefault(cle, []).append({"hash": h, "name": name})
 
                 if not by_cat:
                     log.info("Aucun torrent à restaurer.")
@@ -6403,7 +6409,7 @@ def restore_last_cleanup():
                 restored: list[dict[str, str]] = []
                 for cat, cat_torrents in by_cat.items():
                     hashes = "|".join(t["hash"] for t in cat_torrents)
-                    if not cat:
+                    if cat is None:
                         # Torrent de corbeille de la corbeille globale : le retirer sans
                         # ses fichiers laisse leurs noms en place, comme avant le geste.
                         try:
@@ -6428,7 +6434,7 @@ def restore_last_cleanup():
                         log.error("  ✗ Restauration vers '%s' impossible : %s", cat, e)
                         continue
                     for t in cat_torrents:
-                        log.info("  ↩ Restauré [%s] %s → %s", TARGET_CAT, t["name"], cat)
+                        log.info("  ↩ Restauré [%s] %s → %s", TARGET_CAT, t["name"], cat or "(sans catégorie)")
                         restored.append(t)
 
                 log.info("=== Restauration terminée : %d torrents remis en place ===", len(restored))
