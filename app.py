@@ -88,12 +88,14 @@ RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
 # dès l'event « Manual Interaction Required ». Chaque règle a sa propre
 # simulation, active par défaut : elle journalise ce qu'elle ferait, sans rien
 # changer. Celle-ci est la simulation de la règle 1 (débloquer la file). Le
-# passage régulier n'est qu'un renfort : l'*arr n'émet l'event qu'une fois par
-# téléchargement, et l'oublie à son redémarrage. 0 minute le désactive (/assist
+# passage régulier, toutes les heures, est un renfort : l'*arr n'émet l'event
+# qu'une fois par téléchargement, et l'oublie à son redémarrage. Un téléchargement
+# mort ou une saison trouée n'émettent aucun event : lui seul les voit. Toutes les
+# 6 h, un mort-né attendait jusqu'à 18 h sa course. 0 minute le désactive (/assist
 # reste utilisable). Seuls 0/false/no font agir : une valeur mal saisie garde la
 # simulation.
 IMPORT_ASSIST_DRY_RUN = os.getenv("IMPORT_ASSIST_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
-IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "360")) * 60
+IMPORT_ASSIST_INTERVAL = int(os.getenv("IMPORT_ASSIST_INTERVAL_MINUTES", "60")) * 60
 
 # Règle 2 de l'assistant (torrent mal nommé) : un import bloqué « matched by ID »,
 # parce que l'*arr ne reconnaît pas le nom du torrent, alors que le titre de la
@@ -120,6 +122,11 @@ IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").str
 # d'une autre langue ne sert qu'à combler les trous : le partiel est gardé, et
 # seuls les fichiers des épisodes manquants sont téléchargés.
 IMPORT_ASSIST_PACK_MIN_SCORE = int(os.getenv("IMPORT_ASSIST_PACK_MIN_SCORE", "50"))
+# Règle 4, saisons trouées : une saison demandée dans Seerr garde des épisodes
+# diffusés, sans fichier ni téléchargement, faute de release à l'unité. Un pack de
+# la saison, même d'une autre langue, comble alors ces seuls trous, comme après un
+# pack partiel. Sa propre simulation, qui suit aussi celle de la règle 4.
+IMPORT_ASSIST_TROUS_DRY_RUN = os.getenv("IMPORT_ASSIST_TROUS_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 PROWLARR_URL = os.getenv("PROWLARR_URL", "").rstrip("/")
 PROWLARR_API_KEY = os.getenv("PROWLARR_API_KEY", "")
 
@@ -2859,7 +2866,9 @@ def _assist_modes() -> str:
     def mode(simulation: bool) -> str:
         return "en simulation" if simulation else "ACTIVE"
     sonarr = bool(SONARR_URL and SONARR_API_KEY)
-    r4 = (mode(IMPORT_ASSIST_PACK_DRY_RUN) if sonarr and PROWLARR_URL and PROWLARR_API_KEY
+    trous = (mode(IMPORT_ASSIST_PACK_DRY_RUN or IMPORT_ASSIST_TROUS_DRY_RUN) if SEERR_URL and SEERR_API_KEY
+             else "inactives (pas de Seerr)")
+    r4 = (f"{mode(IMPORT_ASSIST_PACK_DRY_RUN)} (saisons trouées {trous})" if sonarr and PROWLARR_URL and PROWLARR_API_KEY
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
     return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)} "
@@ -3085,6 +3094,9 @@ def run_import_assist(dry_run: bool | None = None, source: str = "manuel") -> li
         verdicts_oublies, nouveaux_oublies = run_forgotten({dl for *_, p in bloques + en_cours for dl in p}, ctx)
         verdicts += verdicts_oublies
         nouveaux += nouveaux_oublies
+        verdicts_trous, nouveaux_trous = run_season_holes(ctx)
+        verdicts += verdicts_trous
+        nouveaux += nouveaux_trous
         if nouveaux:
             # Chaque ligne au-dessus dit sa règle, et si elle n'est qu'une simulation.
             log.info(
@@ -4112,6 +4124,14 @@ _PACK_TORRENT_MAX_BYTES = 20 * 1024 * 1024
 _PACK_RECOVER_AFTER = 1800
 # Recherches Prowlarr simultanées par process : l'arrêt du torrent, lui, n'attend pas.
 _pack_slots = threading.BoundedSemaphore(2)
+# Saisons trouées : un épisode n'est un trou que diffusé depuis ce délai, dans une
+# série ajoutée et demandée depuis ce délai, le temps que Sonarr cherche et que le
+# RSS passe.
+_TROUS_ATTENTE = 24 * 3600
+# Une saison déjà examinée ne l'est de nouveau qu'après ce délai.
+_TROUS_REPRISE = 3 * 86400
+# Saisons cherchées au plus par passage : chaque recherche interroge tous les indexeurs.
+_TROUS_MAX_PAR_PASSAGE = 2
 
 
 def schedule_pack_check(data: dict[str, Any]) -> bool:
@@ -4659,7 +4679,9 @@ def _pack_candidate(
                 or info.get("isSeasonExtra") or info.get("special")):
             continue
         titre_serie = info.get("seriesTitle") or ""
-        if ref["series_title"] and _series_title_key(titre_serie) != ref["series_title"]:
+        # Saisons trouées : plusieurs titres admis, faute de pack partiel de référence.
+        titres_admis = ref.get("series_titles") or ({ref["series_title"]} if ref.get("series_title") else set())
+        if titres_admis and _series_title_key(titre_serie) not in titres_admis:
             autres_titres.add(titre_serie)
             continue
         qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
@@ -5034,6 +5056,188 @@ def _pack_replacement(h: str, colonne: str = "new_hash") -> sqlite3.Row | None:
             return conn.execute(
                 f"SELECT * FROM pack_replace WHERE {colonne} = ? ORDER BY id DESC LIMIT 1", (h.lower(),)
             ).fetchone()
+
+
+# ── Assistant d'import, règle 4 : saisons trouées ───────────────────────────
+#
+# Sonarr cherche les épisodes d'une série à son ajout, puis n'écoute plus que le
+# RSS. Un épisode sans release à l'unité reste donc manquant, même quand un pack
+# de la saison existe : Sonarr le refuse, parce que d'autres épisodes ont déjà
+# mieux ou sont dans la file. StuGo, demandé le 20 novembre 2026 : 30 épisodes
+# sur 40 sans aucune release à l'unité, seul un pack 720p hongrois et anglais.
+# Comme après un pack partiel, ce pack comble les seuls trous : ses autres
+# fichiers ne sont pas téléchargés. Seules les séries demandées dans Seerr ces
+# derniers jours sont regardées : une vieille série incomplète ne se comble pas
+# d'elle-même.
+
+
+def _iso_epoch(texte: str | None) -> float:
+    """Date ISO 8601 (UTC) en secondes. 0 si absente ou illisible."""
+    try:
+        return (datetime.strptime((texte or "")[:19], "%Y-%m-%dT%H:%M:%S") - datetime(1970, 1, 1)).total_seconds()
+    except ValueError:
+        return 0.0
+
+
+def _series_client(clients: list[dict[str, Any]], serie: dict[str, Any]) -> str:
+    """Le client qBittorrent de Sonarr qui prend cette série : celui de ses étiquettes, sinon un client sans étiquette."""
+    actifs = sorted((c for c in clients if c.get("enable") and (c.get("implementation") or "").lower() == "qbittorrent"),
+                    key=lambda c: c.get("priority") or 1)
+    etiquettes = set(serie.get("tags") or [])
+    for c in actifs:
+        if etiquettes & set(c.get("tags") or []):
+            return c.get("name") or ""
+    return next((c.get("name") or "" for c in actifs if not c.get("tags")), "")
+
+
+def _holes_titles(url: str, cle: str, serie: dict[str, Any], saison: int, releases: list[str]) -> set[str]:
+    """
+    Titres de série qu'un pack peut porter, faute de pack partiel de référence : celui
+    de Sonarr, ses titres alternatifs pour cette saison, et ceux des releases déjà
+    prises pour elle. Garde-fou des anthologies, comme dans _pack_candidate.
+    """
+    noms = [serie.get("title") or ""] + [a.get("title") or "" for a in serie.get("alternateTitles") or []
+                                         if a.get("seasonNumber") in (None, -1, saison)]
+    cles = {_series_title_key(n) for n in noms}
+    for titre in list(dict.fromkeys(releases))[:4]:
+        info = (_arr_request("GET", url, cle, "parse", params={"title": titre}) or {}).get("parsedEpisodeInfo") or {}
+        cles.add(_series_title_key(info.get("seriesTitle") or ""))
+    return cles - {""}
+
+
+def _holes_pending(serie_id: int, saison: int, torrents: dict[str, dict[str, Any]]) -> bool:
+    """Un pack ajouté pour cette saison est-il encore en route dans qBittorrent ?"""
+    with _db_lock:
+        with get_db() as conn:
+            rows = conn.execute("SELECT new_hash FROM pack_replace WHERE series_id = ? AND season = ? AND at > ?",
+                                (serie_id, saison, int(time.time()) - _PACK_ATTEMPTS_WINDOW)).fetchall()
+    return any((t.get("progress") or 0) < 1 for r in rows for t in [torrents.get(r["new_hash"])] if t is not None)
+
+
+def run_season_holes(ctx: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """
+    Règle 4, saisons trouées, sur les séries demandées dans Seerr ces derniers
+    jours. Suit sa propre simulation et celle de la règle 4, sauf aperçu (tout
+    simulé). Retourne (verdicts, journalisés maintenant).
+    """
+    if not (SONARR_URL and SONARR_API_KEY and SEERR_URL and SEERR_API_KEY and PROWLARR_URL and PROWLARR_API_KEY):
+        return [], 0
+    dry = ctx["apercu"] or IMPORT_ASSIST_PACK_DRY_RUN or IMPORT_ASSIST_TROUS_DRY_RUN
+    url, cle = SONARR_URL, SONARR_API_KEY
+    maintenant = time.time()
+    try:
+        demandes = _seerr_tv_requests(maintenant - _ACCORD_WINDOW_DAYS * 86400)
+    except Exception as e:
+        log.error("  ⚠ [%s] saisons trouées : Seerr injoignable ou réponse inattendue (%s)", _regle(4), e)
+        return [], 0
+    # Les trous se comptent depuis la demande la plus récente de la série.
+    demandee_le: dict[int, float] = {}
+    for d in demandes:
+        tvdb = d["media"]["tvdbId"]
+        demandee_le[tvdb] = max(demandee_le.get(tvdb, 0.0), _iso_epoch(d.get("createdAt")))
+    diffuse_avant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(maintenant - _TROUS_ATTENTE))
+    verdicts: list[dict[str, Any]] = []
+    nouveaux = cherchees = attente = 0
+    clients: list[dict[str, Any]] | None = None
+    for tvdb, depuis in demandee_le.items():
+        try:
+            serie = next(iter(_arr_request("GET", url, cle, "series", params={"tvdbId": tvdb}) or []), None)
+            if not serie or not serie.get("monitored"):
+                continue
+            if maintenant - max(depuis, _iso_epoch(serie.get("added"))) < _TROUS_ATTENTE:
+                continue
+            serie_id = serie["id"]
+            episodes = _arr_request("GET", url, cle, "episode", params={"seriesId": serie_id}) or []
+            file = _arr_request("GET", url, cle, "queue/details", params={"seriesId": serie_id}) or []
+            en_file = {q.get("episodeId") for q in file}
+            # Les saisons que la règle 5 a écartées ne sont pas celles de la demande.
+            ecartees = (ctx.get("ecartees") or {}).get(serie_id) or set()
+            saisons = sorted({s["seasonNumber"] for s in serie.get("seasons") or []
+                              if s.get("monitored") and (s.get("seasonNumber") or 0) > 0} - ecartees)
+            for saison in saisons:
+                de_la_saison = [e for e in episodes if e.get("seasonNumber") == saison]
+                voulus = _episodes_wanted(de_la_saison)
+                trous = {e["id"] for e in de_la_saison if e["id"] in voulus
+                         and e["id"] not in en_file and (e.get("airDateUtc") or "9999") <= diffuse_avant}
+                cle_journal = f"trous-{serie_id}-s{saison}"
+                if (not trous
+                        or _assist_recent(cle_journal, ("pack-hole-fill", "pack-hole-none", "pack-hole-skip"),
+                                          dry, _TROUS_REPRISE)
+                        or _assist_seen(cle_journal, "pack-hole-error", dry)
+                        or _holes_pending(serie_id, saison, ctx["torrents"])):
+                    continue
+                if cherchees >= _TROUS_MAX_PAR_PASSAGE:
+                    attente += 1
+                    continue
+                cherchees += 1
+                if clients is None:
+                    clients = _arr_request("GET", url, cle, "downloadclient") or []
+                titre = f"{serie.get('title') or tvdb} S{saison:02d}"
+                try:
+                    verdicts.append(_fill_season_holes(url, cle, serie, saison, de_la_saison, trous, file, clients, dry))
+                except Exception as e:
+                    log.error("  ⚠ [%s] [sonarr] %s : saison trouée en erreur (%s)", _regle(4), titre, e)
+                    _assist_record(cle_journal, "sonarr", titre, "pack-hole-error", str(e), dry, 4)
+                    verdicts.append({"arr": "sonarr", "download_id": cle_journal, "title": titre,
+                                     "decision": "pack-hole-error", "reason": str(e)})
+                nouveaux += 1
+        except Exception as e:
+            log.error("  ⚠ [%s] [sonarr] série TVDB %s : saisons trouées en erreur (%s)", _regle(4), tvdb, e)
+    if attente:
+        log.info("  [%s] %d autre(s) saison(s) trouée(s) attendront le passage suivant", _regle(4), attente)
+    return verdicts, nouveaux
+
+
+def _fill_season_holes(url: str, cle: str, serie: dict[str, Any], saison: int, episodes: list[dict[str, Any]],
+                       trous: set[int], file: list[dict[str, Any]], clients: list[dict[str, Any]],
+                       dry: bool) -> dict[str, Any]:
+    """
+    Comble les trous d'une saison par un pack trouvé dans Prowlarr : seuls les
+    fichiers des trous sont téléchargés, dans la catégorie du client de la série.
+    Le pack est noté comme un comblement en VO de la règle 4, qui le suit jusqu'à
+    l'import puis cherche ces épisodes en français.
+    """
+    serie_id = serie["id"]
+    cle_journal = f"trous-{serie_id}-s{saison}"
+    titre = f"{serie.get('title')} S{saison:02d}"
+    verdict: dict[str, Any] = {"arr": "sonarr", "download_id": cle_journal, "title": titre, "stage": "trous"}
+
+    def fin(decision: str, details: str, signe: str = "⏭") -> dict[str, Any]:
+        verdict.update(decision=decision, reason=details)
+        _assist_record(cle_journal, "sonarr", titre, decision, details, dry, 4)
+        _assist_log(4, signe, "sonarr", titre, details, dry)
+        return verdict
+
+    resume = (f"{len(trous)} épisode(s) diffusé(s) depuis plus de {_TROUS_ATTENTE // 3600} h, "
+              "sans fichier ni téléchargement")
+    if _pack_attempts(serie_id, saison) >= _PACK_MAX_ATTEMPTS:
+        return fin("pack-hole-skip", f"{resume}, limite de remplacements atteinte pour cette saison : à voir à la main", "⚠")
+    client = _series_client(clients, serie)
+    categorie = _client_field(clients, client, ("tvCategory",)) if client else ""
+    if not categorie:
+        return fin("pack-hole-skip", f"{resume}, aucun client qBittorrent de Sonarr ne prend cette série", "⚠")
+    de_la_saison = {e["id"] for e in episodes}
+    releases = [q.get("title") or "" for q in file if q.get("episodeId") in de_la_saison]
+    releases += [f.get("sceneName") or "" for f in _arr_request("GET", url, cle, "episodefile",
+                                                                  params={"seriesId": serie_id}) or []
+                 if f.get("seasonNumber") == saison]
+    # Ni score ni qualité de référence : un pack que Sonarr accepterait vaut mieux que rien.
+    ref = {"series_title": "", "series_titles": _holes_titles(url, cle, serie, saison, [r for r in releases if r]),
+           "season": saison, "season_pack": True, "score": IMPORT_ASSIST_PACK_MIN_SCORE, "rang": -1}
+    profil = _quality_profile(url, cle, serie.get("qualityProfileId"))
+    with _pack_slots:
+        cand, ecartes = _pack_candidate(url, cle, serie, saison, episodes, trous, ref, profil, set())
+    if cand is None:
+        return fin("pack-hole-none", f"{resume}, aucun pack de la saison ne les apporte{_ecarts(ecartes)}")
+    seulement = _pack_files_for(cand, trous)
+    details = (f"{resume} → pris {'en VO ' if cand['vo'] else ''}dans {cand['title']} ({cand['indexer']}, "
+               f"{cand['seeders']} sources, score {cand['score']}) : {len(seulement)} fichier(s) téléchargé(s) "
+               f"sur {len(cand['par_fichier'])}, dans {categorie}")
+    verdict["vo"] = cand["title"]
+    if not dry:
+        _qbit_add(cand, categorie, {"auto_tmm": True}, seulement=seulement)
+        _pack_register(serie_id, saison, cle_journal, cand, "vo", trous)
+    return fin("pack-hole-fill", details, "✓")
 
 
 # ── Assistant d'import, règle 5 : accorder la demande Seerr et la saison Sonarr ─

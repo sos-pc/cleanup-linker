@@ -5,6 +5,7 @@ règle 2 élargie (identité confirmée) et règle 7 (release piégée), en simu
 import time
 
 import pytest
+from faux import faux_arr
 
 import app
 
@@ -16,17 +17,6 @@ NOM_PIEGE = "South Park S29E06 1080p WEB H264-MeGusta"
 
 def il_y_a(secondes: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - secondes))
-
-
-def faux_arr(routes: dict, appels: list):
-    """Remplace _arr_request : répond par route (méthode, point d'entrée), note chaque appel."""
-    def _arr_request(method, base_url, api_key, endpoint, timeout=30, retries=3, **kwargs):
-        appels.append((method, endpoint, kwargs.get("params"), kwargs.get("json")))
-        if (method, endpoint) not in routes:
-            raise AssertionError(f"appel inattendu : {method} {endpoint}")
-        reponse = routes[(method, endpoint)]
-        return reponse(kwargs) if callable(reponse) else reponse
-    return _arr_request
 
 
 def contexte(torrents: dict, apercu: bool = False) -> dict:

@@ -27,7 +27,7 @@ Trois principes valent partout :
 | Sauvegarde de la base | Avant chaque sync | Oui |
 | Corbeille après une suppression ou un upgrade dans Sonarr/Radarr | Webhook Sonarr/Radarr | Oui |
 | Corbeille après une suppression dans Jellyfin, déléguée à Sonarr/Radarr si l'option est active | Webhook Jellyfin | Oui |
-| Assistant d'import (règles 1, 2, 4, 5, 6, 7) | Event « Manual Interaction Required », « On Grab » pour la règle 4, passage de renfort toutes les 6 h | Oui |
+| Assistant d'import (règles 1, 2, 4, 5, 6, 7) | Event « Manual Interaction Required », « On Grab » pour la règle 4, passage de renfort toutes les heures | Oui |
 | Balayage des orphelins (`/cleanup`) | À la main | Non |
 | Restauration, bootstrap, sync forcée | À la main | Non |
 
@@ -99,6 +99,7 @@ services:
       - IMPORT_ASSIST_NOM_DRY_RUN=false      # règle 2 · torrent mal nommé
       - IMPORT_ASSIST_IDENTITE_DRY_RUN=false # règle 2 · identité confirmée
       - IMPORT_ASSIST_PACK_DRY_RUN=false     # règle 4 · pack incomplet
+      - IMPORT_ASSIST_TROUS_DRY_RUN=false    # règle 4 · saisons trouées
       - IMPORT_ASSIST_ACCORD_DRY_RUN=false   # règle 5 · bonne saison
       - IMPORT_ASSIST_MORT_DRY_RUN=false     # règle 6 · téléchargement mort
       - IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN=false  # règle 6 · mort-nés jugés plus tôt
@@ -167,11 +168,12 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 
 | Variable | Défaut | Description |
 |---|---|---|
-| `IMPORT_ASSIST_INTERVAL_MINUTES` | `360` | Intervalle du passage de renfort, qui rattrape les events manqués. `0` le désactive, et `/assist` reste utilisable |
+| `IMPORT_ASSIST_INTERVAL_MINUTES` | `60` | Intervalle du passage de renfort, qui rattrape les events manqués et voit seul les téléchargements morts et les saisons trouées. `0` le désactive, et `/assist` reste utilisable |
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Simulation de la règle 1 · débloquer la file |
 | `IMPORT_ASSIST_NOM_DRY_RUN` | `true` | Simulation de la règle 2 · torrent mal nommé |
 | `IMPORT_ASSIST_IDENTITE_DRY_RUN` | `true` | Simulation de l'identité confirmée de la règle 2 : le renommage d'un torrent dont le titre de release ne désigne pas le média à lui seul. Tant qu'elle simule, rien de ce qui en découle n'agit, règle 7 comprise |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Simulation de la règle 4 · pack incomplet |
+| `IMPORT_ASSIST_TROUS_DRY_RUN` | `true` | Simulation des saisons trouées (règle 4). Elles suivent aussi la simulation de la règle 4 |
 | `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
@@ -648,7 +650,7 @@ Il lit les files avec les lignes sans média. Quand le média d'un téléchargem
 ### Déclenchement
 
 - **L'event « On Manual Interaction Required »**, à cocher dans le webhook de Sonarr et de Radarr. L'*arr l'émet au moment où il bloque un import, dans trois cas : titre non reconnu, grab rattaché par ID, ou épisodes attendus manquants. L'assistant passe deux minutes plus tard, le temps que la file affiche l'état `importBlocked`. Les events reçus entre-temps se regroupent dans ce passage.
-- **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (6 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués. Un téléchargement mort ne déclenche aucun event, pas plus qu'une vidéo unique refusée : c'est ce passage, ou celui d'un autre event, qui les juge (règles 6 et 7). Avant chaque passage de renfort, l'assistant relance aussi un torrent dont la vérification de la règle 4 a été interrompue.
+- **Un passage de renfort**, toutes les `IMPORT_ASSIST_INTERVAL_MINUTES` (1 h par défaut, `0` le désactive), et deux minutes après chaque démarrage. L'*arr n'émet l'event qu'une fois par téléchargement, et l'oublie quand il redémarre : ce passage rattrape les events manqués. Un téléchargement mort ne déclenche aucun event, pas plus qu'une vidéo unique refusée : c'est ce passage, ou celui d'un autre event, qui les juge (règles 6 et 7). Avant chaque passage de renfort, l'assistant relance aussi un torrent dont la vérification de la règle 4 a été interrompue.
 - **L'event « On Grab »** de Sonarr lance tout de suite la vérification d'un pack de saison (règle 4), en arrière-plan, sans attendre de passage.
 - **`POST /assist?token=…`** lance un passage tout de suite et renvoie les verdicts :
   - sans paramètre, chaque règle suit son interrupteur ;
@@ -666,7 +668,7 @@ Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lanc
 |-------|--------------|-----------------|
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
 | 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false`, et `IMPORT_ASSIST_IDENTITE_DRY_RUN=false` pour l'identité confirmée | Renomme un torrent que l'*arr ne reconnaît pas, avec le titre de sa release, ou avec un nom refait une fois l'identité confirmée sans l'identifiant de l'indexeur, pour qu'il l'importe lui-même |
-| 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false` | Remplace un pack de saison partiel par un pack complet, ou comble ses trous |
+| 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false`, et `IMPORT_ASSIST_TROUS_DRY_RUN=false` pour les saisons trouées | Remplace un pack de saison partiel par un pack complet, ou comble ses trous. Comble aussi par un pack les trous d'une saison demandée qu'aucune release à l'unité n'apporte |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
 | 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false`, et `IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN=false` pour les mort-nés | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
 | 7 · téléchargement inutile | `IMPORT_ASSIST_INUTILE_DRY_RUN=false`, et `IMPORT_ASSIST_PIEGE_DRY_RUN=false` pour les releases piégées | Sort de la file, sans blacklist, un téléchargement bloqué qui n'apporterait rien, et le met en corbeille, où il continue de seeder. Une release piégée, elle, est blacklistée par l'*arr et arrêtée |
@@ -823,6 +825,37 @@ Verdicts :
 
 Les remplacements sont dans la table `pack_replace`.
 
+**Saisons trouées.** Sonarr cherche les épisodes d'une série à son ajout, puis n'écoute plus que le RSS. Un épisode sans release à l'unité reste donc manquant, même quand un pack de la saison existe : Sonarr refuse ce pack, parce que d'autres épisodes ont déjà mieux ou sont dans la file. StuGo, demandé le 20 novembre 2026, en est l'exemple. Sur 40 épisodes, 2 avaient un fichier, 7 étaient dans la file, et les 31 autres n'avaient aucune release à l'unité. Un pack anglais de la saison existait.
+
+À chaque passage de renfort, l'assistant regarde les séries demandées dans Seerr ces 30 derniers jours, saison surveillée par saison surveillée. Un trou est un épisode :
+- diffusé depuis plus de 24 h ;
+- surveillé, sans fichier ;
+- sans téléchargement dans la file de Sonarr ;
+- d'une série ajoutée et demandée depuis plus de 24 h, le temps que Sonarr cherche et que le RSS passe.
+
+S'il y en a, l'assistant cherche un pack de la saison dans Prowlarr, comme pour un pack partiel, mais :
+- sans qualité ni score de référence : tout pack que Sonarr accepterait vaut mieux que rien ;
+- le titre de série du pack doit être celui de la série, un de ses titres alternatifs pour cette saison, ou celui d'une release déjà prise pour elle. C'est le garde-fou des anthologies.
+
+Le pack trouvé ne télécharge que les fichiers des trous, dans la catégorie du client Sonarr de la série. Il est ensuite suivi comme un comblement en VO, jusqu'à l'import, puis la recherche en français.
+
+Garde-fous :
+- 2 saisons au plus par passage, car chaque recherche interroge tous les indexeurs ;
+- une saison déjà examinée ne l'est de nouveau qu'après 3 jours, une erreur après 24 h ;
+- rien tant qu'un pack ajouté pour la saison est encore en route ;
+- la même limite que les remplacements : 2 par saison et par semaine ;
+- une vieille série incomplète, non demandée, ne se comble pas d'elle-même.
+
+Verdicts :
+- `pack-hole-fill` (pack pris pour les trous) ;
+- `pack-hole-none` (aucun pack ne les apporte) ;
+- `pack-hole-skip` (limite atteinte, ou aucun client) ;
+- `pack-hole-error`.
+
+```
+INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] StuGo S01 : 31 épisode(s) diffusé(s) depuis plus de 24 h, sans fichier ni téléchargement → pris en VO dans StuGo.S01.1080p.HULU.WEB-DL.DD5.1.H.264-BTN (seedpool (API), 4 sources, score -10) : 31 fichier(s) téléchargé(s) sur 40, dans Rays_Le _Chat
+```
+
 ```
 INFO     [SIMULATION] ✓ [règle 4 · pack incomplet] [sonarr] Kengan.Ashura.S01.MULTI.VFF.1080p.WEBRip.EAC3.2.0.x265-SQUEEZE : pack partiel : 12/24 épisodes attendus de la saison 1 → remplacé par Kengan.Ashura.S01.MULTi.VFF.1080p.WEBRiP.EAC3.2.0.x265-T3KASHi (C411, 15 sources, score 195)
 INFO     [SIMULATION] ⏭ [règle 4 · pack incomplet] [sonarr] Ranma ep 15-21 : pas un pack de saison
@@ -977,7 +1010,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
