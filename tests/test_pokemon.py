@@ -4,6 +4,7 @@ que par la prise, et elle a retiré l'épisode interdit S01E18 « Beauty and the
 Ses vidéos sont importées par le titre de leur épisode (règle 2). La règle 4 admet les titres que Sonarr connaît quand
 il ne reconnaît pas celui du pack partiel, sans rouvrir le piège Monster ni prendre Pokémon Horizons pour la saison 1.
 """
+import os
 import re
 from contextlib import contextmanager
 
@@ -27,9 +28,19 @@ def nom_netflix(n, titre):
     return f"Pokemon.The.Series.Indigo.League.S01E{n:02d}.{titre}.MULTi.1080p.NF.WEB.DDP.AV1-BTT.mkv"
 
 
+# Qualités du profil 7, de la moins bonne à la meilleure.
+Q480, Q1080 = 8, 3
+
+
 def episodes_tvdb(avec_fichier=()):
-    return [{"id": 2000 + n, "seasonNumber": 1, "episodeNumber": n, "title": titre, "hasFile": n in avec_fichier}
-            for n, titre in TVDB.items()]
+    return [{"id": 2000 + n, "seasonNumber": 1, "episodeNumber": n, "title": titre, "hasFile": n in avec_fichier,
+             "episodeFileId": 9000 + n if n in avec_fichier else 0} for n, titre in TVDB.items()]
+
+
+def pourvoir(etat, en_place):
+    """Des fichiers en place : épisode → (qualité, score de formats)."""
+    etat["en_place"] = dict(en_place)
+    etat["episodes"] = episodes_tvdb(avec_fichier=set(en_place))
 
 
 @pytest.fixture
@@ -37,7 +48,8 @@ def netflix(monkeypatch, tmp_path):
     """Le pack Netflix téléchargé, un faux Sonarr ; l'import manuel est noté, rien n'est appelé."""
     dossier = tmp_path / "Pokemon.The.Series.S01.Indigo.League.MULTi.1080p.NF.WEB.DDP.AV1-BTT"
     dossier.mkdir()
-    etat = {"fichiers": dict(NETFLIX), "episodes": episodes_tvdb(), "commandes": [], "dossier": dossier}
+    etat = {"fichiers": dict(NETFLIX), "episodes": episodes_tvdb(), "commandes": [], "dossier": dossier,
+            "en_place": {}, "qualite": {"quality": {"id": Q1080}}}
 
     def ecrire():
         for f in dossier.iterdir():
@@ -48,15 +60,21 @@ def netflix(monkeypatch, tmp_path):
     etat["ecrire"] = ecrire
     routes = {
         ("GET", "episode"): lambda kw: etat["episodes"],
-        ("GET", "manualimport"): lambda kw: [{"path": str(f), "quality": {"quality": {"id": 3}}, "languages": [{"id": 2}],
-                                              "releaseGroup": "BTT"} for f in sorted(dossier.iterdir())],
+        ("GET", "manualimport"): lambda kw: [{"path": str(f), "quality": etat["qualite"], "languages": [{"id": 2}],
+                                              "releaseGroup": "BTT", "customFormatScore": 0}
+                                             for f in sorted(dossier.iterdir())],
+        ("GET", "episodefile"): lambda kw: [{"id": 9000 + n, "seasonNumber": 1, "quality": {"quality": {"id": q}},
+                                             "customFormatScore": score} for n, (q, score) in etat["en_place"].items()],
+        ("GET", f"series/{SERIE}"): {"id": SERIE, "qualityProfileId": 7},
+        ("GET", "qualityprofile/7"): {"items": [{"quality": {"id": Q480}}, {"quality": {"id": Q1080}}]},
         ("POST", "command"): lambda kw: etat["commandes"].append(kw["json"]) or {},
     }
     monkeypatch.setattr(app, "_arr_request", faux_arr(routes, []))
     monkeypatch.setattr(app, "IMPORT_ASSIST_NOM_DRY_RUN", False)
     monkeypatch.setattr(app, "IMPORT_ASSIST_TITRES_DRY_RUN", False)
     etat["torrent"] = {"hash": DL, "name": dossier.name, "content_path": str(dossier), "save_path": str(tmp_path)}
-    etat["records"] = [{"episodeId": 2000 + n, "downloadId": DL.upper(), "title": dossier.name} for n in TVDB]
+    etat["records"] = [{"episodeId": 2000 + n, "seriesId": SERIE, "downloadId": DL.upper(), "title": dossier.name}
+                       for n in TVDB]
     return etat
 
 
@@ -111,12 +129,106 @@ def test_deux_videos_pour_un_meme_episode(netflix):
 
 
 def test_episode_deja_pourvu_ou_hors_de_la_prise(netflix):
-    netflix["episodes"] = episodes_tvdb(avec_fichier={16})
+    pourvoir(netflix, {16: (Q1080, 0)})
     netflix["records"] = [r for r in netflix["records"] if r["episodeId"] != 2023]
     verdict, _ = importer(netflix)
     importes = ranges(netflix)
     assert 16 not in importes.values() and 23 not in importes.values()
-    assert verdict["reason"].startswith("7/8 vidéo(s) reconnue(s) au titre exact de leur épisode, 6 importée(s)")
+    assert verdict["reason"].startswith("7/8 vidéo(s) reconnue(s) au titre exact de leur épisode, 6 importée(s) "
+                                        "dans un épisode vide, 1 laissée(s) : le fichier en place est de qualité au moins égale")
+
+
+def test_meilleure_qualite_remplace_le_fichier_en_place(netflix):
+    """YLAMARCH a mis certains épisodes en 480p : la version Netflix en 1080p les remplace, comme un upgrade."""
+    pourvoir(netflix, {16: (Q480, 0)})
+    verdict, _ = importer(netflix)
+    assert 16 in ranges(netflix).values()
+    assert "1 à la place d'un fichier moins bon (S01E16 « Pokémon Shipwreck »)" in verdict["reason"]
+
+
+def test_meme_qualite_meilleur_score_ne_remplace_pas(netflix):
+    """Le score d'un fichier en place dépend de son nom : YLAMARCH, en français, compte 0, Netflix MULTi 85."""
+    pourvoir(netflix, {16: (Q1080, -10)})
+    importer(netflix)
+    assert 16 not in ranges(netflix).values()
+
+
+@pytest.fixture
+def inutile(monkeypatch):
+    """La règle 7 notée, pas appelée."""
+    appels = []
+    monkeypatch.setattr(app, "_useless", lambda arr, url, cle, dl, records, t, ctx, verdict, constat:
+                        appels.append((ctx["apercu"], constat)) or ({"decision": "useless"}, True))
+    return appels
+
+
+@pytest.mark.parametrize("simulation", [False, True])
+def test_rien_a_apporter_confie_a_la_regle_7(netflix, inutile, monkeypatch, simulation):
+    monkeypatch.setattr(app, "IMPORT_ASSIST_TITRES_DRY_RUN", simulation)
+    pourvoir(netflix, {n: (Q1080, 0) for n in TVDB})
+    verdict, _ = importer(netflix)
+    assert verdict["decision"] == "useless" and netflix["commandes"] == []
+    # Tant que l'import par titre simule, la règle 7 qui en découle simule aussi.
+    [(apercu, constat)] = inutile
+    assert apercu is simulation
+    assert constat.startswith("ses 8 vidéo(s), reconnues au titre exact de leur épisode, n'apportent rien")
+
+
+def test_rien_a_apporter_mais_une_video_inconnue(netflix, inutile):
+    netflix["fichiers"][15] = "Episode.Sans.Titre.Connu"
+    pourvoir(netflix, {n: (Q1080, 0) for n in TVDB})
+    assert importer(netflix) is None and inutile == []
+
+
+@pytest.mark.parametrize("cas", ["qualite hors profil", "sans proposition"])
+def test_dans_le_doute_rien_n_est_jete(netflix, inutile, cas):
+    pourvoir(netflix, {n: (Q1080, 0) for n in TVDB})
+    if cas == "qualite hors profil":
+        netflix["en_place"][16] = (99, 0)
+    else:
+        netflix["qualite"] = None
+    assert importer(netflix) is None and inutile == []
+
+
+def test_import_termine_quand_plus_rien_a_apporter(netflix):
+    netflix["ecrire"]()
+    ctx = {"torrents": {}, "categories": {}, "dry_run": False, "apercu": False, "ecartees": {}}
+    pourvoir(netflix, {n: (Q1080, 0) for n in TVDB})
+
+    def fini(lies=3):
+        return app._titles_done("sonarr", "u", "k", DL, netflix["records"], netflix["torrent"], SERIE, ctx, lies)
+
+    assert not fini()  # aucun import par titre n'a eu lieu
+    app._assist_record(DL, "sonarr", "Pokemon", "import-titles", "fait", False, 2)
+    assert fini()
+    assert not fini(lies=0)
+    pourvoir(netflix, {n: (Q1080, 0) for n in TVDB if n != 20})
+    assert not fini()  # un épisode reste à remplir
+    pourvoir(netflix, {n: (Q480 if n == 20 else Q1080, 0) for n in TVDB})
+    assert not fini()  # un fichier en place reste à remplacer
+
+
+def test_episode_vide_sans_proposition_d_import(netflix):
+    """Sans qualité proposée par Sonarr, la vidéo n'est pas importée, même dans un épisode vide."""
+    netflix["qualite"] = None
+    assert importer(netflix) is None
+    assert netflix["commandes"] == []
+
+
+def test_sortie_de_file_par_la_regle_1(netflix, monkeypatch):
+    """Une fois l'import par titre terminé, le téléchargement suit la règle 1 : catégorie après import, seed."""
+    netflix["ecrire"]()
+    videos = sorted(str(f) for f in netflix["dossier"].iterdir())
+    torrent = dict(netflix["torrent"], progress=1)
+    ctx = {"torrents": {DL: torrent}, "categories": {}, "dry_run": False, "apercu": False, "ecartees": {}}
+    monkeypatch.setattr(app, "_seed_obstacle", lambda categorie, t, ctx: "suite de la règle 1")
+    for termine, raison in ((True, "suite de la règle 1"), (False, "1/8 vidéo(s) dans la bibliothèque")):
+        monkeypatch.setattr(app, "_titles_done", lambda *a, termine=termine: termine)
+        with app.get_db() as conn:
+            conn.execute("DELETE FROM assist_log")
+        verdict, _ = app._assist_download("sonarr", "u", "k", DL, netflix["records"], [],
+                                          {SERIE: {os.stat(videos[0]).st_ino}}, ctx)
+        assert verdict["reason"] == raison
 
 
 def test_saison_ecartee_par_la_regle_5(netflix):
