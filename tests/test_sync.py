@@ -4,11 +4,11 @@ Une lecture qui ferait trop maigrir l'index est refusée ; une sync ratée est r
 de juger après une chute, même jusqu'à zéro.
 """
 import os
-import threading
 import time
 from contextlib import contextmanager
 
 import pytest
+from faux import FilsImmediats
 
 import app
 
@@ -195,20 +195,6 @@ def test_boucle_reprend_vite_apres_un_echec(monkeypatch):
     assert attentes == [5, 300, 900, 1800, 12 * 3600, 300]
 
 
-class _FilsImmediats:
-    """Remplace le module threading d'app : le fil lancé par une route tourne dans le test même."""
-
-    class Thread:
-        def __init__(self, target, args=(), kwargs=None, daemon=None):
-            self.target, self.args, self.kwargs = target, args, kwargs or {}
-
-        def start(self):
-            self.target(*self.args, **self.kwargs)
-
-    def __getattr__(self, nom):
-        return getattr(threading, nom)
-
-
 @pytest.mark.parametrize("statut,poursuit", [("refused", False), ("failed", False), ("success", True)])
 def test_cleanup_s_arrete_si_sa_sync_n_a_pas_reussi(sync, monkeypatch, statut, poursuit):
     """Un index refusé ou une sync ratée ne disent pas l'état des liens : /cleanup ne va pas plus loin."""
@@ -218,7 +204,7 @@ def test_cleanup_s_arrete_si_sa_sync_n_a_pas_reussi(sync, monkeypatch, statut, p
         suite.append(True)
         raise RuntimeError("fin du test")
 
-    monkeypatch.setattr(app, "threading", _FilsImmediats())
+    monkeypatch.setattr(app, "threading", FilsImmediats())
     monkeypatch.setattr(app, "sync_db", lambda force=False: statut)
     monkeypatch.setattr(app, "_arr_queue_hashes", file_des_arr)
     reponse = app.app.test_client().post("/cleanup?token=tests&dry_run=true")
