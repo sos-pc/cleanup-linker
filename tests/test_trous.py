@@ -217,3 +217,50 @@ def test_le_client_de_la_serie(etiquettes, client):
 
 def test_le_passage_de_renfort_a_lieu_toutes_les_heures():
     assert app.IMPORT_ASSIST_INTERVAL == 3600
+
+
+# ── Saisons tenues par un téléchargement mort, et demandes par saison ────────
+
+def mourir(stugo, dead_wait=True, seeds=0):
+    """Les téléchargements de la file deviennent un seul magnet mort-né, comme Pokémon S04."""
+    mort = "d" * 40
+    for q in stugo["file"]:
+        q["downloadId"] = mort.upper()
+    if dead_wait:
+        app._assist_record(mort, "sonarr", "magnet", "dead-wait", "aucune autre version trouvée", False, 6)
+    return {mort: {"hash": mort, "progress": 0, "state": "metaDL", "added_on": time.time() - 20 * 3600,
+                   "last_activity": time.time() - 20 * 3600, "num_seeds": seeds, "dlspeed": 0, "downloaded": 0}}
+
+
+def test_un_mort_sans_autre_version_ne_tient_pas_ses_episodes(stugo):
+    app.run_season_holes(contexte(mourir(stugo)))
+    [(_, _, _, seulement)] = stugo["ajouts"]
+    assert len(seulement) == 38  # les 40, moins les 2 qui ont un fichier
+
+
+def test_un_mort_encore_en_course_tient_ses_episodes(stugo):
+    app.run_season_holes(contexte(mourir(stugo, dead_wait=False)))
+    [(_, _, _, seulement)] = stugo["ajouts"]
+    assert len(seulement) == 31
+
+
+def test_un_telechargement_vivant_tient_ses_episodes(stugo):
+    app.run_season_holes(contexte(mourir(stugo, seeds=2)))
+    [(_, _, _, seulement)] = stugo["ajouts"]
+    assert len(seulement) == 31
+
+
+def demande(createdat, saison):
+    return {"media": {"tvdbId": 454056, "tmdbId": 1}, "createdAt": createdat, "seasons": [{"seasonNumber": saison}]}
+
+
+def test_chaque_saison_compte_depuis_sa_demande(stugo):
+    """Pokémon : la saison 1, demandée il y a deux jours, n'attend pas la demande d'une autre saison faite à l'instant."""
+    stugo["demandes"] = [demande(il_y_a(2 * 86400), 1), demande(il_y_a(3600), 2)]
+    verdicts, _ = app.run_season_holes(contexte())
+    assert verdicts[0]["decision"] == "pack-hole-fill"
+
+
+def test_la_saison_demandee_a_l_instant_attend(stugo):
+    stugo["demandes"] = [demande(il_y_a(2 * 86400), 2), demande(il_y_a(3600), 1)]
+    assert app.run_season_holes(contexte()) == ([], 0)
