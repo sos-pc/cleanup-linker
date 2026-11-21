@@ -766,11 +766,23 @@ Quand l'identité n'est pas confirmée par le nom, l'assistant lit le titre que 
 - sans casse, accents ni ponctuation, « & » lu « and », un mot de scène en tête (« FiNAL ») ignoré ;
 - le plus long des titres qui conviennent, s'il désigne un seul épisode (à défaut, un seul de la saison du nom), et de 6 lettres ou chiffres au moins.
 
-Si au moins 80 % des vidéos sont reconnues, sans deux vidéos pour un même épisode, chacune est importée en hardlink sous son épisode. Seuls sont importés les épisodes de la prise, hors saison écartée par la règle 5, et encore sans fichier : rien n'est remplacé. Le journal dit combien de vidéos sont rangées sous un autre numéro que celui de leur nom, avec un exemple. Les vidéos sans titre reconnu restent à importer à la main.
+Si au moins 80 % des vidéos sont reconnues, sans deux vidéos pour un même épisode, chacune est classée. Seuls comptent les épisodes de la prise, hors saison écartée par la règle 5 :
+- **épisode vide** : la vidéo est importée en hardlink sous son épisode ;
+- **qualité de rang supérieur** dans le profil (480p → 1080p) : elle remplace le fichier en place, comme un upgrade ;
+- **qualité au moins égale en place** : le fichier en place reste ;
+- **comparaison impossible** (qualité hors profil, pas de proposition d'import de Sonarr) : le fichier en place reste, et rien n'est jeté.
+
+Le score de formats ne départage pas : celui d'un fichier en place dépend de son nom. Les fichiers YLAMARCH de Pokémon, en français mais renommés sans « VFF », comptent 0, quand la version Netflix MULTi compte 85. Comparer les scores aurait remplacé 50 bons fichiers français.
+
+Le journal dit combien de vidéos sont rangées sous un autre numéro que celui de leur nom, avec un exemple. Les vidéos sans titre reconnu restent à importer à la main.
+
+**Quand il n'apporte rien.** Si toutes ses vidéos sont reconnues et qu'aucune n'améliore un épisode, le téléchargement est confié à la règle 7 : retiré de la file sans blacklist, mis en corbeille, où il continue de seeder. Une vidéo non reconnue, ou impossible à comparer, empêche ce verdict. C'est le cas de la version Netflix de Pokémon après l'arrivée de YLAMARCH : ses 52 épisodes, E01 à E57 sans les 3 interdits ni E52-E53, avaient tous un fichier 1080p. Tant que l'import par titre simule, la règle 7 qui en découle simule aussi.
+
+**Quand il a apporté une partie.** Une fois ses vidéos utiles importées, et rien d'autre à attendre, le téléchargement quitte la file comme un import complet de la règle 1 : catégorie après import, seed.
 
 Elle a son propre interrupteur, `IMPORT_ASSIST_TITRES_DRY_RUN`, en simulation par défaut.
 
-Verdicts : `rename` (torrent renommé), `import-titles` (importé par titre d'épisode), `rename-suspect`, `rename-blocked`, `rename-orphan` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
+Verdicts : `rename` (torrent renommé), `import-titles` (importé par titre d'épisode), `useless` (rien à apporter, voir la règle 7), `rename-suspect`, `rename-blocked`, `rename-orphan` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
 
 ```
 INFO     ✓ [règle 2 · torrent mal nommé] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : le titre de la release désigne bien Resident Evil (2026) : torrent renommé Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo → Radarr l'importera seul
@@ -1022,7 +1034,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, fichier 480p remplacé, rien remplacé à qualité égale, règle 7 quand rien n'est apporté, sortie de file, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest

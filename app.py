@@ -3313,7 +3313,10 @@ def _assist_download(
                                 f"{arr.capitalize()} refuse les {refusees} vidéo(s) : la bibliothèque a déjà mieux pour chacune")
             if _matched_by_id(records):
                 return _misnamed(arr, url, cle, dl, records, t, media_id, ctx, verdict, ecarte)
-        return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
+        # Règle 2, import par titre d'épisode : ses vidéos utiles sont importées, les autres
+        # n'apportent rien. Il quitte alors la file comme un import complet, et seede.
+        if not _titles_done(arr, url, cle, dl, records, t, media_id, ctx, lies):
+            return ecarte(f"{lies}/{len(videos)} vidéo(s) dans la bibliothèque")
 
     obstacle = _seed_obstacle(categorie, t, ctx)
     if obstacle:
@@ -3374,7 +3377,9 @@ def _assist_download(
             log.error("  ⚠ [%s] [%s] %s : %s", _regle(4), arr, titre, note)
 
     recherche = manquants if len(manquants) <= _ASSIST_MAX_SEARCH and not remplace else []
-    resume = f"{len(videos)}/{len(videos)} vidéo(s) déjà dans la bibliothèque → {categorie}"
+    resume = (f"{lies}/{len(videos)} vidéo(s) déjà dans la bibliothèque"
+              + (", les autres n'apportent rien (import par titre d'épisode)" if lies < len(videos) else "")
+              + f" → {categorie}")
     if remplace and pack.get("vo"):
         resume += (f", règle 4 : les {len(manquants)} épisode(s) manquant(s) pris en VO dans {pack['title']}, "
                    "seuls leurs fichiers téléchargés")
@@ -3759,18 +3764,27 @@ def _episode_by_title(nom: str, par_cle: dict[str, list[dict[str, Any]]]) -> dic
     return episodes[0] if len(episodes) == 1 else None
 
 
-def _import_by_titles(
+def _titles_plan(
     url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any], media_id: int,
-    ctx: dict[str, Any], verdict: dict[str, Any],
-) -> tuple[dict[str, Any], bool] | None:
+    ctx: dict[str, Any],
+) -> dict[str, Any] | None:
     """
-    Règle 2, import par titre d'épisode : chaque vidéo reconnue par son titre est
-    importée (hardlink) sous cet épisode, s'il fait partie de ceux de la prise et n'a
-    pas encore de fichier. None si les titres ne suffisent pas : moins de
-    _TITRES_PART_MIN des vidéos reconnues, ou deux vidéos pour un même épisode.
+    Ce que l'import par titre ferait de ce téléchargement, vidéo par vidéo. None si
+    les titres ne suffisent pas : moins de _TITRES_PART_MIN des vidéos reconnues, ou
+    deux vidéos pour un même épisode. Sinon, parmi les reconnues (épisodes de la prise,
+    hors saison écartée par la règle 5) :
+    - `vides` : l'épisode n'a pas de fichier ;
+    - `mieux` : la vidéo est d'une qualité de rang supérieur dans le profil (480p →
+      1080p) : elle remplace le fichier en place, comme un upgrade ;
+    - `deja` : le fichier en place est d'une qualité au moins égale ;
+    - `doute` : Sonarr ne permet pas de comparer (qualité inconnue du profil, pas de
+      proposition d'import) : le fichier en place reste, et rien n'est jeté.
+    La qualité d'une vidéo est celle que Sonarr lui donne à l'import (proposition
+    d'import manuel). Le score de formats ne départage pas : celui d'un fichier en
+    place dépend de son nom. Les fichiers YLAMARCH de Pokémon, en français mais
+    renommés sans « VFF », comptent 0, et la version Netflix MULTi 85 : comparer les
+    scores remplacerait 50 bons fichiers français.
     """
-    dry = ctx["apercu"] or IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_TITRES_DRY_RUN
-    titre = records[0].get("title") or dl
     videos = _torrent_videos(t) or []
     if not videos:
         return None
@@ -3791,33 +3805,102 @@ def _import_by_titles(
         return None
     if len({e["id"] for e in reconnus.values()}) < len(reconnus):
         return None  # deux vidéos pour un même épisode : les titres ne départagent rien
-    a_importer = {v: e for v, e in reconnus.items() if not e.get("hasFile")}
+    propositions = {it.get("path"): it for it in _arr_request(
+        "GET", url, cle, "manualimport", timeout=300,
+        params={"downloadId": dl.upper(), "filterExistingFiles": "false"}) or []}
+    fichiers = {f["id"]: f for f in _arr_request("GET", url, cle, "episodefile", params={"seriesId": media_id}) or []}
+    rang = _quality_rank(url, cle, (_arr_request("GET", url, cle, f"series/{media_id}") or {}).get("qualityProfileId"))
+
+    def niveau(objet: dict[str, Any]) -> int | None:
+        return rang.get(((objet.get("quality") or {}).get("quality") or {}).get("id"))
+
+    plan: dict[str, Any] = {"videos": videos, "reconnus": reconnus, "propositions": propositions,
+                            "vides": {}, "mieux": {}, "deja": {}, "doute": {}}
+    for v, e in reconnus.items():
+        proposition = propositions.get(v) or {}
+        if not proposition.get("quality"):
+            plan["doute"][v] = e  # sans qualité, Sonarr n'importerait pas
+        elif not e.get("hasFile"):
+            plan["vides"][v] = e
+        else:
+            r_video, r_place = niveau(proposition), niveau(fichiers.get(e.get("episodeFileId")) or {})
+            if r_video is None or r_place is None:
+                plan["doute"][v] = e
+            elif r_video > r_place:
+                plan["mieux"][v] = e
+            else:
+                plan["deja"][v] = e
+    return plan
+
+
+def _titles_done(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
+                 media_id: int, ctx: dict[str, Any], lies: int) -> bool:
+    """
+    Un téléchargement importé en partie par titre d'épisode n'a-t-il plus rien à
+    apporter ? Ses vidéos utiles sont dans la bibliothèque, les autres ne valent pas
+    les fichiers en place. Il peut alors quitter la file comme un import complet.
+    """
+    if arr != "sonarr" or not lies or _assist_last(dl, "import-titles", False) is None:
+        return False
+    plan = _titles_plan(url, cle, dl, records, t, media_id, ctx)
+    return plan is not None and not plan["vides"] and not plan["mieux"]
+
+
+def _import_by_titles(
+    url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any], media_id: int,
+    ctx: dict[str, Any], verdict: dict[str, Any],
+) -> tuple[dict[str, Any], bool] | None:
+    """
+    Règle 2, import par titre d'épisode : chaque vidéo reconnue par son titre est
+    importée (hardlink) sous cet épisode, s'il est vide ou si elle vaut mieux que le
+    fichier en place (_titles_plan). Si toutes ses vidéos sont reconnues et qu'aucune
+    n'apporte rien, le téléchargement est confié à la règle 7. None si les titres ne
+    suffisent pas.
+    """
+    dry = ctx["apercu"] or IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_TITRES_DRY_RUN
+    titre = records[0].get("title") or dl
+    plan = _titles_plan(url, cle, dl, records, t, media_id, ctx)
+    if plan is None:
+        return None
+    videos, reconnus = plan["videos"], plan["reconnus"]
+    a_importer = {**plan["vides"], **plan["mieux"]}
+    if not a_importer:
+        if len(reconnus) < len(videos) or plan["doute"]:
+            return None  # une vidéo non reconnue, ou impossible à comparer, apporte peut-être quelque chose
+        # Tant que l'import par titre simule, la règle 7 qui en découle simule aussi.
+        return _useless("sonarr", url, cle, dl, records, t, dict(ctx, apercu=True) if dry else ctx, verdict,
+                        f"ses {len(videos)} vidéo(s), reconnues au titre exact de leur épisode, n'apportent rien : "
+                        "chaque épisode a déjà un fichier de qualité au moins égale")
     decales = [(nom[m.start():], e) for v, e in sorted(reconnus.items())
                for nom in [os.path.splitext(os.path.basename(v))[0]] if (m := _TITRES_EPISODE_RE.search(nom))
                and (int(m.group(1)), int(m.group(2))) != (e.get("seasonNumber"), e.get("episodeNumber"))]
     details = (f"{len(reconnus)}/{len(videos)} vidéo(s) reconnue(s) au titre exact de leur épisode, "
-               f"{len(a_importer)} importée(s) sous cet épisode")
+               f"{len(plan['vides'])} importée(s) dans un épisode vide")
+    if plan["mieux"]:
+        _, e = sorted(plan["mieux"].items())[0]
+        details += (f", {len(plan['mieux'])} à la place d'un fichier moins bon "
+                    f"(S{e['seasonNumber']:02d}E{e['episodeNumber']:02d} « {e.get('title')} »)")
+    if plan["deja"]:
+        details += f", {len(plan['deja'])} laissée(s) : le fichier en place est de qualité au moins égale"
+    if plan["doute"]:
+        details += f", {len(plan['doute'])} laissée(s) faute de pouvoir les comparer au fichier en place"
     if decales:
         nom, e = decales[0]
-        details += (f", dont {len(decales)} rangée(s) sous un autre numéro que celui de leur nom "
+        details += (f" ; {len(decales)} rangée(s) sous un autre numéro que celui de leur nom "
                     f"(« {nom[:50]} » → S{e['seasonNumber']:02d}E{e['episodeNumber']:02d} « {e.get('title')} »)")
     if len(reconnus) < len(videos):
         details += f" ; {len(videos) - len(reconnus)} sans épisode reconnu parmi ceux de la prise, à importer à la main"
     verdict.update(decision="import-titles", reason=details, files=len(a_importer))
     if _assist_seen(dl, "import-titles", dry):
         return verdict, False
-    if a_importer and not dry:
-        propositions = {it.get("path"): it for it in _arr_request(
-            "GET", url, cle, "manualimport", timeout=300,
-            params={"downloadId": dl.upper(), "filterExistingFiles": "false"}) or []}
+    if not dry:
         entrees = [{"path": v, "seriesId": media_id, "episodeIds": [e["id"]], "quality": p["quality"],
                     "languages": p.get("languages") or [], "releaseGroup": p.get("releaseGroup") or "",
                     "indexerFlags": p.get("indexerFlags") or 0, "releaseType": "singleEpisode",
                     "downloadId": dl.upper()}
-                   for v, e in sorted(a_importer.items()) for p in [propositions.get(v) or {}] if p.get("quality")]
-        if not entrees:
-            return None
-        # « copy » : hardlink depuis le torrent, qui continue de seeder.
+                   for v, e in sorted(a_importer.items()) for p in [plan["propositions"][v]]]
+        # « copy » : hardlink depuis le torrent, qui continue de seeder. Un fichier en place
+        # moins bon est remplacé, comme lors d'un upgrade.
         _arr_request("POST", url, cle, "command", json={"name": "ManualImport", "importMode": "copy", "files": entrees})
     _assist_record(dl, "sonarr", titre, "import-titles", details, dry, 2)
     _assist_log(2, "✓", "sonarr", titre, details, dry)
