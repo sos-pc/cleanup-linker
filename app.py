@@ -1966,6 +1966,11 @@ def _trash_torrent(racine: str, fichiers: list[str]) -> tuple[bytes, str]:
     """
     Le .torrent d'un torrent de corbeille : ces fichiers, sous `racine`, sans lire
     leurs données. Retourne (contenu du .torrent, infohash v1).
+
+    Le dossier entre dans l'infohash (champ `source`). Deux dossiers jumeaux, la
+    même release sous deux trackers de cross-seeds, ont le même nom et les mêmes
+    fichiers : sans lui, ils donneraient le même torrent, et qBittorrent refuserait
+    le second.
     """
     nom = os.path.basename(racine)
     if fichiers == [racine] and not os.path.isdir(racine):
@@ -1977,8 +1982,9 @@ def _trash_torrent(racine: str, fichiers: list[str]) -> tuple[bytes, str]:
         total = sum(e["length"] for e in liste)
         info = {"name": nom, "files": liste}
     pieces = max(1, -(-total // _CORBEILLE_PIECE))
+    dossier = hashlib.sha1(os.fsencode(racine)).hexdigest()[:16]
     info.update({"piece length": _CORBEILLE_PIECE, "pieces": b"\0" * 20 * pieces,
-                 "private": 1, "source": "cleanup-linker"})
+                 "private": 1, "source": f"cleanup-linker {dossier}"})
     return _bencode({"info": info, "created by": "cleanup-linker"}), hashlib.sha1(_bencode(info)).hexdigest()
 
 
@@ -2447,9 +2453,20 @@ def _rest_plan(s: requests.Session, lues: set[str], en_file: set[str], geres: se
     return plan
 
 
+def _qbit_has(s: requests.Session, h: str) -> bool:
+    """qBittorrent a-t-il ce torrent ?"""
+    rep = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": h}, timeout=10)
+    rep.raise_for_status()
+    return bool(rep.json())
+
+
 def _trash_apply(plan: dict[str, Any], s: requests.Session, source: str) -> dict[str, int]:
-    """Exécute le plan : torrents en corbeille, torrents de corbeille ajoutés. Rien n'est supprimé."""
-    faits = {"torrents": 0, "corbeilles": 0}
+    """
+    Exécute le plan : torrents en corbeille, torrents de corbeille ajoutés. Rien n'est
+    supprimé. Ce qui est fait est compté au fur et à mesure dans plan["faits"] : après
+    une erreur, l'appelant sait ce qui a déjà changé.
+    """
+    faits = plan["faits"] = {"torrents": 0, "corbeilles": 0}
     lot = {t["hash"] for t in plan["torrents"]}
     if lot:
         # Comme ailleurs : un torrent dont le dossier est aussi celui d'un torrent hors du
@@ -2466,20 +2483,35 @@ def _trash_apply(plan: dict[str, Any], s: requests.Session, source: str) -> dict
             for t in bouger:
                 log_move(t["hash"], t.get("name") or "", t.get("category") or "", source)
             faits["torrents"] = len(bouger)
-    racines_vivantes = {torrent_root(t) for t in qbit_get_torrents(s)} if plan["corbeilles"] else set()
+    # Les places déjà prises par un torrent : un torrent de corbeille n'y est jamais déplacé.
+    occupees = {torrent_root(t) for t in qbit_get_torrents(s)} if plan["corbeilles"] else set()
     for c in plan["corbeilles"]:
-        contenu, h = _trash_torrent(c["racine"], c["fichiers"])
         nom = c["nom"]
+        try:
+            contenu, h = _trash_torrent(c["racine"], c["fichiers"])
+        except OSError as e:
+            # Un fichier disparu depuis le plan : ce torrent-là n'est pas fait, les autres si.
+            log.error("  ⚠ Corbeille globale : torrent de corbeille %s impossible à faire (%s)", nom, e)
+            continue
+        # Le dossier est dans l'infohash : un torrent déjà là sous ce hash est celui de ce
+        # dossier, avec ces fichiers, fait par un passage précédent. Il n'est pas recompté.
+        if _qbit_has(s, h):
+            log.info("      = torrent de corbeille %s déjà dans qBittorrent", nom)
+            continue
         data = {"category": TARGET_CAT, "tags": _CORBEILLE_TAG, "rename": nom, "savepath": os.path.dirname(c["racine"]),
                 "autoTMM": "false", "skip_checking": "true", "stopped": "true", "paused": "true", "contentLayout": "Original"}
         r = s.post(f"{QBIT_URL}/api/v2/torrents/add", data=data, timeout=30,
                    files={"torrents": (f"{h}.torrent", contenu, "application/x-bittorrent")})
+        # qBittorrent 5 répond 409 quand il n'ajoute rien, 415 à un .torrent invalide :
+        # ce torrent-là n'est pas fait, les suivants le sont quand même.
+        if 400 <= r.status_code < 500:
+            log.error("  ⚠ Corbeille globale : qBittorrent refuse le torrent de corbeille %s (HTTP %d : %s)",
+                      nom, r.status_code, (r.text or "").strip()[:200])
+            continue
         r.raise_for_status()
         present = False
         for _ in range(10):
-            rep = s.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": h}, timeout=10)
-            rep.raise_for_status()
-            if rep.json():
+            if _qbit_has(s, h):
                 present = True
                 break
             time.sleep(1)
@@ -2499,12 +2531,20 @@ def _trash_apply(plan: dict[str, Any], s: requests.Session, source: str) -> dict
             for x in anciens:
                 log.info("      ↻ torrent de corbeille %s repris dans %s, retiré sans ses fichiers", x[:8], nom)
         # Un nom lu par Jellyfin sort du dossier lu, comme le ferait ATM pour un torrent :
-        # le titre disparaît de la bibliothèque. Pas si un autre torrent occupe la même place.
-        cible = os.path.join(plan["dossier_corbeille"], os.path.basename(c["racine"]))
-        if c["visible"] and c["racine"] not in racines_vivantes and cible not in racines_vivantes:
-            r = s.post(f"{QBIT_URL}/api/v2/torrents/setLocation", timeout=30,
-                       data={"hashes": h, "location": plan["dossier_corbeille"]})
-            r.raise_for_status()
+        # le titre disparaît de la bibliothèque. Pas si un autre torrent occupe la même place,
+        # ni si la place dans la corbeille est déjà prise, par un jumeau déplacé juste avant
+        # ou par un dossier resté sur le disque : les deux se mêleraient.
+        if c["visible"]:
+            cible = os.path.join(plan["dossier_corbeille"], os.path.basename(c["racine"]))
+            if c["racine"] in occupees:
+                log.info("      ↷ %s reste à sa place, encore lu par Jellyfin : un autre torrent a ce dossier", nom)
+            elif cible in occupees or os.path.lexists(cible):
+                log.info("      ↷ %s reste à sa place, encore lu par Jellyfin : %s est déjà pris", nom, cible)
+            else:
+                r = s.post(f"{QBIT_URL}/api/v2/torrents/setLocation", timeout=30,
+                           data={"hashes": h, "location": plan["dossier_corbeille"]})
+                r.raise_for_status()
+                occupees.add(cible)
     return faits
 
 
@@ -2570,16 +2610,34 @@ def global_trash(chemins: list[str], source: str, motif: str, dry_run: bool,
         resume = "fichiers gardés (case décochée) : rien ne part en corbeille"
         log.info("  %s🗑 Corbeille globale (%s) : %s", etiquette, motif, resume)
         return {"id": _corbeille_record(source, motif, chemins, dry_run, resume, None), "resume": resume}
+    plan = None
     try:
         lues = _jellyfin_libraries()
         with qbit_session() as s:
             plan = _trash_plan(chemins, s, lues)
             faits = _trash_apply(plan, s, source) if not dry_run and not plan["refus"] else {}
     except Exception as e:
-        resume = f"erreur, rien n'a été fait : {e}"
-        log.error("  ⚠ %sCorbeille globale (%s) : %s", etiquette, motif, resume)
-        return {"id": _corbeille_record(source, motif, chemins, dry_run, resume, None), "resume": resume, "error": str(e)}
+        return _trash_failure(e, plan, source, motif, chemins, dry_run)
     return _trash_report(plan, source, motif, chemins, dry_run, faits)
+
+
+def _trash_failure(e: Exception, plan: dict[str, Any] | None, source: str, motif: str,
+                   chemins: list[str], dry_run: bool) -> dict[str, Any]:
+    """
+    Une erreur de la corbeille globale, journalisée avec ce qui a déjà changé : une
+    erreur au milieu du geste laisse des torrents en corbeille, qu'il faut savoir.
+    """
+    etiquette = "[SIMULATION] " if dry_run else ""
+    faits = (plan or {}).get("faits") or {}
+    fait = []
+    if faits.get("torrents"):
+        fait.append(f"{faits['torrents']} torrent(s) mis en corbeille")
+    if faits.get("corbeilles"):
+        fait.append(f"{faits['corbeilles']} torrent(s) de corbeille ajouté(s)")
+    resume = f"erreur après {' et '.join(fait)} : {e}" if fait else f"erreur, rien n'a été fait : {e}"
+    log.error("  ⚠ %sCorbeille globale (%s) : %s", etiquette, motif, resume)
+    rid = _corbeille_record(source, motif, chemins, dry_run, resume, plan)
+    return {"id": rid, "resume": resume, "error": str(e), "moved": sum(faits.values())}
 
 
 def _trash_report(plan: dict[str, Any], source: str, motif: str, chemins: list[str], dry_run: bool,
@@ -2612,6 +2670,7 @@ def rest_trash(dry_run: bool, en_file: set[str]) -> dict[str, Any]:
     """
     etiquette = "[SIMULATION] " if dry_run else ""
     motif = "cleanup"
+    plan = None
     try:
         lues = _jellyfin_libraries()
         if lues is None:
@@ -2625,9 +2684,7 @@ def rest_trash(dry_run: bool, en_file: set[str]) -> dict[str, Any]:
             plan = _rest_plan(s, lues, en_file, geres)
             faits = _trash_apply(plan, s, "cleanup") if not dry_run else {}
     except Exception as e:
-        resume = f"erreur, rien n'a été fait : {e}"
-        log.error("  ⚠ %sCorbeille globale (%s) : %s", etiquette, motif, resume)
-        return {"id": _corbeille_record("cleanup", motif, [], dry_run, resume, None), "resume": resume, "error": str(e)}
+        return _trash_failure(e, plan, "cleanup", motif, [], dry_run)
     return _trash_report(plan, "cleanup", motif, [], dry_run, faits)
 
 
