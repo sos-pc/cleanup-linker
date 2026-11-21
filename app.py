@@ -107,6 +107,11 @@ IMPORT_ASSIST_NOM_DRY_RUN = os.getenv("IMPORT_ASSIST_NOM_DRY_RUN", "true").strip
 # absente), l'assistant confirme l'identité sans l'identifiant de l'indexeur, puis
 # donne au torrent un nom que l'*arr relit comme ce média. Simulation propre.
 IMPORT_ASSIST_IDENTITE_DRY_RUN = os.getenv("IMPORT_ASSIST_IDENTITE_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+# Règle 2, import par titre d'épisode (Sonarr) : une release que l'*arr ne relie que
+# par la prise, dont les vidéos portent les titres exacts d'épisodes de la série.
+# Ces titres prouvent l'identité, et rangent chaque vidéo à sa place quand la
+# release numérote autrement que TVDB. Sa propre simulation.
+IMPORT_ASSIST_TITRES_DRY_RUN = os.getenv("IMPORT_ASSIST_TITRES_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 
 # Règle 4 de l'assistant (pack incomplet) : un pack de saison partiel est
 # remplacé par un pack complet, cherché dans Prowlarr. Sa propre simulation,
@@ -2872,7 +2877,8 @@ def _assist_modes() -> str:
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
     return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)} "
-            f"(identité confirmée {mode(IMPORT_ASSIST_IDENTITE_DRY_RUN)}), "
+            f"(identité confirmée {mode(IMPORT_ASSIST_IDENTITE_DRY_RUN)}, import par titre d'épisode "
+            f"{mode(IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_TITRES_DRY_RUN) if sonarr else 'inactif (pas de Sonarr)'}), "
             f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)} "
             f"(mort-nés après {IMPORT_ASSIST_MORT_JAMAIS_HEURES:g} h {mode(IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN)}), "
             f"{_regle(7)} {mode(IMPORT_ASSIST_INUTILE_DRY_RUN)} (releases piégées {mode(IMPORT_ASSIST_PIEGE_DRY_RUN)})")
@@ -3708,6 +3714,116 @@ def _id_confirmee(
     return raison
 
 
+# ── Assistant d'import, règle 2 : import par titre d'épisode ────────────────
+#
+# Sonarr range une vidéo d'après le numéro de son nom. Une release qui numérote
+# autrement que TVDB est donc mal rangée : la version Netflix de Pokémon a retiré
+# trois épisodes interdits (S01E18, E35, E38), et décale de 1 à 3 tous les
+# suivants. « Tentacool and Tentacruel », 18e chez Netflix, finirait sous « Beauty
+# and the Beach ». Quand Sonarr ne relie la release que par la prise, mais que ses
+# vidéos portent les titres exacts d'épisodes, le titre fait foi : il prouve
+# l'identité, et range chaque vidéo à sa place.
+
+# Part minimale des vidéos reconnues par leur titre : en dessous, rien n'est importé.
+_TITRES_PART_MIN = 0.8
+# Un titre d'épisode plus court (lettres et chiffres) ne prouve rien.
+_TITRES_LONGUEUR_MIN = 6
+_TITRES_EPISODE_RE = re.compile(r"S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
+# Mots de scène qui peuvent précéder le titre : « S01E52.FiNAL.The.Breeding.Center.Secret ».
+_TITRES_TETE_RE = re.compile(r"^(?:final|proper|repack|internal)+")
+
+
+def _titre_cle(texte: str) -> str:
+    """Titre comparable : sans casse, accents ni ponctuation, « & » lu « and »."""
+    return _episode_title_key((texte or "").replace("&", " and "))
+
+
+def _episode_by_title(nom: str, par_cle: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    """
+    L'épisode dont le titre ouvre ce qui suit SxxEyy dans le nom de la vidéo : le plus
+    long des titres qui conviennent, s'il désigne un seul épisode (à défaut, un seul de
+    la saison du nom). None sans titre reconnu : pour une vidéo de plusieurs épisodes
+    (« S01E21-E22 »), le second numéro empêche déjà de lire un titre.
+    """
+    base = os.path.splitext(os.path.basename(nom))[0]
+    m = _TITRES_EPISODE_RE.search(base)
+    if not m:
+        return None
+    reste = _titre_cle(base[m.end():])
+    essais = {reste, _TITRES_TETE_RE.sub("", reste)}
+    titre = max((k for k in par_cle if len(k) >= _TITRES_LONGUEUR_MIN and any(e.startswith(k) for e in essais)),
+                key=len, default="")
+    episodes = par_cle.get(titre) or []
+    if len(episodes) > 1:
+        episodes = [e for e in episodes if e.get("seasonNumber") == int(m.group(1))]
+    return episodes[0] if len(episodes) == 1 else None
+
+
+def _import_by_titles(
+    url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any], media_id: int,
+    ctx: dict[str, Any], verdict: dict[str, Any],
+) -> tuple[dict[str, Any], bool] | None:
+    """
+    Règle 2, import par titre d'épisode : chaque vidéo reconnue par son titre est
+    importée (hardlink) sous cet épisode, s'il fait partie de ceux de la prise et n'a
+    pas encore de fichier. None si les titres ne suffisent pas : moins de
+    _TITRES_PART_MIN des vidéos reconnues, ou deux vidéos pour un même épisode.
+    """
+    dry = ctx["apercu"] or IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_TITRES_DRY_RUN
+    titre = records[0].get("title") or dl
+    videos = _torrent_videos(t) or []
+    if not videos:
+        return None
+    episodes = _arr_request("GET", url, cle, "episode", params={"seriesId": media_id}) or []
+    par_cle: dict[str, list[dict[str, Any]]] = {}
+    for e in episodes:
+        k = _titre_cle(e.get("title") or "")
+        if len(k) >= _TITRES_LONGUEUR_MIN:
+            par_cle.setdefault(k, []).append(e)
+    attendus = {r["episodeId"] for r in records if r.get("episodeId")}
+    ecartees = (ctx.get("ecartees") or {}).get(media_id) or set()
+    reconnus: dict[str, dict[str, Any]] = {}
+    for v in videos:
+        e = _episode_by_title(v, par_cle)
+        if e is not None and e["id"] in attendus and e.get("seasonNumber") not in ecartees:
+            reconnus[v] = e
+    if len(reconnus) < max(1, -(-len(videos) * _TITRES_PART_MIN // 1)):
+        return None
+    if len({e["id"] for e in reconnus.values()}) < len(reconnus):
+        return None  # deux vidéos pour un même épisode : les titres ne départagent rien
+    a_importer = {v: e for v, e in reconnus.items() if not e.get("hasFile")}
+    decales = [(nom[m.start():], e) for v, e in sorted(reconnus.items())
+               for nom in [os.path.splitext(os.path.basename(v))[0]] if (m := _TITRES_EPISODE_RE.search(nom))
+               and (int(m.group(1)), int(m.group(2))) != (e.get("seasonNumber"), e.get("episodeNumber"))]
+    details = (f"{len(reconnus)}/{len(videos)} vidéo(s) reconnue(s) au titre exact de leur épisode, "
+               f"{len(a_importer)} importée(s) sous cet épisode")
+    if decales:
+        nom, e = decales[0]
+        details += (f", dont {len(decales)} rangée(s) sous un autre numéro que celui de leur nom "
+                    f"(« {nom[:50]} » → S{e['seasonNumber']:02d}E{e['episodeNumber']:02d} « {e.get('title')} »)")
+    if len(reconnus) < len(videos):
+        details += f" ; {len(videos) - len(reconnus)} sans épisode reconnu parmi ceux de la prise, à importer à la main"
+    verdict.update(decision="import-titles", reason=details, files=len(a_importer))
+    if _assist_seen(dl, "import-titles", dry):
+        return verdict, False
+    if a_importer and not dry:
+        propositions = {it.get("path"): it for it in _arr_request(
+            "GET", url, cle, "manualimport", timeout=300,
+            params={"downloadId": dl.upper(), "filterExistingFiles": "false"}) or []}
+        entrees = [{"path": v, "seriesId": media_id, "episodeIds": [e["id"]], "quality": p["quality"],
+                    "languages": p.get("languages") or [], "releaseGroup": p.get("releaseGroup") or "",
+                    "indexerFlags": p.get("indexerFlags") or 0, "releaseType": "singleEpisode",
+                    "downloadId": dl.upper()}
+                   for v, e in sorted(a_importer.items()) for p in [propositions.get(v) or {}] if p.get("quality")]
+        if not entrees:
+            return None
+        # « copy » : hardlink depuis le torrent, qui continue de seeder.
+        _arr_request("POST", url, cle, "command", json={"name": "ManualImport", "importMode": "copy", "files": entrees})
+    _assist_record(dl, "sonarr", titre, "import-titles", details, dry, 2)
+    _assist_log(2, "✓", "sonarr", titre, details, dry)
+    return verdict, True
+
+
 def _misnamed(
     arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], t: dict[str, Any],
     media_id: int, ctx: dict[str, Any], verdict: dict[str, Any], ecarte: Any,
@@ -3759,7 +3875,9 @@ def _misnamed(
     if not cible_nom:
         confirme = _id_confirmee(arr, url, cle, media_id, records, t, release, ctx)
         if isinstance(confirme, str):
-            return ecarte(confirme, 2, dry)
+            # Sans titre de la série dans le nom, les titres des épisodes peuvent suffire.
+            par_titres = _import_by_titles(url, cle, dl, records, t, media_id, ctx, verdict) if arr == "sonarr" else None
+            return par_titres or ecarte(confirme, 2, dry)
         cible_nom, preuve, p = confirme
         dry = dry or IMPORT_ASSIST_IDENTITE_DRY_RUN
         # Tant que l'identité confirmée est en simulation, rien de ce qui en découle n'agit.
@@ -4595,6 +4713,8 @@ def _release_ref(url: str, cle: str, titre: str, profil: dict[str, Any]) -> dict
     qid = ((info.get("quality") or {}).get("quality") or {}).get("id")
     return {
         "series_title": _series_title_key(info.get("seriesTitle") or ""),
+        # Sonarr reconnaît-il la série à ce titre seul ? « Pokemon The Series » : non.
+        "connu": bool(p.get("series")),
         "season": info.get("seasonNumber"),
         "season_pack": bool(info.get("fullSeason") or info.get("isPartialSeason")) and not info.get("isMultiSeason"),
         "score": _score_hors_pack(p, profil),
@@ -4603,13 +4723,19 @@ def _release_ref(url: str, cle: str, titre: str, profil: dict[str, Any]) -> dict
 
 
 def _pack_queries(serie: dict[str, Any], saison: int) -> list[str]:
-    """Requêtes « Titre S01 » : titre de la série et titres alternatifs, deux au plus."""
+    """
+    Requêtes « Titre S01 » : titre de la série et titres alternatifs valables pour cette
+    saison, deux au plus, sans accents comme les noms de releases. « Pokémon » cherche
+    « Pokemon S04 », puis « Pokemon Johto League Champions S04 », et non le titre de
+    scène d'une autre saison (« Pokemon Indigo League », celui de la saison 1).
+    """
     titres = [serie.get("title") or ""] + [
         a.get("title") or "" for a in serie.get("alternateTitles") or []
-        if a.get("seasonNumber") in (None, -1, saison)
+        if a.get("seasonNumber") in (None, -1, saison) and a.get("sceneSeasonNumber") in (None, -1, saison)
     ]
     requetes: list[str] = []
-    for titre in titres:
+    for brut in titres:
+        titre = unicodedata.normalize("NFKD", brut).encode("ascii", "ignore").decode()
         titre = re.sub(r"\(\d{4}\)", " ", titre)
         titre = re.sub(r"['’]", "", titre)
         titre = re.sub(r"[^\w]+", " ", titre).strip()
@@ -4654,6 +4780,13 @@ def _pack_candidate(
     seuil = min(ref["score"], IMPORT_ASSIST_PACK_MIN_SCORE)
     # Pour combler des trous, une autre langue suffit, tant que Sonarr l'accepterait.
     plancher = min(seuil, profil["score_min"])
+    # Saisons trouées : plusieurs titres admis, faute de pack partiel de référence.
+    titres_admis = set(ref.get("series_titles") or ({ref["series_title"]} if ref.get("series_title") else set()))
+    if titres_admis and ref.get("connu") is False:
+        # Sonarr ne reconnaît pas le titre du pack partiel (« Pokemon The Series », la
+        # version Netflix) : ses propres titres pour la série sont admis aussi. Un titre
+        # qu'il connaît, comme « Monster The Lizzie Borden Story », reste seul juge.
+        titres_admis |= _series_titles(url, cle, serie, saison, [])
     candidats: list[tuple[int, int, int, dict[str, Any]]] = []
     vus: set[tuple[str, Any]] = set()
     autres_titres: set[str] = set()
@@ -4679,8 +4812,6 @@ def _pack_candidate(
                 or info.get("isSeasonExtra") or info.get("special")):
             continue
         titre_serie = info.get("seriesTitle") or ""
-        # Saisons trouées : plusieurs titres admis, faute de pack partiel de référence.
-        titres_admis = ref.get("series_titles") or ({ref["series_title"]} if ref.get("series_title") else set())
         if titres_admis and _series_title_key(titre_serie) not in titres_admis:
             autres_titres.add(titre_serie)
             continue
@@ -5090,19 +5221,31 @@ def _series_client(clients: list[dict[str, Any]], serie: dict[str, Any]) -> str:
     return next((c.get("name") or "" for c in actifs if not c.get("tags")), "")
 
 
-def _holes_titles(url: str, cle: str, serie: dict[str, Any], saison: int, releases: list[str]) -> set[str]:
+def _series_titles(url: str, cle: str, serie: dict[str, Any], saison: int, releases: list[str]) -> set[str]:
     """
-    Titres de série qu'un pack peut porter, faute de pack partiel de référence : celui
-    de Sonarr, ses titres alternatifs pour cette saison, et ceux des releases déjà
-    prises pour elle. Garde-fou des anthologies, comme dans _pack_candidate.
+    Titres de série qu'un pack de cette saison peut porter : celui de Sonarr, ses
+    titres alternatifs valables pour elle, et ceux des releases déjà prises pour elle.
+    Un titre alternatif propre à une autre saison de scène n'en est pas : « Pokemon
+    Horizons » est la saison 25 de Pokémon, pas sa saison 1. Garde-fou des
+    anthologies, comme dans _pack_candidate.
     """
     noms = [serie.get("title") or ""] + [a.get("title") or "" for a in serie.get("alternateTitles") or []
-                                         if a.get("seasonNumber") in (None, -1, saison)]
+                                         if a.get("seasonNumber") in (None, -1, saison)
+                                         and a.get("sceneSeasonNumber") in (None, -1, saison)]
     cles = {_series_title_key(n) for n in noms}
     for titre in list(dict.fromkeys(releases))[:4]:
         info = (_arr_request("GET", url, cle, "parse", params={"title": titre}) or {}).get("parsedEpisodeInfo") or {}
         cles.add(_series_title_key(info.get("seriesTitle") or ""))
     return cles - {""}
+
+
+def _dead_waiting(dl: str, torrents: dict[str, dict[str, Any]], maintenant: float) -> bool:
+    """Ce téléchargement est-il mort, sans autre version trouvée par la règle 6 ces derniers jours ?"""
+    t = torrents.get(dl)
+    inactif = _dead_since(t, maintenant)
+    if inactif is None or inactif < _dead_threshold(t, True):
+        return False
+    return any(_assist_recent(dl, ("dead-wait",), simulation, _TROUS_REPRISE) for simulation in (False, True))
 
 
 def _holes_pending(serie_id: int, saison: int, torrents: dict[str, dict[str, Any]]) -> bool:
@@ -5130,11 +5273,15 @@ def run_season_holes(ctx: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
     except Exception as e:
         log.error("  ⚠ [%s] saisons trouées : Seerr injoignable ou réponse inattendue (%s)", _regle(4), e)
         return [], 0
-    # Les trous se comptent depuis la demande la plus récente de la série.
-    demandee_le: dict[int, float] = {}
+    # Chaque saison compte depuis sa dernière demande ; une saison qu'aucune demande ne
+    # nomme, depuis la plus récente de la série (clé None). Pokémon : la saison 1,
+    # demandée ce matin, ne retarde pas la saison 4, demandée la veille.
+    demandee_le: dict[int, dict[int | None, float]] = {}
     for d in demandes:
-        tvdb = d["media"]["tvdbId"]
-        demandee_le[tvdb] = max(demandee_le.get(tvdb, 0.0), _iso_epoch(d.get("createdAt")))
+        quand = _iso_epoch(d.get("createdAt"))
+        par_saison = demandee_le.setdefault(d["media"]["tvdbId"], {})
+        for s in [x.get("seasonNumber") for x in d.get("seasons") or []] + [None]:
+            par_saison[s] = max(par_saison.get(s, 0.0), quand)
     diffuse_avant = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(maintenant - _TROUS_ATTENTE))
     verdicts: list[dict[str, Any]] = []
     nouveaux = cherchees = attente = 0
@@ -5144,17 +5291,24 @@ def run_season_holes(ctx: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
             serie = next(iter(_arr_request("GET", url, cle, "series", params={"tvdbId": tvdb}) or []), None)
             if not serie or not serie.get("monitored"):
                 continue
-            if maintenant - max(depuis, _iso_epoch(serie.get("added"))) < _TROUS_ATTENTE:
+            if maintenant - _iso_epoch(serie.get("added")) < _TROUS_ATTENTE:
                 continue
             serie_id = serie["id"]
             episodes = _arr_request("GET", url, cle, "episode", params={"seriesId": serie_id}) or []
             file = _arr_request("GET", url, cle, "queue/details", params={"seriesId": serie_id}) or []
-            en_file = {q.get("episodeId") for q in file}
+            # Un téléchargement mort pour lequel la règle 6 n'a trouvé aucune autre version
+            # ne tient pas ses épisodes : un pack peut partir en parallèle, sans que le mort
+            # soit retiré. Le premier fini gagne. Pokémon S04 : un magnet resté sans liste
+            # de fichiers.
+            en_file = {q.get("episodeId") for q in file
+                       if not _dead_waiting((q.get("downloadId") or "").lower(), ctx["torrents"], maintenant)}
             # Les saisons que la règle 5 a écartées ne sont pas celles de la demande.
             ecartees = (ctx.get("ecartees") or {}).get(serie_id) or set()
             saisons = sorted({s["seasonNumber"] for s in serie.get("seasons") or []
                               if s.get("monitored") and (s.get("seasonNumber") or 0) > 0} - ecartees)
             for saison in saisons:
+                if maintenant - depuis.get(saison, depuis[None]) < _TROUS_ATTENTE:
+                    continue
                 de_la_saison = [e for e in episodes if e.get("seasonNumber") == saison]
                 voulus = _episodes_wanted(de_la_saison)
                 trous = {e["id"] for e in de_la_saison if e["id"] in voulus
@@ -5222,7 +5376,7 @@ def _fill_season_holes(url: str, cle: str, serie: dict[str, Any], saison: int, e
                                                                   params={"seriesId": serie_id}) or []
                  if f.get("seasonNumber") == saison]
     # Ni score ni qualité de référence : un pack que Sonarr accepterait vaut mieux que rien.
-    ref = {"series_title": "", "series_titles": _holes_titles(url, cle, serie, saison, [r for r in releases if r]),
+    ref = {"series_title": "", "series_titles": _series_titles(url, cle, serie, saison, [r for r in releases if r]),
            "season": saison, "season_pack": True, "score": IMPORT_ASSIST_PACK_MIN_SCORE, "rang": -1}
     profil = _quality_profile(url, cle, serie.get("qualityProfileId"))
     with _pack_slots:

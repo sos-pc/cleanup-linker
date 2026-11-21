@@ -98,6 +98,7 @@ services:
       - IMPORT_ASSIST_DRY_RUN=false          # règle 1 · débloquer la file
       - IMPORT_ASSIST_NOM_DRY_RUN=false      # règle 2 · torrent mal nommé
       - IMPORT_ASSIST_IDENTITE_DRY_RUN=false # règle 2 · identité confirmée
+      - IMPORT_ASSIST_TITRES_DRY_RUN=false   # règle 2 · import par titre d'épisode
       - IMPORT_ASSIST_PACK_DRY_RUN=false     # règle 4 · pack incomplet
       - IMPORT_ASSIST_TROUS_DRY_RUN=false    # règle 4 · saisons trouées
       - IMPORT_ASSIST_ACCORD_DRY_RUN=false   # règle 5 · bonne saison
@@ -172,6 +173,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `IMPORT_ASSIST_DRY_RUN` | `true` | Simulation de la règle 1 · débloquer la file |
 | `IMPORT_ASSIST_NOM_DRY_RUN` | `true` | Simulation de la règle 2 · torrent mal nommé |
 | `IMPORT_ASSIST_IDENTITE_DRY_RUN` | `true` | Simulation de l'identité confirmée de la règle 2 : le renommage d'un torrent dont le titre de release ne désigne pas le média à lui seul. Tant qu'elle simule, rien de ce qui en découle n'agit, règle 7 comprise |
+| `IMPORT_ASSIST_TITRES_DRY_RUN` | `true` | Simulation de l'import par titre d'épisode de la règle 2 (Sonarr) |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Simulation de la règle 4 · pack incomplet |
 | `IMPORT_ASSIST_TROUS_DRY_RUN` | `true` | Simulation des saisons trouées (règle 4). Elles suivent aussi la simulation de la règle 4 |
 | `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier |
@@ -667,7 +669,7 @@ Un seul passage tourne à la fois, quel que soit le process gunicorn qui le lanc
 | Règle | Interrupteur | Ce qu'elle fait |
 |-------|--------------|-----------------|
 | 1 · débloquer la file | `IMPORT_ASSIST_DRY_RUN=false` | Sort de la file un téléchargement déjà importé, et cherche ses épisodes manquants |
-| 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false`, et `IMPORT_ASSIST_IDENTITE_DRY_RUN=false` pour l'identité confirmée | Renomme un torrent que l'*arr ne reconnaît pas, avec le titre de sa release, ou avec un nom refait une fois l'identité confirmée sans l'identifiant de l'indexeur, pour qu'il l'importe lui-même |
+| 2 · torrent mal nommé | `IMPORT_ASSIST_NOM_DRY_RUN=false`, `IMPORT_ASSIST_IDENTITE_DRY_RUN=false` pour l'identité confirmée, et `IMPORT_ASSIST_TITRES_DRY_RUN=false` pour l'import par titre d'épisode | Renomme un torrent que l'*arr ne reconnaît pas, avec le titre de sa release, ou avec un nom refait une fois l'identité confirmée sans l'identifiant de l'indexeur, pour qu'il l'importe lui-même. À défaut, importe les épisodes d'après le titre que porte chaque vidéo |
 | 4 · pack incomplet | `IMPORT_ASSIST_PACK_DRY_RUN=false`, et `IMPORT_ASSIST_TROUS_DRY_RUN=false` pour les saisons trouées | Remplace un pack de saison partiel par un pack complet, ou comble ses trous. Comble aussi par un pack les trous d'une saison demandée qu'aucune release à l'unité n'apporte |
 | 5 · bonne saison | `IMPORT_ASSIST_ACCORD_DRY_RUN=false` | Range dans la bonne saison TVDB ce que Seerr a demandé sous un autre numéro |
 | 6 · téléchargement mort | `IMPORT_ASSIST_MORT_DRY_RUN=false`, et `IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN=false` pour les mort-nés | Lance une autre version en parallèle d'un téléchargement qui ne reçoit plus rien ; la première finie gagne |
@@ -758,7 +760,17 @@ Si l'*arr bloque toujours le torrent 10 minutes après le renommage, l'avertisse
 
 **Un téléchargement détaché de son média** (voir plus haut) ne peut plus être réglé par un renommage. L'*arr importe avec le média de son suivi, qu'il a perdu, et partirait donc sans film ni série. L'avertissement `rename-orphan` demande un import manuel, sauf si la règle 7 constate que le téléchargement est inutile. L'import manuel n'est pas automatisé : par l'API, il ne contrôle pas l'upgrade, et pourrait remplacer un meilleur fichier.
 
-Verdicts : `rename` (torrent renommé), `rename-suspect`, `rename-blocked`, `rename-orphan` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
+**Import par titre d'épisode (Sonarr).** Sonarr range une vidéo d'après le numéro de son nom. Une release qui numérote autrement que TVDB est donc mal rangée. La version Netflix de Pokémon (« Pokemon The Series », saison 1) a retiré trois épisodes interdits : S01E18 « Beauty and the Beach », E35 « The Legend of Dratini », E38 « Electric Soldier Porygon ». Tous les suivants sont décalés de 1, puis 2, puis 3. Importée par numéro, « Tentacool and Tentacruel », 18e chez Netflix, finirait sous « Beauty and the Beach ». Sonarr ne reconnaissait pas ce nom, et l'identité confirmée non plus : aucun titre connu de la série dans le nom.
+
+Quand l'identité n'est pas confirmée par le nom, l'assistant lit le titre que porte chaque vidéo après son « SxxEyy », et le compare aux titres des épisodes de la série :
+- sans casse, accents ni ponctuation, « & » lu « and », un mot de scène en tête (« FiNAL ») ignoré ;
+- le plus long des titres qui conviennent, s'il désigne un seul épisode (à défaut, un seul de la saison du nom), et de 6 lettres ou chiffres au moins.
+
+Si au moins 80 % des vidéos sont reconnues, sans deux vidéos pour un même épisode, chacune est importée en hardlink sous son épisode. Seuls sont importés les épisodes de la prise, hors saison écartée par la règle 5, et encore sans fichier : rien n'est remplacé. Le journal dit combien de vidéos sont rangées sous un autre numéro que celui de leur nom, avec un exemple. Les vidéos sans titre reconnu restent à importer à la main.
+
+Elle a son propre interrupteur, `IMPORT_ASSIST_TITRES_DRY_RUN`, en simulation par défaut.
+
+Verdicts : `rename` (torrent renommé), `import-titles` (importé par titre d'épisode), `rename-suspect`, `rename-blocked`, `rename-orphan` et `rename-failed` (à voir à la main), et `ignored:…` (rien à faire, avec la raison).
 
 ```
 INFO     ✓ [règle 2 · torrent mal nommé] [radarr] Resident.Evil.2026.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv : le titre de la release désigne bien Resident Evil (2026) : torrent renommé Resident.Evil.2026.VOSTFR.1080p.WEB.EAC3.5.1.H264-KyoGo → Radarr l'importera seul
@@ -786,14 +798,14 @@ Sans aucun pack complet, le pack partiel repart : mieux vaut une demi-saison que
 Un pack complet doit :
 - apporter tous les épisodes manquants, d'après la liste des fichiers de son `.torrent` ;
 - être un pack de la même saison, ni multi-saisons, ni « Part » ;
-- porter le même titre de série que le pack partiel. Une série d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases nomment chacune « S01 ». Ainsi, « Monster: The Lizzie Borden Story » est la saison 4 de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer, qui a 10 épisodes au lieu de 8. Le « S01 complet » serait une autre histoire que celle demandée ;
+- porter le même titre de série que le pack partiel. Une série d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases nomment chacune « S01 ». Ainsi, « Monster: The Lizzie Borden Story » est la saison 4 de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer, qui a 10 épisodes au lieu de 8. Le « S01 complet » serait une autre histoire que celle demandée. Si Sonarr ne reconnaît pas le titre du pack partiel, comme « Pokemon The Series », la version Netflix, ses propres titres pour la série sont admis aussi : « Pokemon ». Un titre qu'il connaît, comme « Monster The Lizzie Borden Story », reste seul juge. Un titre alternatif propre à une autre saison de scène ne l'est jamais : « Pokemon Horizons » est la saison 25 de Pokémon ;
 - avoir une qualité autorisée par le profil de la série, au moins aussi bonne que celle du pack partiel ;
 - avoir un score de formats d'au moins 50 (`IMPORT_ASSIST_PACK_MIN_SCORE`), même s'il est moins bien noté que le pack partiel : mieux vaut une saison sans trou. Si le pack partiel est lui-même sous 50, son propre score sert de seuil. Le bonus que le profil donne aux packs ne compte pas, puisque le partiel et ses remplaçants en ont tous. Avec le profil actuel :
   - une release qui porte du français fait au moins 55 : MULTi 55, VOSTFR 80, VF 110, MULTi VFF 195 ;
   - une release sans français part de -20, et gagne 10 par format technique (Atmos, Dolby Vision, HDR…). Un pack anglais reste donc sous le seuil ;
 - avoir au moins 3 sources et un lien `.torrent`. Un magnet n'a pas de liste de fichiers à lire avant d'être ajouté.
 
-Les mieux classés passent d'abord : score, puis qualité, puis sources. Seuls les `.torrent` des 4 premiers sont lus, car chaque lecture passe par un tracker.
+Les requêtes sont « Titre S01 » : le titre de la série, puis un titre alternatif valable pour cette saison, sans accents, comme les noms de releases. Pour Pokémon S04 : « Pokemon S04 », puis « Pokemon Johto League Champions S04 ». Les mieux classés passent d'abord : score, puis qualité, puis sources. Seuls les `.torrent` des 4 premiers sont lus, car chaque lecture passe par un tracker.
 
 Garde-fous :
 - **Hit-and-run :** un torrent privé déjà téléchargé à plus de 2 % n'est jamais arrêté. On le laisse finir, et la règle reprend après l'import.
@@ -830,8 +842,8 @@ Les remplacements sont dans la table `pack_replace`.
 À chaque passage de renfort, l'assistant regarde les séries demandées dans Seerr ces 30 derniers jours, saison surveillée par saison surveillée. Un trou est un épisode :
 - diffusé depuis plus de 24 h ;
 - surveillé, sans fichier ;
-- sans téléchargement dans la file de Sonarr ;
-- d'une série ajoutée et demandée depuis plus de 24 h, le temps que Sonarr cherche et que le RSS passe.
+- sans téléchargement dans la file de Sonarr. Un téléchargement mort pour lequel la règle 6 n'a trouvé aucune autre version ne compte pas : le pack part en parallèle, le mort reste, et le premier fini gagne. C'est le cas de Pokémon S04, un magnet resté sans liste de fichiers ;
+- d'une série ajoutée depuis plus de 24 h, et d'une saison demandée depuis plus de 24 h, le temps que Sonarr cherche et que le RSS passe. Chaque saison compte depuis sa propre demande : la saison 1 de Pokémon, demandée un matin, ne retarde pas la saison 4, demandée la veille.
 
 S'il y en a, l'assistant cherche un pack de la saison dans Prowlarr, comme pour un pack partiel, mais :
 - sans qualité ni score de référence : tout pack que Sonarr accepterait vaut mieux que rien ;
@@ -1010,7 +1022,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
