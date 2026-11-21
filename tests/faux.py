@@ -1,6 +1,7 @@
 """
-Doublures partagées par les tests : un qBittorrent en mémoire qui répond comme la version 5.2, et un module
-threading dont les fils tournent tout de suite, pour les routes qui travaillent en arrière-plan.
+Doublures partagées par les tests : un qBittorrent en mémoire qui répond comme la version 5.2, un faux Sonarr
+ou Radarr qui répond par route, et un module threading dont les fils tournent tout de suite, pour les routes
+qui travaillent en arrière-plan.
 """
 import os
 import threading
@@ -72,6 +73,17 @@ class FauxQbit:
         else:
             raise AssertionError("POST inattendu : " + url)
         return Rep()
+
+
+def faux_arr(routes: dict, appels: list):
+    """Remplace _arr_request : répond par route (méthode, point d'entrée), note chaque appel."""
+    def _arr_request(method, base_url, api_key, endpoint, timeout=30, retries=3, **kwargs):
+        appels.append((method, endpoint, kwargs.get("params"), kwargs.get("json")))
+        if (method, endpoint) not in routes:
+            raise AssertionError(f"appel inattendu : {method} {endpoint}")
+        reponse = routes[(method, endpoint)]
+        return reponse(kwargs) if callable(reponse) else reponse
+    return _arr_request
 
 
 class FilsImmediats:
