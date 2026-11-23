@@ -4,6 +4,7 @@ hardlinks dans un dossier jetable, index rempli à la main, route /jellyfin appe
 Radarr qui notent chaque appel. Le cas de l'incident Westworld (2026-11-12) en tête.
 """
 import os
+from contextlib import contextmanager
 
 import pytest
 
@@ -136,10 +137,147 @@ def test_film_supprime_dans_films_atteint_toujours_radarr(tmp_path, porte):
     indexer(radarr)
     porte["etat"]["bibliotheques"] = {str(tmp_path / "Multimedia/Films")}
     porte["etat"]["movies"] = [{"id": 9, "title": "Un Film", "path": str(tmp_path / "Media/Films/Un Film (2020)"),
-                                "movieFile": {"id": 5}}]
+                                "movieFile": {"id": 5, "path": radarr}}]
     os.remove(torrent)  # Jellyfin a supprimé le fichier qu'il voyait
     rep = evenement("Movie", "film-1", "Un Film")
+    # Le fichier actuel de Radarr est encore là, mais c'est le même fichier, sous un autre nom : la fiche part.
     assert suppressions(porte["appels"]) == ["movie/9"]
+    assert rep["status"] == "delegated"
+
+
+def no_other_land(tmp_path, porte):
+    """
+    Bibliothèque « meuhmeuh » posée sur /data/Media. Radarr a remplacé Kitsune par la VOSTFR (upgrade), et l'event
+    s'est perdu : le torrent de Kitsune est toujours là, et l'index ne connaît pas encore le nouveau nom de Radarr.
+    """
+    kitsune = fichier(str(tmp_path / "Multimedia/MeuhMeuh/No.Other.Land.Kitsune.mkv"), b"kitsune")
+    vostfr = fichier(str(tmp_path / "Multimedia/MeuhMeuh/No.Other.Land.VOSTFR.mkv"), b"vostfr")
+    dossier = tmp_path / "Media/meuhmeuh/No Other Land (2024)"
+    ancien = lien(kitsune, str(dossier / "No Other Land (2024) - Kitsune.mkv"))
+    nouveau = lien(vostfr, str(dossier / "No Other Land (2024) - VOSTFR.mkv"))
+    indexer(kitsune, torrent="kitsune")
+    indexer(ancien, item="film-kitsune")
+    indexer(vostfr, torrent="vostfr")
+    porte["etat"]["bibliotheques"] = {str(tmp_path / "Media/meuhmeuh")}
+    porte["etat"]["movies"] = [{"id": 714, "title": "No Other Land", "path": str(dossier),
+                                "movieFile": {"id": 50, "path": nouveau}}]
+    os.remove(ancien)  # l'upgrade : Radarr efface l'ancien fichier, Jellyfin le retire de sa base
+    return ancien, nouveau
+
+
+def test_upgrade_ne_supprime_pas_le_film(tmp_path, porte):
+    """No Other Land, 2026-11-22 : l'ItemDeleted de l'ancien fichier supprimait le film, nouvelle version comprise."""
+    ancien, nouveau = no_other_land(tmp_path, porte)
+    rep = evenement("Movie", "film-kitsune", "No Other Land")
+    assert suppressions(porte["appels"]) == []
+    assert rep.get("status") != "delegated"
+    # Le torrent de l'ancien fichier passe par la corbeille, comme l'event d'upgrade l'aurait fait.
+    assert porte["gestes"] == [[ancien]]
+    assert os.path.exists(nouveau)
+
+
+def test_upgrade_d_un_fichier_sans_torrent_ne_supprime_pas_le_film(tmp_path, porte):
+    """L'ancien fichier n'avait aucun torrent : son inode disparaît avec lui, la disparition a l'air d'une suppression."""
+    dossier = tmp_path / "Media/meuhmeuh/Vieux Film (1990)"
+    ancien = fichier(str(dossier / "Vieux Film (1990) - DVD.mkv"), b"dvd")
+    nouveau = fichier(str(dossier / "Vieux Film (1990) - Bluray.mkv"), b"bluray")
+    indexer(ancien, item="film-dvd")
+    porte["etat"]["bibliotheques"] = {str(tmp_path / "Media/meuhmeuh")}
+    porte["etat"]["movies"] = [{"id": 715, "title": "Vieux Film", "path": str(dossier),
+                                "movieFile": {"id": 52, "relativePath": "Vieux Film (1990) - Bluray.mkv"}}]
+    os.remove(ancien)
+    rep = evenement("Movie", "film-dvd", "Vieux Film")
+    assert suppressions(porte["appels"]) == []
+    assert rep.get("status") != "delegated"
+    assert os.path.exists(nouveau)
+
+
+def test_film_supprime_dans_sa_bibliotheque_media_est_delegue(tmp_path, porte):
+    """Même bibliothèque, cas ordinaire : le fichier qu'on supprime est le fichier actuel de Radarr."""
+    torrent = fichier(str(tmp_path / "Multimedia/MeuhMeuh/Un.Autre.Film.mkv"))
+    dossier = tmp_path / "Media/meuhmeuh/Un Autre Film (2020)"
+    radarr = lien(torrent, str(dossier / "Un Autre Film (2020).mkv"))
+    indexer(torrent, torrent="t8")
+    indexer(radarr, item="film-meuh")
+    porte["etat"]["bibliotheques"] = {str(tmp_path / "Media/meuhmeuh")}
+    porte["etat"]["movies"] = [{"id": 15, "title": "Un Autre Film", "path": str(dossier),
+                                "movieFile": {"id": 51, "relativePath": "Un Autre Film (2020).mkv"}}]
+    os.remove(radarr)
+    rep = evenement("Movie", "film-meuh", "Un Autre Film")
+    assert suppressions(porte["appels"]) == ["movie/15"]
+    assert rep["status"] == "delegated"
+
+
+@pytest.fixture
+def ajouts(monkeypatch):
+    """Les ajouts Jellyfin repartent de zéro, avec un délai qui ne s'écoule jamais pendant le test."""
+    monkeypatch.setattr(app, "_JELLYFIN_INDEX_DELAY", 3600)
+    monkeypatch.setattr(app, "_jellyfin_index_timer", None)
+    monkeypatch.setattr(app, "_jellyfin_index_items", 0)
+    yield
+    if app._jellyfin_index_timer is not None:
+        app._jellyfin_index_timer.cancel()
+
+
+def ajout(item_type, item_id="x", nom="test"):
+    rep = app.app.test_client().post("/jellyfin?token=tests", json={
+        "NotificationType": "ItemAdded", "ItemType": item_type, "ItemId": item_id, "Name": nom})
+    assert rep.status_code == 200
+    return rep.get_json()["status"]
+
+
+def test_ajouts_regroupes_dans_une_seule_sync(porte, ajouts, monkeypatch):
+    syncs = []
+    monkeypatch.setattr(app, "sync_db", lambda **k: syncs.append(k) or "success")
+    assert ajout("Episode") == "index scheduled"
+    assert ajout("Episode") == "index already scheduled"
+    assert ajout("Series") == "ignored"  # un conteneur n'a pas de fichier : ses épisodes arrivent à part
+    assert syncs == []
+    app._jellyfin_index_timer.cancel()
+    assert app._run_jellyfin_index() == "success"
+    assert syncs == [{"sauvegarde": False, "motif": "2 ajout(s) dans Jellyfin"}]
+    # La sync passée, un ajout en programme une autre.
+    assert ajout("Movie") == "index scheduled"
+
+
+def test_oppenheimer_supprime_juste_apres_son_ajout(tmp_path, porte, ajouts, monkeypatch):
+    """
+    Oppenheimer, 2026-11-22 : importé à 17:37, supprimé dans Jellyfin à 17:49, la dernière sync datait de 13:07.
+    L'ItemAdded fait connaître l'item tout de suite, et la suppression atteint Radarr.
+    """
+    films = tmp_path / "Multimedia/Films"
+    torrent = fichier(str(films / "Oppenheimer.2023.QTZ.mkv"))
+    dossier = tmp_path / "Media/Films/Oppenheimer (2023)"
+    radarr = lien(torrent, str(dossier / "Oppenheimer (2023).mkv"))
+
+    @contextmanager
+    def session():
+        yield object()
+
+    sauvegardes = []
+    monkeypatch.setattr(app, "qbit_session", session)
+    monkeypatch.setattr(app, "qbit_get_categories", lambda s: {"[seed] Films": str(films)})
+    monkeypatch.setattr(app, "qbit_get_torrents", lambda s: [{
+        "hash": "a" * 40, "name": "Oppenheimer.2023.QTZ.mkv", "category": "[seed] Films",
+        "content_path": torrent, "save_path": str(films)}])
+    monkeypatch.setattr(app, "backup_db", lambda: sauvegardes.append(True))
+    monkeypatch.setattr(app, "refresh_arr_managed_from_links", lambda: 0)
+    monkeypatch.setattr(app, "purge_arr_managed_absents", lambda hashes: 0)
+    monkeypatch.setattr(app, "_SYNC_MEDIA_ROOT", str(tmp_path / "Media"))
+    monkeypatch.setattr(app, "jellyfin_fetch_items", lambda: [{"Id": "oppenheimer", "Path": torrent}])
+    porte["etat"]["bibliotheques"] = {str(films)}
+    porte["etat"]["movies"] = [{"id": 713, "title": "Oppenheimer", "path": str(dossier),
+                                "movieFile": {"id": 70, "path": radarr}}]
+
+    assert app._jellyfin_paths_for_item("oppenheimer") == []  # avant : la suppression restait sans effet
+    assert ajout("Movie", "oppenheimer", "Oppenheimer") == "index scheduled"
+    app._jellyfin_index_timer.cancel()
+    assert app._run_jellyfin_index() == "success"
+    assert sauvegardes == []  # pas de copie de la base pour une sync d'ajout
+
+    os.remove(torrent)  # Jellyfin supprime le fichier qu'il voit : celui du torrent
+    rep = evenement("Movie", "oppenheimer", "Oppenheimer")
+    assert suppressions(porte["appels"]) == ["movie/713"]
     assert rep["status"] == "delegated"
 
 
