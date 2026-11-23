@@ -28,6 +28,7 @@ class FauxQbit:
 
     def __init__(self):
         self.torrents: list[dict] = []
+        self.fichiers: dict[str, list[str]] = {}  # hash → noms relatifs au save_path, comme /torrents/files
         self.ecritures: list[tuple[str, dict]] = []
         self.refus: dict[int, int] = {}
         self.ajouts = 0
@@ -42,6 +43,8 @@ class FauxQbit:
                 voulus = set(params["hashes"].split("|"))
                 liste = [t for t in liste if t["hash"] in voulus]
             return Rep(liste)
+        if url.endswith("/torrents/files"):
+            return Rep([{"name": n} for n in self.fichiers.get(params["hash"], [])])
         raise AssertionError("GET inattendu : " + url)
 
     def post(self, url, data=None, timeout=None, files=None):
