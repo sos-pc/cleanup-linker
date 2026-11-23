@@ -117,7 +117,7 @@ Les montages de `/data` sont en lecture seule : cleanup-linker lit le disque, et
 
 ### Variables d'environnement
 
-Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font agir leur règle que sur `0`, `false` ou `no` : une valeur mal saisie laisse la simulation. Les options Jellyfin (`JELLYFIN_FALLBACK_MATCH`, `JELLYFIN_DELEGATE_TO_ARR`, `JELLYFIN_ARR_DELETE_CONTAINERS`) ne s'activent, elles, que sur `1`, `true` ou `yes`.
+Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font agir leur règle que sur `0`, `false` ou `no` : une valeur mal saisie laisse la simulation. Les options Jellyfin `JELLYFIN_DELEGATE_TO_ARR` et `JELLYFIN_ARR_DELETE_CONTAINERS` ne s'activent, elles, que sur `1`, `true` ou `yes`. `JELLYFIN_RESOLUTION_ID` prend `off`, `simulation` ou `active` : une autre valeur vaut simulation.
 
 **Obligatoires** : le service ne démarre pas sans elles.
 
@@ -159,9 +159,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `JELLYFIN_URL` | — | URL Jellyfin. Vide = pas d'index Jellyfin, et la route `/jellyfin` répond 503 |
 | `JELLYFIN_API_KEY` | — | Clé API Jellyfin (Tableau de bord → Clés API) |
 | `JELLYFIN_PATH_MAP` | `/Multimedia:/data/Multimedia` | Traduction des chemins vus par Jellyfin. Format `préfixe_jf:préfixe_local`, séparés par des virgules ; les plus longs passent d'abord |
-| `JELLYFIN_FALLBACK_MATCH` | `true` | Résolution par métadonnées d'un item pas encore indexé |
-| `JELLYFIN_FALLBACK_MAX` | `10` | Nombre maximal de chemins que cette résolution peut retenir pour un film ou un épisode |
-| `JELLYFIN_FALLBACK_MAX_CONTAINER` | `500` | Idem pour une série ou une saison, qui compte légitimement beaucoup de fichiers |
+| `JELLYFIN_RESOLUTION_ID` | `simulation` | Résolution par identifiant (TMDB, IMDb, TVDB) d'un item supprimé avant d'être indexé : `off`, `simulation` ou `active`. Demande `JELLYFIN_DELEGATE_TO_ARR`. Remplace `JELLYFIN_FALLBACK_MATCH`, `JELLYFIN_FALLBACK_MAX` et `JELLYFIN_FALLBACK_MAX_CONTAINER`, qui ne sont plus lues |
 | `JELLYFIN_DELEGATE_TO_ARR` | `false` | Traduit une suppression en action Sonarr/Radarr, au lieu de déplacer les torrents directement |
 | `JELLYFIN_ARR_DELETE_CONTAINERS` | `false` | La suppression d'une série ou d'un film retire aussi l'entrée de Sonarr/Radarr, au lieu de la dé-monitorer |
 
@@ -437,7 +435,19 @@ Un média ajouté *puis* supprimé entre deux syncs n'a jamais été tagué. Le 
 
 Une seule sync tourne à la fois, **entre tous les process**. La boucle tourne dans le maître gunicorn, `/sync`, `/cleanup` et les ajouts dans les deux workers. Ils s'attendent par un verrou de fichier, `db.sqlite.sync.lock`, comme les passages de l'assistant. Chaque worker programme sa propre sync, et les ajouts d'un même pack peuvent arriver dans les deux. La sync d'un ajout est donc sautée si une autre, réussie, a commencé après le premier ajout de son lot : elle a déjà tout relu.
 
-Le repli (`JELLYFIN_FALLBACK_MATCH`) reste pour le cas où l'event d'ajout se serait perdu. Il restreint les candidats par métadonnées : `SeriesName` et saison, ou titre et année. Il **ne retient que les chemins réellement absents du disque**. Au-delà de `JELLYFIN_FALLBACK_MAX` chemins (`JELLYFIN_FALLBACK_MAX_CONTAINER` pour une série ou une saison), il abandonne : un titre trop générique ne doit pas déclencher un déplacement de masse.
+**Ce qui reste : la fenêtre, fermée par l'identifiant.** Le plugin Webhook n'envoie ses ajouts que toutes les ~91 s : sa tâche est réglée sur 30 s, mais Jellyfin impose un délai minimal entre deux passages. Un média supprimé dans les 70 s à 2 min 40 qui suivent son apparition reste donc inconnu de l'index. L'event `ItemDeleted` ne donne jamais le chemin du fichier, mais il porte les identifiants du média : `Provider_tmdb`, `Provider_imdb`, `Provider_tvdb`. Pour un épisode ou une saison, il porte aussi `SeriesId`, `SeasonNumber` et `EpisodeNumber`.
+
+L'identifiant suffit à trouver le média, pas à prouver qu'il a été supprimé. Jellyfin émet aussi `ItemDeleted` quand rien n'est supprimé : analyse, réidentification, changement de bibliothèque, upgrade. Avec `JELLYFIN_RESOLUTION_ID`, un item inconnu de l'index est donc traité ainsi :
+
+1. **La fiche**, par l'identifiant :
+   - un film : son id TMDB, sinon IMDb, dans Radarr ;
+   - une série : son id TVDB, sinon TMDB ou IMDb, dans Sonarr ;
+   - une saison ou un épisode : sa série relue dans Jellyfin, ou, si elle n'y est plus, le dossier de ses autres épisodes indexés. L'épisode se reconnaît à son id TVDB, sinon à sa saison et à son numéro.
+2. **Les fichiers que l'*arr connaît** : celui qu'il tient, et, d'après son historique, le fichier du torrent dont il l'a importé.
+3. **La preuve, sur le disque.** Un fichier compte pour supprimé s'il a disparu et qu'une bibliothèque Jellyfin le lisait : Jellyfin ne supprime que ce qu'il montre. Le fichier du torrent ne compte que si le torrent le garde encore à cet endroit. Un torrent déplacé depuis l'import laisse un chemin vide sans que rien soit supprimé. Si rien n'a disparu, rien n'est fait.
+4. **La suite habituelle.** Une sync relit d'abord le disque. Puis les chemins disparus sont inscrits dans l'index comme elle l'aurait fait : même inode que le nom qui reste, torrent d'après l'historique. Ensuite, tout passe par le chemin ordinaire, garde-fous compris : déplacement, autre copie visible, fichier remplacé.
+
+`simulation`, la valeur par défaut, journalise la décision sans rien faire. Cette résolution remplace l'ancien repli par titre et année (`JELLYFIN_FALLBACK_MATCH`). Il était désactivé en production : une ligne périmée de l'index lui suffisait pour supprimer un film du même nom.
 
 Pour combler l'écart à la main :
 
@@ -517,6 +527,12 @@ Effet secondaire appréciable : Sonarr n'émet plus qu'un seul `SeriesDelete`, r
 C'est désactivé par défaut, parce que c'est irréversible côté *arr : on perd l'historique, le profil de qualité, les tags et le monitoring. **À vérifier avant d'activer** : avec des listes d'import (Trakt, IMDb…), la série sera ré-ajoutée au prochain sync, sauf à gérer les exclusions.
 
 **Repli** : si le média n'est géré par aucun *arr, typiquement une bibliothèque Jellyfin posée sur un dossier de téléchargement, on retombe sur le déplacement direct des torrents. Idem si l'*arr est injoignable : une erreur d'API n'interrompt jamais le traitement.
+
+**Torrent vidé par Jellyfin.** Quand la bibliothèque lit le dossier de téléchargement, comme « Films », c'est le fichier du torrent que Jellyfin supprime. Le torrent ne peut plus seeder, mais personne ne le voit :
+- la corbeille globale part des noms restés sur le disque, et il n'en reste aucun ;
+- qBittorrent ne le marque pas « fichiers manquants » de lui-même. Oppenheimer est resté 16 h en seed sur du vide.
+
+Après chaque suppression traitée, délégation comprise, un torrent qui tenait un chemin supprimé et n'a plus aucune vidéo sur le disque part donc en corbeille. C'est le même critère que les torrents perdus de `/cleanup`. Un pack qui garde d'autres épisodes reste en place.
 
 #### Tester sans rien déplacer
 

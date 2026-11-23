@@ -8,17 +8,23 @@ import time
 from contextlib import contextmanager
 
 import pytest
+from faux import FauxQbit
 
 import app
 
 
 @pytest.fixture
 def porte(monkeypatch):
-    """Porte Jellyfin active, délégation et suppression des conteneurs comprises ; index vide ; appels *arr notés."""
+    """
+    Porte Jellyfin active, délégation et suppression des conteneurs comprises ; index vide ; appels *arr notés ;
+    qBittorrent en mémoire.
+    """
     with app.get_db() as conn:
         conn.execute("DELETE FROM files")
     appels, gestes = [], []
-    etat = {"series": [], "episodefiles": [], "movies": [], "bibliotheques": set()}
+    etat = {"series": [], "episodefiles": [], "episodes": None, "movies": [], "historique": [],
+            "bibliotheques": set()}
+    qb = FauxQbit()
 
     def faux_arr(method, base_url, api_key, endpoint, timeout=30, retries=3, **kwargs):
         appels.append((method, endpoint))
@@ -27,20 +33,40 @@ def porte(monkeypatch):
         if method == "GET" and endpoint == "episodefile":
             return etat["episodefiles"]
         if method == "GET" and endpoint == "episode":
+            if etat["episodes"] is not None:
+                return etat["episodes"]
             return [{"id": 100 + f["id"], "episodeFileId": f["id"]} for f in etat["episodefiles"]]
         if method == "GET" and endpoint == "movie":
             return etat["movies"]
+        if method == "GET" and endpoint in ("history/movie", "history/series"):
+            return etat["historique"]
         return None  # PUT et DELETE : seulement notés
+
+    @contextmanager
+    def session():
+        yield qb
 
     monkeypatch.setattr(app, "_arr_request", faux_arr)
     monkeypatch.setattr(app, "_jellyfin_libraries", lambda: etat["bibliotheques"])
     monkeypatch.setattr(app, "_delete_gesture", lambda chemins, *a, **k: gestes.append(list(chemins)) or 0)
+    monkeypatch.setattr(app, "qbit_session", session)
     for nom, valeur in {"JELLYFIN_URL": "http://jellyfin.invalid", "JELLYFIN_API_KEY": "tests",
                         "JELLYFIN_DELEGATE_TO_ARR": True, "JELLYFIN_ARR_DELETE_CONTAINERS": True,
                         "SONARR_URL": "http://sonarr.invalid", "SONARR_API_KEY": "tests",
                         "RADARR_URL": "http://radarr.invalid", "RADARR_API_KEY": "tests"}.items():
         monkeypatch.setattr(app, nom, valeur)
-    return {"appels": appels, "gestes": gestes, "etat": etat}
+    return {"appels": appels, "gestes": gestes, "etat": etat, "qbit": qb}
+
+
+def torrent_qbit(chemin, h, categorie="[seed] Films"):
+    """Un torrent tel que qBittorrent le décrit : `chemin` est sa racine, fichier seul ou dossier."""
+    return {"hash": h, "name": os.path.basename(chemin), "category": categorie,
+            "content_path": chemin, "save_path": os.path.dirname(chemin)}
+
+
+def corbeille(qb):
+    """Les hashes que la porte a mis en corbeille."""
+    return {d["hashes"] for action, d in qb.ecritures if action == "setCategory" and d["category"] == app.TARGET_CAT}
 
 
 def fichier(chemin, contenu=b"video"):
@@ -62,10 +88,11 @@ def indexer(chemin, torrent=None, item=None, serie=None):
                      "VALUES (?, ?, ?, 0, ?, ?)", (os.stat(chemin).st_ino, chemin, torrent, item, serie))
 
 
-def evenement(item_type, item_id, nom="test"):
+def evenement(item_type, item_id, nom="test", **champs):
+    """Un ItemDeleted du plugin Webhook ; `champs` : Provider_tmdb, SeriesId, SeasonNumber, EpisodeNumber…"""
     client = app.app.test_client()
     rep = client.post("/jellyfin?token=tests", json={"NotificationType": "ItemDeleted", "ItemType": item_type,
-                                                     "ItemId": item_id, "Name": nom})
+                                                     "ItemId": item_id, "Name": nom, **champs})
     assert rep.status_code == 200
     return rep.get_json()
 
@@ -136,6 +163,7 @@ def test_film_supprime_dans_films_atteint_toujours_radarr(tmp_path, porte):
     radarr = lien(torrent, str(tmp_path / "Media/Films/Un Film (2020)/Un Film (2020).mkv"))
     indexer(torrent, torrent="t2", item="film-1")
     indexer(radarr)
+    porte["qbit"].torrents.append(torrent_qbit(os.path.dirname(torrent), "t2"))
     porte["etat"]["bibliotheques"] = {str(tmp_path / "Multimedia/Films")}
     porte["etat"]["movies"] = [{"id": 9, "title": "Un Film", "path": str(tmp_path / "Media/Films/Un Film (2020)"),
                                 "movieFile": {"id": 5, "path": radarr}}]
@@ -144,6 +172,8 @@ def test_film_supprime_dans_films_atteint_toujours_radarr(tmp_path, porte):
     # Le fichier actuel de Radarr est encore là, mais c'est le même fichier, sous un autre nom : la fiche part.
     assert suppressions(porte["appels"]) == ["movie/9"]
     assert rep["status"] == "delegated"
+    # Le torrent n'a plus aucune vidéo : la corbeille globale, partie des noms restants, ne le verrait pas.
+    assert corbeille(porte["qbit"]) == {"t2"}
 
 
 def no_other_land(tmp_path, porte):
@@ -257,16 +287,9 @@ def test_oppenheimer_supprime_juste_apres_son_ajout(tmp_path, porte, ajouts, mon
     dossier = tmp_path / "Media/Films/Oppenheimer (2023)"
     radarr = lien(torrent, str(dossier / "Oppenheimer (2023).mkv"))
 
-    @contextmanager
-    def session():
-        yield object()
-
     sauvegardes = []
-    monkeypatch.setattr(app, "qbit_session", session)
+    porte["qbit"].torrents.append(torrent_qbit(torrent, "a" * 40))
     monkeypatch.setattr(app, "qbit_get_categories", lambda s: {"[seed] Films": str(films)})
-    monkeypatch.setattr(app, "qbit_get_torrents", lambda s: [{
-        "hash": "a" * 40, "name": "Oppenheimer.2023.QTZ.mkv", "category": "[seed] Films",
-        "content_path": torrent, "save_path": str(films)}])
     monkeypatch.setattr(app, "backup_db", lambda: sauvegardes.append(True))
     monkeypatch.setattr(app, "refresh_arr_managed_from_links", lambda: 0)
     monkeypatch.setattr(app, "purge_arr_managed_absents", lambda hashes: 0)
@@ -286,6 +309,190 @@ def test_oppenheimer_supprime_juste_apres_son_ajout(tmp_path, porte, ajouts, mon
     rep = evenement("Movie", "oppenheimer", "Oppenheimer")
     assert suppressions(porte["appels"]) == ["movie/713"]
     assert rep["status"] == "delegated"
+    assert corbeille(porte["qbit"]) == {"a" * 40}  # le torrent, vidé de son fichier, part aussi
+
+
+# ── Résolution par identifiant : un item supprimé avant que l'index le connaisse ──────────────────────────────────
+
+
+@pytest.fixture
+def identifiants(porte, monkeypatch):
+    """Résolution par identifiant active ; la sync est seulement notée ; les séries Jellyfin sont simulées."""
+    monkeypatch.setattr(app, "JELLYFIN_RESOLUTION_ID", "active")
+    syncs, items = [], {}
+    monkeypatch.setattr(app, "sync_db", lambda **k: syncs.append(k) or "success")
+    monkeypatch.setattr(app, "_jellyfin_item", lambda i: items.get(i))
+    porte.update(syncs=syncs, items_jf=items)
+    return porte
+
+
+def import_radarr(fichier_arr, source, h):
+    """Une ligne d'historique *arr : `fichier_arr` importé depuis `source`, le fichier du torrent `h`."""
+    return {"eventType": "downloadFolderImported", "downloadId": h.upper(),
+            "data": {"importedPath": fichier_arr, "droppedPath": source}}
+
+
+def oppenheimer_inconnu(tmp_path, porte):
+    """« Films » lit le dossier du torrent ; Radarr tient son hardlink ; rien n'est indexé, aucune sync depuis."""
+    films = tmp_path / "Multimedia/Films"
+    torrent = fichier(str(films / "Oppenheimer.2023.QTZ.mkv"))
+    dossier = tmp_path / "Media/Films/Oppenheimer (2023)"
+    radarr = lien(torrent, str(dossier / "Oppenheimer (2023).mkv"))
+    h = "b" * 40
+    porte["qbit"].torrents.append(torrent_qbit(torrent, h))
+    porte["etat"]["bibliotheques"] = {str(films)}
+    porte["etat"]["movies"] = [{"id": 713, "tmdbId": 872585, "title": "Oppenheimer", "path": str(dossier),
+                                "movieFile": {"id": 70, "path": radarr}}]
+    porte["etat"]["historique"] = [import_radarr(radarr, torrent, h)]
+    return torrent, radarr, h
+
+
+def test_identifiant_oppenheimer(tmp_path, identifiants):
+    """Supprimé dans Jellyfin avant d'être indexé : l'identifiant TMDB mène à Radarr, le disque prouve la suppression."""
+    torrent, radarr, h = oppenheimer_inconnu(tmp_path, identifiants)
+    os.remove(torrent)  # Jellyfin supprime le fichier qu'il voit, celui du torrent
+    rep = evenement("Movie", "inconnu", "Oppenheimer", Provider_tmdb="872585", Provider_imdb="tt15398776")
+    assert suppressions(identifiants["appels"]) == ["movie/713"]
+    assert rep["status"] == "delegated" and rep["resolution"] == "identifiant" and not rep["dry_run"]
+    assert identifiants["syncs"]  # l'index relu avant d'y inscrire le nom disparu
+    assert corbeille(identifiants["qbit"]) == {h}
+    assert os.path.exists(radarr)  # c'est Radarr, appelé pour de bon en prod, qui supprime sa copie
+
+
+def test_identifiant_en_simulation_rien_n_agit(tmp_path, identifiants, monkeypatch):
+    monkeypatch.setattr(app, "JELLYFIN_RESOLUTION_ID", "simulation")
+    torrent, _, _ = oppenheimer_inconnu(tmp_path, identifiants)
+    os.remove(torrent)
+    rep = evenement("Movie", "inconnu", "Oppenheimer", Provider_tmdb="872585")
+    assert suppressions(identifiants["appels"]) == []
+    assert corbeille(identifiants["qbit"]) == set()
+    assert rep["resolution"] == "identifiant" and rep["dry_run"]
+
+
+def test_identifiant_coupe(tmp_path, identifiants, monkeypatch):
+    monkeypatch.setattr(app, "JELLYFIN_RESOLUTION_ID", "off")
+    torrent, _, _ = oppenheimer_inconnu(tmp_path, identifiants)
+    os.remove(torrent)
+    assert evenement("Movie", "inconnu", "Oppenheimer", Provider_tmdb="872585")["status"] == "unresolved"
+    assert suppressions(identifiants["appels"]) == []
+
+
+def test_identifiant_fichiers_en_place_pas_une_suppression(tmp_path, identifiants):
+    """Un retrait sans suppression (analyse, réidentification, élément homonyme) : rien n'a disparu, rien n'est fait."""
+    oppenheimer_inconnu(tmp_path, identifiants)
+    rep = evenement("Movie", "virtuel", "Oppenheimer", Provider_tmdb="872585")
+    assert rep["status"] == "unresolved"
+    assert suppressions(identifiants["appels"]) == []
+    assert identifiants["syncs"] == []
+
+
+def test_identifiant_torrent_deplace_pas_une_suppression(tmp_path, identifiants):
+    """Le chemin noté à l'import est vide parce que le torrent a changé de dossier depuis : rien n'est supprimé."""
+    films = tmp_path / "Multimedia/Films"
+    ancien = str(films / "Oppenheimer.2023.QTZ.mkv")
+    nouveau = fichier(str(tmp_path / "Multimedia/Films seed/Oppenheimer.2023.QTZ.mkv"))
+    dossier = tmp_path / "Media/Films/Oppenheimer (2023)"
+    radarr = lien(nouveau, str(dossier / "Oppenheimer (2023).mkv"))
+    indexer(nouveau, torrent="c" * 40)  # une sync a déjà vu le torrent à sa nouvelle place
+    indexer(radarr)
+    identifiants["qbit"].torrents.append(torrent_qbit(nouveau, "c" * 40))
+    identifiants["etat"]["bibliotheques"] = {str(films)}
+    identifiants["etat"]["movies"] = [{"id": 713, "tmdbId": 872585, "title": "Oppenheimer", "path": str(dossier),
+                                       "movieFile": {"id": 70, "path": radarr}}]
+    identifiants["etat"]["historique"] = [import_radarr(radarr, ancien, "c" * 40)]
+    rep = evenement("Movie", "inconnu", "Oppenheimer", Provider_tmdb="872585")
+    assert rep["status"] == "unresolved"
+    assert suppressions(identifiants["appels"]) == []
+
+
+def test_identifiant_bibliotheque_sur_media(tmp_path, identifiants):
+    """« meuhmeuh » lit /data/Media : Jellyfin supprime la copie de Radarr, le torrent garde la sienne."""
+    torrent = fichier(str(tmp_path / "Multimedia/MeuhMeuh/Film.Neuf.2024.mkv"))
+    dossier = tmp_path / "Media/meuhmeuh/Film Neuf (2024)"
+    radarr = lien(torrent, str(dossier / "Film Neuf (2024).mkv"))
+    identifiants["qbit"].torrents.append(torrent_qbit(torrent, "d" * 40, "[seed] meuhmeuh"))
+    identifiants["etat"]["bibliotheques"] = {str(tmp_path / "Media/meuhmeuh")}
+    identifiants["etat"]["movies"] = [{"id": 800, "tmdbId": 42, "title": "Film Neuf", "path": str(dossier),
+                                       "movieFile": {"id": 80, "relativePath": "Film Neuf (2024).mkv"}}]
+    identifiants["etat"]["historique"] = [import_radarr(radarr, torrent, "d" * 40)]
+    os.remove(radarr)
+    rep = evenement("Movie", "inconnu", "Film Neuf", Provider_tmdb="42")
+    assert suppressions(identifiants["appels"]) == ["movie/800"]
+    assert rep["resolution"] == "identifiant"
+    # Le torrent a encore sa vidéo : c'est l'event de suppression de Radarr qui le passera à la corbeille.
+    assert corbeille(identifiants["qbit"]) == set()
+
+
+def test_identifiant_fichier_hors_bibliotheque_pas_une_suppression(tmp_path, identifiants):
+    """Le fichier de Radarr manque, mais aucune bibliothèque ne le lisait : ce n'est pas Jellyfin qui l'a supprimé."""
+    torrent, radarr, _ = oppenheimer_inconnu(tmp_path, identifiants)
+    os.remove(radarr)  # /data/Media/Films n'est pas une bibliothèque : « Films » lit le dossier du torrent
+    rep = evenement("Movie", "inconnu", "Oppenheimer", Provider_tmdb="872585")
+    assert rep["status"] == "unresolved"
+    assert suppressions(identifiants["appels"]) == []
+
+
+def test_identifiant_sans_fiche_rien(tmp_path, identifiants):
+    torrent, _, _ = oppenheimer_inconnu(tmp_path, identifiants)
+    os.remove(torrent)
+    assert evenement("Movie", "inconnu", "Autre", Provider_tmdb="1")["status"] == "unresolved"
+    assert suppressions(identifiants["appels"]) == []
+
+
+def serie_pack(tmp_path, porte):
+    """Un pack de deux épisodes, hardlinkés dans « Séries », lue par Jellyfin sur /data/Media ; rien n'est indexé."""
+    pack = tmp_path / "Multimedia/Séries/Show.S01.1080p"
+    eps_t = [fichier(str(pack / f"Show.S01E0{n}.mkv"), f"ep{n}".encode()) for n in (1, 2)]
+    dossier = tmp_path / "Media/Séries/Show (2020)"
+    eps_m = [lien(t, str(dossier / f"Season 01/Show - S01E0{n}.mkv")) for n, t in zip((1, 2), eps_t)]
+    h = "e" * 40
+    porte["qbit"].torrents.append(torrent_qbit(str(pack), h, "[seed] Séries"))
+    porte["etat"]["bibliotheques"] = {str(tmp_path / "Media/Séries")}
+    porte["etat"]["series"] = [{"id": 31, "title": "Show", "tvdbId": 7000, "path": str(dossier)}]
+    porte["etat"]["episodes"] = [{"id": 500 + n, "seasonNumber": 1, "episodeNumber": n, "tvdbId": 9000 + n,
+                                  "episodeFileId": 70 + n} for n in (1, 2)]
+    porte["etat"]["episodefiles"] = [{"id": 70 + n, "path": m} for n, m in zip((1, 2), eps_m)]
+    porte["etat"]["historique"] = [import_radarr(m, t, h) for m, t in zip(eps_m, eps_t)]
+    porte["items_jf"]["serie-jf"] = {"Id": "serie-jf", "ProviderIds": {"Tvdb": "7000"}}
+    return eps_m, h
+
+
+@pytest.mark.parametrize("champs", [
+    {"Provider_tvdb": "9001"},                     # l'id TVDB de l'épisode
+    {"SeasonNumber": 1, "EpisodeNumber": 1},       # sans lui, la saison et le numéro
+])
+def test_identifiant_episode(tmp_path, identifiants, champs):
+    eps_m, _ = serie_pack(tmp_path, identifiants)
+    os.remove(eps_m[0])
+    rep = evenement("Episode", "inconnu", "Show", SeriesId="serie-jf", **champs)
+    assert rep["status"] == "delegated" and rep["resolution"] == "identifiant"
+    assert suppressions(identifiants["appels"]) == ["episodefile/71"]
+    assert corbeille(identifiants["qbit"]) == set()  # le pack garde l'autre épisode
+
+
+def test_identifiant_saison_entiere(tmp_path, identifiants):
+    eps_m, _ = serie_pack(tmp_path, identifiants)
+    for m in eps_m:
+        os.remove(m)
+    rep = evenement("Season", "saison-inconnue", "Saison 1", SeriesId="serie-jf", SeasonNumber=1)
+    assert rep["status"] == "delegated" and rep["resolution"] == "identifiant"
+    assert sorted(suppressions(identifiants["appels"])) == ["episodefile/71", "episodefile/72"]
+
+
+def test_torrent_vide_seulement_sans_autre_video(tmp_path, porte):
+    """Un torrent part en corbeille quand Jellyfin a effacé sa dernière vidéo, pas quand il lui en reste une."""
+    seul = fichier(str(tmp_path / "Multimedia/Films/Seul.mkv"))
+    pack = tmp_path / "Multimedia/Séries/Pack.S01"
+    ep1, _ep2 = (fichier(str(pack / f"E0{n}.mkv")) for n in (1, 2))
+    indexer(seul, torrent="f1")
+    indexer(ep1, torrent="f2")
+    porte["qbit"].torrents += [torrent_qbit(seul, "f1"), torrent_qbit(str(pack), "f2", "[seed] Séries")]
+    os.remove(seul)
+    os.remove(ep1)
+    assert app._trash_emptied_torrents([seul, ep1], dry_run=True) == 1
+    assert corbeille(porte["qbit"]) == set()
+    assert app._trash_emptied_torrents([seul, ep1], dry_run=False) == 1
+    assert corbeille(porte["qbit"]) == {"f1"}
 
 
 def test_serie_supprimee_dans_sa_bibliotheque_reste_deleguee(tmp_path, porte):

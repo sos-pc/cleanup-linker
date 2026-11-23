@@ -194,20 +194,17 @@ JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 # séparés par des virgules. Les préfixes les plus longs sont appliqués en premier.
 JELLYFIN_PATH_MAP = os.getenv("JELLYFIN_PATH_MAP", "/Multimedia:/data/Multimedia")
 
-# Filet quand l'item n'a jamais été indexé (média ajouté puis supprimé entre
-# deux syncs) : on restreint les candidats par métadonnées et on n'agit que sur
-# les fichiers réellement absents du disque.
-JELLYFIN_FALLBACK_MATCH = os.getenv("JELLYFIN_FALLBACK_MATCH", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-# Borne le rayon d'action du fallback : au-delà, le motif est jugé trop large
-# (titre générique) et on préfère ne rien faire plutôt que déplacer à l'aveugle.
-JELLYFIN_FALLBACK_MAX = int(os.getenv("JELLYFIN_FALLBACK_MAX", "10"))
-# Une série entière compte légitimement beaucoup de fichiers : plafond distinct
-# pour les suppressions de conteneur (Series/Season).
-JELLYFIN_FALLBACK_MAX_CONTAINER = int(os.getenv("JELLYFIN_FALLBACK_MAX_CONTAINER", "500"))
+# Un item que l'index ne connaît pas encore (média arrivé puis supprimé entre deux
+# syncs) est rapproché de sa fiche Sonarr/Radarr par les identifiants que porte
+# l'event : TMDB, IMDb, TVDB. Il n'agit que si un fichier que l'*arr connaît, et
+# que Jellyfin montrait, a disparu : l'identifiant désigne le média, seul le
+# disque prouve la suppression. « simulation » par défaut : la décision est
+# journalisée, rien n'agit. « active » ; « off » le coupe. Remplace l'ancien
+# repli par titre et année (JELLYFIN_FALLBACK_MATCH) : une ligne périmée de
+# l'index y suffisait à supprimer un film.
+JELLYFIN_RESOLUTION_ID = os.getenv("JELLYFIN_RESOLUTION_ID", "simulation").strip().lower()
+if JELLYFIN_RESOLUTION_ID not in ("off", "simulation", "active"):
+    JELLYFIN_RESOLUTION_ID = "simulation"
 
 # Traduit une suppression Jellyfin en action Sonarr/Radarr (dé-monitorer puis
 # supprimer l'enregistrement du fichier) au lieu de déplacer les torrents nous-mêmes.
@@ -1362,63 +1359,240 @@ def _common_root(paths: list[str]) -> str:
     return "/".join(common)
 
 
-def _jellyfin_paths_by_metadata(data: dict[str, Any], max_paths: int) -> list[str]:
+# ── Résolution par identifiant ───────────────────────────────────────────────
+# L'event ItemDeleted ne donne jamais le chemin du fichier : seule une sync relie
+# un item à ses fichiers. Un média arrivé puis supprimé entre deux syncs reste
+# donc inconnu (Oppenheimer, 2026-11-22). Mais l'event porte les identifiants du
+# média (TMDB, IMDb, TVDB). Ils suffisent à trouver sa fiche Sonarr/Radarr, pas à
+# prouver la suppression : Jellyfin émet aussi ItemDeleted quand rien n'est
+# supprimé (analyse, réidentification, changement de bibliothèque, upgrade). La
+# preuve vient du disque, par les fichiers que l'*arr connaît.
+
+
+def _event_ids(data: dict[str, Any]) -> dict[str, str]:
+    """Les identifiants que porte l'event (tmdb, imdb, tvdb…) : clés « Provider_<nom> » du plugin Webhook."""
+    return {k[len("provider_"):].lower(): str(v).strip() for k, v in data.items()
+            if k.lower().startswith("provider_") and v not in (None, "")}
+
+
+def _item_ids(item: dict[str, Any]) -> dict[str, str]:
+    """Les identifiants d'un item lu dans l'API Jellyfin (ProviderIds : Tmdb, Imdb, Tvdb…)."""
+    return {k.lower(): str(v).strip() for k, v in (item.get("ProviderIds") or {}).items() if v not in (None, "")}
+
+
+def _jellyfin_item(item_id: str) -> dict[str, Any] | None:
+    """Un item encore présent dans Jellyfin, avec ses identifiants. None s'il n'y est plus ou si Jellyfin ne répond pas."""
+    try:
+        r = requests.get(f"{JELLYFIN_URL}/Items", params={"Ids": item_id, "Fields": "ProviderIds"}, timeout=30,
+                         headers={"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'})
+        r.raise_for_status()
+        items = r.json().get("Items") or []
+        return items[0] if items else None
+    except Exception as e:
+        log.warning("  [identifiant] Jellyfin ne répond pas sur l'item %s : %s", item_id, e)
+        return None
+
+
+def _entier(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _radarr_by_ids(ids: dict[str, str]) -> dict[str, Any] | None:
+    """La fiche Radarr de ces identifiants : TMDB, sinon IMDb."""
+    if ids.get("tmdb"):
+        films = _arr_request("GET", RADARR_URL, RADARR_API_KEY, "movie", params={"tmdbId": ids["tmdb"]}) or []
+        film = next((m for m in films if str(m.get("tmdbId")) == ids["tmdb"]), None)
+        if film:
+            return film
+    if ids.get("imdb"):
+        imdb = ids["imdb"].lower()
+        return next((m for m in _arr_request("GET", RADARR_URL, RADARR_API_KEY, "movie") or []
+                     if (m.get("imdbId") or "").lower() == imdb), None)
+    return None
+
+
+def _sonarr_by_ids(ids: dict[str, str]) -> dict[str, Any] | None:
+    """La fiche Sonarr de ces identifiants de série : TVDB, sinon TMDB, sinon IMDb."""
+    if ids.get("tvdb"):
+        series = _arr_request("GET", SONARR_URL, SONARR_API_KEY, "series", params={"tvdbId": ids["tvdb"]}) or []
+        serie = next((s for s in series if str(s.get("tvdbId")) == ids["tvdb"]), None)
+        if serie:
+            return serie
+    toutes: list[dict[str, Any]] | None = None
+    for cle, champ in (("tmdb", "tmdbId"), ("imdb", "imdbId")):
+        if ids.get(cle):
+            if toutes is None:
+                toutes = _arr_request("GET", SONARR_URL, SONARR_API_KEY, "series") or []
+            serie = next((s for s in toutes if str(s.get(champ) or "").lower() == ids[cle].lower()), None)
+            if serie:
+                return serie
+    return None
+
+
+def _sonarr_series_of(data: dict[str, Any], item_type: str) -> dict[str, Any] | None:
     """
-    Filet quand l'item n'a jamais été indexé : on restreint par métadonnées puis
-    on ne garde que les chemins réellement absents du disque. Un fichier encore
-    présent n'est jamais retenu, ce qui rend un faux positif très improbable.
+    La fiche Sonarr d'un event Series, Season ou Episode. Une série porte ses propres
+    identifiants ; une saison ou un épisode, seulement l'id Jellyfin de sa série. On
+    relit alors la série dans Jellyfin, ou, si elle n'y est plus, on retrouve son
+    dossier par ses autres épisodes indexés.
     """
-    item_type = data.get("ItemType", "")
-    patterns: list[str] = []
-
-    if item_type in ("Series", "Season"):
-        series = data.get("SeriesName") or data.get("Name")
-        if series:
-            season = data.get("IndexNumber") if item_type == "Season" else None
-            if season is not None:
-                patterns.append(f"%/{series}%/Season {int(season):02d}/%")
-            else:
-                patterns.append(f"%/{series}/%")
-                patterns.append(f"%/{series} (%/%")
-    elif item_type == "Episode":
-        series = data.get("SeriesName")
-        season = data.get("SeasonNumber")
-        if series and season is not None:
-            patterns.append(f"%/{series}/Season {int(season):02d}/%")
-            patterns.append(f"%/{series} (%/Season {int(season):02d}/%")
-    elif item_type in ("Movie", "Video"):
-        name, year = data.get("Name"), data.get("Year")
-        if name and year:
-            patterns.append(f"%/{name} ({year})%")
-        elif name:
-            patterns.append(f"%/{name}%")
-
-    if not patterns:
-        return []
-
-    candidates: set[str] = set()
+    if item_type == "Series":
+        return _sonarr_by_ids(_event_ids(data))
+    serie_jf = str(data.get("SeriesId") or "")
+    if not serie_jf:
+        return None
+    item = _jellyfin_item(serie_jf)
+    if item:
+        serie = _sonarr_by_ids(_item_ids(item))
+        if serie:
+            return serie
     with _db_lock:
         with get_db() as conn:
-            for pat in patterns:
-                for row in conn.execute(
-                    "SELECT DISTINCT path FROM files WHERE path LIKE ?", (pat,)
-                ).fetchall():
-                    candidates.add(row["path"])
+            chemins = [r[0] for r in conn.execute(
+                "SELECT DISTINCT path FROM files WHERE jellyfin_series_id = ? LIMIT 50", (serie_jf,))]
+    if not chemins:
+        return None
+    return _match_by_path(_arr_request("GET", SONARR_URL, SONARR_API_KEY, "series") or [], chemins)
 
-    disparus = [p for p in candidates if not os.path.exists(p)]
-    if candidates:
-        log.info(
-            "  [fallback] %d candidat(s) par métadonnées, %d réellement absent(s) du disque",
-            len(candidates), len(disparus),
-        )
-    if len(disparus) > max_paths:
-        log.warning(
-            "  [fallback] %d chemins pour un seul item — motif jugé trop large, abandon "
-            "(plafond %d)",
-            len(disparus), max_paths,
-        )
+
+def _import_sources(arr: str, media_id: int) -> dict[str, tuple[str, str]]:
+    """Pour chaque fichier importé par l'*arr : le fichier du torrent d'origine et son hash, d'après l'historique."""
+    url, cle = _arr_conf(arr)
+    endpoint, param = ("history/movie", "movieId") if arr == "radarr" else ("history/series", "seriesId")
+    sources: dict[str, tuple[str, str]] = {}
+    for h in _arr_request("GET", url, cle, endpoint, params={param: media_id}) or []:
+        d = h.get("data") or {}
+        if h.get("eventType") == "downloadFolderImported" and d.get("importedPath"):
+            # Le plus récent d'abord : un fichier réimporté garde sa dernière source.
+            sources.setdefault(d["importedPath"], (d.get("droppedPath") or "", (h.get("downloadId") or "").lower()))
+    return sources
+
+
+def _arr_media_files(data: dict[str, Any], item_type: str) -> tuple[str, str, list[dict[str, str]]]:
+    """
+    (*arr, titre, fichiers) du média que désigne l'event, d'après ses identifiants.
+    Chaque fichier : `fichier`, le chemin que l'*arr tient ; `source`, le fichier du
+    torrent dont il l'a importé ; `torrent`, le hash de ce torrent. ("", "", []) sans fiche.
+    """
+    if item_type in ("Movie", "Video") and RADARR_URL and RADARR_API_KEY:
+        film = _radarr_by_ids(_event_ids(data))
+        if not film:
+            return "", "", []
+        actuel = _radarr_current_file(film)
+        if not actuel:
+            return "radarr", film.get("title", "?"), []
+        source, h = _import_sources("radarr", film["id"]).get(actuel, ("", ""))
+        return "radarr", film.get("title", "?"), [{"fichier": actuel, "source": source, "torrent": h}]
+
+    if item_type in ("Episode", "Season", "Series") and SONARR_URL and SONARR_API_KEY:
+        serie = _sonarr_series_of(data, item_type)
+        if not serie:
+            return "", "", []
+        sid, titre = serie["id"], serie.get("title", "?")
+        episodes = _arr_request("GET", SONARR_URL, SONARR_API_KEY, "episode", params={"seriesId": sid}) or []
+        saison = _entier(data.get("SeasonNumber"))
+        if item_type == "Episode":
+            # L'id TVDB de l'épisode d'abord : la numérotation de Jellyfin peut différer de celle de Sonarr.
+            tvdb = _event_ids(data).get("tvdb")
+            vises = [e for e in episodes if tvdb and str(e.get("tvdbId")) == tvdb]
+            debut = _entier(data.get("EpisodeNumber"))
+            if not vises and saison is not None and debut is not None:
+                fin = _entier(data.get("EpisodeNumberEnd")) or debut
+                vises = [e for e in episodes if e.get("seasonNumber") == saison
+                         and debut <= (e.get("episodeNumber") or -1) <= fin]
+        elif item_type == "Season":
+            vises = [e for e in episodes if saison is not None and e.get("seasonNumber") == saison]
+        else:
+            vises = episodes
+        ids_fichiers = {e["episodeFileId"] for e in vises if e.get("episodeFileId")}
+        if not ids_fichiers:
+            return "sonarr", titre, []
+        sources = _import_sources("sonarr", sid)
+        fichiers = []
+        for f in _arr_request("GET", SONARR_URL, SONARR_API_KEY, "episodefile", params={"seriesId": sid}) or []:
+            if f.get("id") in ids_fichiers and f.get("path"):
+                source, h = sources.get(f["path"], ("", ""))
+                fichiers.append({"fichier": f["path"], "source": source, "torrent": h})
+        return "sonarr", titre, fichiers
+    return "", "", []
+
+
+def _jellyfin_paths_by_arr(data: dict[str, Any], item_type: str) -> list[str]:
+    """
+    Les chemins qu'un item inconnu de l'index désignait, retrouvés par sa fiche *arr.
+
+    Un fichier compte pour supprimé s'il a disparu et qu'une bibliothèque Jellyfin le
+    lisait : Jellyfin ne supprime que ce qu'il montre. Soit le fichier que l'*arr
+    tient (bibliothèque posée sur /data/Media), soit le fichier du torrent dont il
+    l'a importé (bibliothèque posée sur le dossier de téléchargement, comme
+    « Films »), à condition que ce torrent le garde encore à cet endroit : un torrent
+    déplacé depuis laisse un chemin vide sans que rien soit supprimé.
+
+    Les chemins disparus sont inscrits dans l'index comme la sync l'aurait fait, et
+    la suite passe par le chemin habituel, garde-fous compris (déplacement, autre
+    copie visible, fichier remplacé). [] si rien de ce que l'*arr connaît n'a disparu.
+    """
+    arr, titre, fichiers = _arr_media_files(data, item_type)
+    if not arr:
         return []
-    return disparus
+    if not fichiers:
+        log.info("  ⏭ [identifiant] %s : « %s » n'a aucun fichier, rien à vérifier", arr, titre)
+        return []
+    lues = _jellyfin_libraries()
+    if lues is None:
+        log.warning("  [identifiant] bibliothèques Jellyfin illisibles : rien n'est tenté pour « %s »", titre)
+        return []
+    with qbit_session() as s:
+        torrents = {t["hash"].lower(): t for t in qbit_get_torrents(s)}
+
+    disparus: list[tuple[str, str, str]] = []  # (chemin disparu, nom restant du même fichier, hash du torrent)
+    for f in fichiers:
+        fichier, source, h = f["fichier"], f["source"], f["torrent"]
+        t = torrents.get(h) if h else None
+        source_a_jour = bool(t and source and _under(source, {torrent_root(t)}))
+        source_la = source_a_jour and os.path.exists(source)
+        if not os.path.exists(fichier) and _under(fichier, lues):
+            disparus.append((fichier, source if source_la else "", h if t else ""))
+        elif source_a_jour and not source_la and _under(source, lues):
+            disparus.append((source, fichier if os.path.exists(fichier) else "", h))
+    if not disparus:
+        log.info("  ⏭ [identifiant] %s : les fichiers de « %s » sont en place, ou Jellyfin ne les montrait pas : "
+                 "pas une suppression", arr, titre)
+        return []
+
+    log.info("  [identifiant] %s : « %s », %d fichier(s) supprimé(s) dans Jellyfin, dont %s",
+             arr, titre, len(disparus), disparus[0][0])
+    # L'index apprend d'abord ce qui reste sur le disque (autres noms, cross-seeds), puis les noms disparus.
+    sync_db(sauvegarde=False, motif="suppression d'un média pas encore indexé")
+    _index_disparus(disparus, torrents)
+    return [c for c, _, _ in disparus]
+
+
+def _index_disparus(disparus: list[tuple[str, str, str]], torrents: dict[str, dict[str, Any]]) -> None:
+    """
+    Inscrit dans l'index des chemins disparus avant d'avoir été indexés, comme la sync
+    l'aurait fait : l'inode du nom restant du même fichier, et le torrent d'après
+    l'historique de l'*arr. Sans nom restant, un inode négatif propre au chemin, qui
+    n'existe sur aucun disque.
+    """
+    lignes: list[tuple[int, str, str | None, str | None, str | None]] = []
+    for chemin, reste, h in disparus:
+        try:
+            inode: int | None = os.lstat(reste).st_ino if reste else None
+        except OSError:
+            inode = None
+        if inode is None:
+            inode = -(int(hashlib.sha1(chemin.encode()).hexdigest()[:12], 16) or 1)
+        t = torrents.get(h) or {}
+        lignes.append((inode, chemin, h or None, t.get("name"), t.get("category")))
+        if reste and h:
+            lignes.append((inode, reste, h, t.get("name"), t.get("category")))
+    with _db_lock:
+        with get_db() as conn:
+            conn.executemany(_UPSERT_FILES, lignes)
 
 
 # Un ajout dans Jellyfin déclenche une sync, pour que l'item soit connu de l'index
@@ -6481,22 +6655,26 @@ def jellyfin_webhook():
     # Supprimer une série ou une saison n'émet qu'un seul event, sur le conteneur —
     # jamais un par épisode (vérifié en production). On remonte donc aux fichiers
     # via jellyfin_series_id / jellyfin_season_id.
-    is_container = item_type in ("Series", "Season")
-
     paths = _jellyfin_paths_for_item(item_id, item_type)
     resolution = "index"
 
-    if not paths and JELLYFIN_FALLBACK_MATCH:
-        log.info("  Item %s absent de l'index, tentative par métadonnées", item_id)
-        paths = _jellyfin_paths_by_metadata(
-            data, JELLYFIN_FALLBACK_MAX_CONTAINER if is_container else JELLYFIN_FALLBACK_MAX
-        )
-        resolution = "fallback"
+    # Média arrivé depuis la dernière sync : sa fiche *arr, par ses identifiants.
+    if not paths and JELLYFIN_DELEGATE_TO_ARR and JELLYFIN_RESOLUTION_ID != "off":
+        try:
+            paths = _jellyfin_paths_by_arr(data, item_type)
+        except Exception as e:
+            log.error("  [identifiant] résolution impossible : %s", e)
+            paths = []
+        if paths:
+            resolution = "identifiant"
+            if JELLYFIN_RESOLUTION_ID == "simulation" and not dry_run:
+                log.info("  [SIMULATION] résolution par identifiant : la suite est journalisée, rien n'agit")
+                dry_run = True
 
     if not paths:
         log.warning(
-            "  Item Jellyfin non résolu: %s (%s). Média ajouté depuis la dernière "
-            "sync, ou hors périmètre de l'index.",
+            "  Item Jellyfin non résolu: %s (%s). Ni l'index ni ses identifiants ne mènent à un "
+            "fichier supprimé.",
             label, item_id,
         )
         return jsonify({"status": "unresolved", "item_id": item_id}), 200
@@ -6541,10 +6719,12 @@ def jellyfin_webhook():
     if JELLYFIN_DELEGATE_TO_ARR:
         delegated = delegate_to_arr(disparus, item_type, dry_run)
         if delegated and not delegated.get("garde"):
+            vides = _trash_emptied_torrents(disparus, dry_run)
             return jsonify({
                 "status": "delegated",
                 "delegated_to": delegated,
                 "deleted_paths": len(disparus),
+                "emptied_torrents": vides,
                 "resolution": resolution,
                 "dry_run": dry_run,
             })
@@ -6577,9 +6757,55 @@ def jellyfin_webhook():
         "moved": moved,
         "root": root or None,
         "deleted_paths": len(disparus),
+        "emptied_torrents": _trash_emptied_torrents(disparus, dry_run),
         "resolution": resolution,
         "dry_run": dry_run,
     })
+
+
+def _a_des_videos(racine: str) -> bool:
+    """Une vidéo est-elle encore sur le disque sous cette racine de torrent, fichier ou dossier ?"""
+    if os.path.isfile(racine):
+        return os.path.splitext(racine)[1].lower() in VIDEO_EXTENSIONS
+    return any(os.path.splitext(n)[1].lower() in VIDEO_EXTENSIONS for _, _, noms in os.walk(racine) for n in noms)
+
+
+def _trash_emptied_torrents(chemins: list[str], dry_run: bool) -> int:
+    """
+    Les torrents dont Jellyfin vient d'effacer le fichier : quand sa bibliothèque lit
+    le dossier de téléchargement (« Films »), c'est le fichier du torrent qu'il
+    supprime. S'il ne reste aucune de leurs vidéos sur le disque, ils ne peuvent plus
+    seeder. La corbeille globale ne les voit pas, elle part des noms restés sur le
+    disque. Et qBittorrent ne les marque pas « fichiers manquants » de lui-même :
+    Oppenheimer est resté 16 h en seed sur du vide. Ils partent en corbeille, comme
+    les torrents perdus de /cleanup. Rend leur nombre.
+    """
+    hashes: set[str] = set()
+    with _db_lock:
+        with get_db() as conn:
+            for i in range(0, len(chemins), _SQL_CHUNK):
+                lot = chemins[i:i + _SQL_CHUNK]
+                hashes |= {r[0].lower() for r in conn.execute(
+                    f"SELECT DISTINCT torrent_hash FROM files WHERE torrent_hash IS NOT NULL "
+                    f"AND path IN ({','.join('?' * len(lot))})", lot)}
+    if not hashes:
+        return 0
+    try:
+        with qbit_session() as s:
+            vides = [t for t in qbit_get_torrents(s) if (t.get("hash") or "").lower() in hashes
+                     and t.get("category") and t.get("category") != TARGET_CAT
+                     and not _a_des_videos(torrent_root(t))]
+            for t in vides:
+                log.info("  %s🗑 Plus aucune vidéo sur le disque, torrent en corbeille : [%s] %s",
+                         "[DRY RUN] " if dry_run else "", t.get("category"), t.get("name"))
+            if not vides or dry_run:
+                return len(vides)
+            plan = {"torrents": [{"hash": t["hash"], "name": t.get("name"), "category": t.get("category")}
+                                 for t in vides], "corbeilles": []}
+            return _trash_apply(plan, s, "jellyfin")["torrents"]
+    except Exception as e:
+        log.error("  Torrents vidés par Jellyfin non traités : %s", e)
+        return 0
 
 
 @app.route("/jellyfin/index", methods=["POST"])
