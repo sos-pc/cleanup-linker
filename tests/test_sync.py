@@ -118,6 +118,26 @@ def test_garde_fou_desactive(tmp_path, sync, monkeypatch):
     assert app.sync_db() == "success"
 
 
+def test_sync_sans_sauvegarde(tmp_path, sync, monkeypatch):
+    """Les syncs d'un ajout Jellyfin ne copient pas la base : elles feraient tourner les sauvegardes en quelques heures."""
+    copies = []
+    monkeypatch.setattr(app, "backup_db", lambda: copies.append(True))
+    bibliotheque(tmp_path, sync)
+    assert app.sync_db(sauvegarde=False, motif="1 ajout(s) dans Jellyfin") == "success"
+    assert copies == []
+    assert app.sync_db() == "success"
+    assert copies == [True]
+
+
+def test_une_sync_a_la_fois(monkeypatch):
+    """Boucle, /sync, /cleanup et ajouts Jellyfin passent par le même verrou."""
+    vu = []
+    monkeypatch.setattr(app, "_sync_db", lambda force, sauvegarde, motif: vu.append(app._sync_run_lock.locked()) or "success")
+    assert app.sync_db() == "success"
+    assert vu == [True]
+    assert not app._sync_run_lock.locked()
+
+
 def test_qbittorrent_injoignable(tmp_path, sync):
     bibliotheque(tmp_path, sync)
     app.sync_db()

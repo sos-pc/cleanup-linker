@@ -224,8 +224,10 @@ Triggers: ✅ On Grab              ← facultatif : marque le torrent comme pris
           ✅ On Movie Delete
           ✅ On Movie File Delete
           ❌ On Movie File Delete For Upgrade   ← laisser décoché (voir Limites connues)
-          ✅ On Manual Interaction Required   ← déclenche l'assistant d'import
+          ❌ On Manual Interaction Required   ← dans un second webhook, voir ci-dessous
 ```
+
+« On Manual Interaction Required » va dans un **second webhook**, à part : même URL, cet event seul (sur l'installation de référence, « cleanup-linker (blocages) »). Radarr 6.3, puis 7.0.3, plante en préparant cet event pour un téléchargement de Sonarr vu dans une catégorie partagée. Après chaque échec, Radarr coupe toute la notification pendant 30 min à 1 h : imports, upgrades et suppressions ne partent plus. Du 20 au 22 novembre 2026, aucun des 6 imports simples de Radarr n'est arrivé. Un upgrade perdu a même fait supprimer un film par la porte Jellyfin (voir « Fichier remplacé »). Séparé, l'event n'entraîne que lui dans sa coupure. Les blocages restent couverts par l'event de Sonarr et par le passage horaire de l'assistant.
 
 Chaque event qui porte un `downloadId` marque le torrent comme pris par un *arr (table `arr_managed`). C'est ce qui le rend visible pour `/cleanup`.
 
@@ -236,12 +238,14 @@ Tableau de bord → Extensions → Webhook → **Add Generic Destination**
 ```
 Webhook Name  : cleanup-linker
 Webhook Url   : http://192.168.1.111:5001/jellyfin?token=VOTRE_TOKEN
-Notification Type : ✅ Item Deleted
+Notification Type : ✅ Item Deleted   ✅ Item Added
 Item Type     : ✅ Movies   ✅ Episodes   ✅ Series   ✅ Seasons
 Send All Properties : ✅ obligatoire
 ```
 
 `Send All Properties` envoie le JSON brut. Sans cette case, il faut fournir un template Handlebars, et la route ne recevra pas `ItemId`.
+
+`Item Added` fait connaître à l'index un média tout juste arrivé, sans attendre la sync de 12 h. Sans lui, le supprimer depuis Jellyfin avant la sync reste sans effet (voir « Média non indexé »).
 
 Si Jellyfin n'est pas sur le réseau Docker `mediastack`, utilise l'IP de l'hôte (`http://192.168.1.111:5001`) plutôt que le nom du conteneur.
 
@@ -427,9 +431,13 @@ C'est aussi ici que le premier garde-fou compte le plus. Retirer une bibliothèq
 
 #### Média non indexé
 
-Un média ajouté *puis* supprimé entre deux syncs n'a jamais été tagué. Le repli (`JELLYFIN_FALLBACK_MATCH`) restreint alors les candidats par métadonnées : `SeriesName` et saison, ou titre et année. Il **ne retient que les chemins réellement absents du disque**. Au-delà de `JELLYFIN_FALLBACK_MAX` chemins (`JELLYFIN_FALLBACK_MAX_CONTAINER` pour une série ou une saison), il abandonne : un titre trop générique ne doit pas déclencher un déplacement de masse.
+Un média ajouté *puis* supprimé entre deux syncs n'a jamais été tagué. Le 2026-11-22, Oppenheimer a été importé à 17:37 puis supprimé dans Jellyfin à 17:49, alors que la dernière sync datait de 13:07. L'event est resté « non résolu » : Radarr gardait sa copie de 14 Go, et le torrent, son fichier effacé, ne pouvait plus seeder.
 
-Pour combler l'écart sans attendre la sync :
+**Les ajouts sont donc indexés dès que Jellyfin les annonce.** Chaque `ItemAdded` de type `Movie`, `Episode` ou `Video` programme une sync une minute plus tard. Les ajouts qui arrivent entre-temps, comme les épisodes d'un pack, s'y regroupent. Un ajout reçu pendant la sync en programme une autre. Cette sync est la sync ordinaire, garde-fous compris, mais sans copie de la base : à raison de plusieurs par jour, elle ferait tourner les sauvegardes en quelques heures. Une seule sync tourne à la fois : la boucle, `/sync`, `/cleanup` et les ajouts s'attendent.
+
+Le repli (`JELLYFIN_FALLBACK_MATCH`) reste pour le cas où l'event d'ajout se serait perdu. Il restreint les candidats par métadonnées : `SeriesName` et saison, ou titre et année. Il **ne retient que les chemins réellement absents du disque**. Au-delà de `JELLYFIN_FALLBACK_MAX` chemins (`JELLYFIN_FALLBACK_MAX_CONTAINER` pour une série ou une saison), il abandonne : un titre trop générique ne doit pas déclencher un déplacement de masse.
+
+Pour combler l'écart à la main :
 
 ```bash
 curl -XPOST 'http://192.168.1.111:5001/jellyfin/index?token=VOTRE_TOKEN'
@@ -467,7 +475,19 @@ Comparer le seul chemin Jellyfin aux dossiers Radarr ne peut pas aboutir. Avant 
 
 Les chemins supprimés sont donc d'abord complétés par **tous les autres chemins du même inode** connus de la base. Ils y sont encore au moment de l'event, car la sync ne purge un chemin disparu qu'au passage suivant. L'identification par préfixe trouve alors le film par son chemin `/data/Media`.
 
-Un lien n'est retenu que si **son inode sur le disque est toujours celui de la base**. Un fichier remplacé depuis la dernière sync, par un upgrade par exemple, est un autre fichier : une suppression Jellyfin ne doit pas l'emporter. Et quand Radarr détient une autre release que celle supprimée, aucun chemin `/data/Media` ne partage l'inode du fichier supprimé : rien n'est délégué, et la release de Radarr reste en place.
+Un lien n'est retenu que si **son inode sur le disque est toujours celui de la base**. Un fichier remplacé depuis la dernière sync, par un upgrade par exemple, est un autre fichier : une suppression Jellyfin ne doit pas l'emporter.
+
+**Fichier remplacé : la fiche Radarr est gardée.** Radarr retrouve un film par son dossier, pas par son fichier. Quand une bibliothèque Jellyfin lit `/data/Media`, l'ancien fichier d'un upgrade était dans ce dossier. Jellyfin le voit disparaître et émet `ItemDeleted`. Normalement, l'event d'upgrade de Radarr a déjà mis l'ancien torrent en corbeille : ses données ont changé de dossier, et le garde-fou du déplacement écarte l'event. Mais si l'ancien fichier n'avait pas de torrent, ou si l'event d'upgrade s'est perdu, la disparition ressemble à une suppression. Le 2026-11-22, la porte a ainsi supprimé No Other Land de Radarr, avec la version qu'il venait d'importer.
+
+Avant de supprimer quoi que ce soit, la porte compare donc le **fichier actuel de Radarr** (`movieFile`) aux fichiers disparus, par leur inode dans l'index :
+
+| Fichier actuel de Radarr | Lecture | Action |
+|---|---|---|
+| Disparu | C'est lui qu'on a supprimé | Délégation |
+| Présent, même inode qu'un fichier disparu | Le même fichier, supprimé sous un autre nom (bibliothèque « Films ») | Délégation |
+| Présent, autre inode | Un upgrade ou une autre version : la disparition ne le concerne pas | Fiche gardée, chemins disparus envoyés à la corbeille |
+
+Dans le dernier cas, la corbeille traite l'ancien fichier comme l'event d'upgrade l'aurait fait : son torrent part s'il ne sert plus. Sonarr n'a pas besoin de ce garde-fou : un épisode y est retrouvé par le chemin exact de son fichier, et l'ancien fichier d'un upgrade n'y figure plus.
 
 **Un autre nom encore lu par Jellyfin n'est jamais retenu.** C'est une autre copie, toujours visible : un doublon dans une autre bibliothèque, ou le nouveau nom d'un dossier déplacé. Passer par lui ferait retrouver et supprimer la fiche de cette copie, avec ses fichiers. C'est arrivé le 2026-11-12 avec Westworld, visible dans deux bibliothèques sur les mêmes inodes. La copie de `meuhmeuh` a été retirée, et la porte a retrouvé, par l'autre nom, la fiche Sonarr de la copie de `Séries`, puis l'a supprimée. Le même piège existait pour Dragon Ball : retirer la copie « Dragon Ball Kai » faisait supprimer la fiche « Dragon Ball Z » de l'autre copie. Seule restait retenue la fiche dont le dossier est le plus long. Désormais, la délégation ne passe que par les chemins supprimés et par les noms qu'aucune bibliothèque ne lit, comme le hardlink de Radarr derrière la bibliothèque « Films ». Si les bibliothèques Jellyfin sont illisibles, aucun autre nom n'est retenu.
 
@@ -1082,6 +1102,7 @@ Chaque event Sonarr/Radarr qui porte un `downloadId` marque d'abord le torrent d
 |---|---|---|
 | `ItemDeleted` | `Movie`, `Episode`, `Video` | Résout `ItemId` → chemin → inode, puis corbeille ou délégation à l'*arr |
 | `ItemDeleted` | `Series`, `Season` | Résout via `jellyfin_series_id` / `jellyfin_season_id` → dossier commun → une seule passe |
+| `ItemAdded` | `Movie`, `Episode`, `Video` | Programme une sync, sans copie de la base, une minute plus tard ; les ajouts suivants s'y regroupent |
 | Autre | — | Ignoré |
 
 ### API

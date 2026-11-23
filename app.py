@@ -251,6 +251,8 @@ VIDEO_EXTENSIONS: set[str] = _parse_extensions(
 # ── Verrou global SQLite ─────────────────────────────────────────────────────
 _db_lock = threading.Lock()
 _sync_started = threading.Event()  # Empêche les doubles sync_loop (multi-workers)
+# Une seule sync à la fois : la boucle, /sync, /cleanup et les ajouts Jellyfin se suivent.
+_sync_run_lock = threading.Lock()
 
 
 # ── Base de données ──────────────────────────────────────────────────────────
@@ -866,10 +868,21 @@ def _sync_delay(statut: str, echecs: int) -> int:
     return min(SYNC_INTERVAL, _SYNC_RETRY_DELAYS[min(echecs, len(_SYNC_RETRY_DELAYS) - 1)])
 
 
-def sync_db(force: bool = False) -> str:
+def sync_db(force: bool = False, sauvegarde: bool = True, motif: str = "") -> str:
+    """
+    Une sync à la fois : celle qui arrive pendant qu'une autre tourne attend la fin
+    de la première, puis relit tout. `sauvegarde=False` saute la copie de la base,
+    pour les syncs déclenchées par un ajout dans Jellyfin, qui feraient tourner les
+    sauvegardes en quelques heures. `motif` s'affiche dans le journal.
+    """
+    with _sync_run_lock:
+        return _sync_db(force, sauvegarde, motif)
+
+
+def _sync_db(force: bool, sauvegarde: bool, motif: str) -> str:
     """
     Sync complète (atomique avec soft delete) :
-    1. Backup la DB
+    1. Backup la DB (sauf `sauvegarde=False`)
     2. Récupère les catégories qBit → dossiers à scanner
     3. Récupère tous les torrents qBit
     4. Pour chaque torrent → stat() les fichiers → inode
@@ -880,11 +893,12 @@ def sync_db(force: bool = False) -> str:
     qui aurait trop maigri : la transaction est annulée et l'index reste tel quel,
     sauf `force`. Retourne "success", "failed" (qBittorrent injoignable) ou "refused".
     """
-    log.info("=== Début sync DB ===")
+    log.info("=== Début sync DB%s ===", f" ({motif})" if motif else "")
     start = time.time()
 
     # Backup avant modification
-    backup_db()
+    if sauvegarde:
+        backup_db()
 
     # Compte les rows avant
     with _db_lock:
@@ -1367,6 +1381,48 @@ def _jellyfin_paths_by_metadata(data: dict[str, Any], max_paths: int) -> list[st
     return disparus
 
 
+# Un ajout dans Jellyfin déclenche une sync, pour que l'item soit connu de l'index
+# avant qu'on puisse le supprimer. Les ajouts d'une même minute (un pack de saison,
+# une bibliothèque qui se remplit) se regroupent dans une seule sync.
+_JELLYFIN_INDEX_DELAY = 60
+_jellyfin_index_lock = threading.Lock()
+_jellyfin_index_timer: threading.Timer | None = None
+_jellyfin_index_items = 0
+
+
+def schedule_jellyfin_index() -> bool:
+    """
+    Programme une sync dans _JELLYFIN_INDEX_DELAY secondes, après un ItemAdded.
+
+    La porte ne relie un item Jellyfin à ses fichiers que pendant une sync. Celle
+    de 12 h laissait sans effet la suppression d'un média arrivé entre-temps :
+    Oppenheimer, supprimé dans Jellyfin 12 min après son import, le 2026-11-22.
+    False si une sync était déjà programmée : l'ajout y est compté.
+    """
+    global _jellyfin_index_timer, _jellyfin_index_items
+    with _jellyfin_index_lock:
+        _jellyfin_index_items += 1
+        if _jellyfin_index_timer is not None and _jellyfin_index_timer.is_alive():
+            return False
+        _jellyfin_index_timer = threading.Timer(_JELLYFIN_INDEX_DELAY, _run_jellyfin_index)
+        _jellyfin_index_timer.daemon = True
+        _jellyfin_index_timer.start()
+        return True
+
+
+def _run_jellyfin_index() -> str:
+    global _jellyfin_index_timer, _jellyfin_index_items
+    # Libéré avant la sync : un ajout reçu pendant qu'elle tourne en programme une autre.
+    with _jellyfin_index_lock:
+        _jellyfin_index_timer = None
+        n, _jellyfin_index_items = _jellyfin_index_items, 0
+    try:
+        return sync_db(sauvegarde=False, motif=f"{n} ajout(s) dans Jellyfin")
+    except Exception as e:
+        log.error("Erreur sync après un ajout Jellyfin : %s", e)
+        return "failed"
+
+
 # ── Délégation à Sonarr / Radarr ─────────────────────────────────────────────
 
 
@@ -1486,8 +1542,29 @@ def _delegate_sonarr(paths: list[str], item_type: str, dry_run: bool) -> dict[st
     return {"arr": "sonarr", "series": titre, "episodes": len(episode_ids), "files": len(targets)}
 
 
-def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
-    """Dé-monitore puis supprime le fichier côté Radarr. None si film inconnu."""
+def _radarr_current_file(movie: dict[str, Any]) -> str:
+    """Le chemin du fichier que Radarr tient pour ce film, ou "" s'il n'en a pas."""
+    mf = movie.get("movieFile") or {}
+    if mf.get("path"):
+        return mf["path"]
+    if mf.get("relativePath") and movie.get("path"):
+        return os.path.join(movie["path"], mf["relativePath"])
+    return ""
+
+
+def _delegate_radarr(paths: list[str], dry_run: bool, inodes: set[int]) -> dict[str, Any] | None:
+    """
+    Dé-monitore puis supprime le fichier côté Radarr. None si film inconnu.
+
+    Radarr retrouve un film par son dossier, pas par son fichier : l'ancien fichier
+    d'un upgrade y était aussi. `inodes` sont ceux des fichiers disparus. Si le
+    fichier actuel de Radarr est encore sur le disque et n'en fait pas partie, la
+    disparition ne le concerne pas : la fiche est gardée ({"garde": True}), et
+    l'appelant passe les chemins disparus à la corbeille, comme l'event d'upgrade
+    l'aurait fait. Le 2026-11-22, cet event perdu, la porte a supprimé No Other Land
+    de Radarr, avec la version qu'il venait d'importer, sur l'ItemDeleted émis par
+    Jellyfin pour l'ancien fichier.
+    """
     if not (RADARR_URL and RADARR_API_KEY):
         return None
 
@@ -1497,6 +1574,17 @@ def _delegate_radarr(paths: list[str], dry_run: bool) -> dict[str, Any] | None:
 
     mid, titre = movie["id"], movie.get("title", "?")
     file_id = (movie.get("movieFile") or {}).get("id")
+
+    actuel = _radarr_current_file(movie)
+    if actuel:
+        try:
+            inode_actuel: int | None = os.stat(actuel).st_ino
+        except OSError:
+            inode_actuel = None  # son fichier a disparu : c'est bien lui qu'on a supprimé
+        if inode_actuel is not None and inode_actuel not in inodes:
+            log.info("  ⏭ Radarr : '%s' garde son fichier actuel (%s), qui n'est pas celui qui a disparu : "
+                     "upgrade ou autre version, la fiche n'est pas touchée", titre, os.path.basename(actuel))
+            return {"arr": "radarr", "movie": titre, "garde": True}
 
     # Un film est un conteneur à lui seul : le supprimer de Jellyfin veut dire
     # qu'on n'en veut plus, pas qu'on attend une meilleure version.
@@ -1734,10 +1822,22 @@ def delegate_to_arr(paths: list[str], item_type: str, dry_run: bool) -> dict[str
         if item_type in ("Series", "Season", "Episode"):
             return _delegate_sonarr(candidats, item_type, dry_run)
         if item_type in ("Movie", "Video"):
-            return _delegate_radarr(candidats, dry_run)
+            return _delegate_radarr(candidats, dry_run, _path_inodes(paths))
     except Exception as e:
         log.error("  Erreur délégation *arr : %s", e)
     return None
+
+
+def _path_inodes(paths: list[str]) -> set[int]:
+    """Les inodes que l'index donne à ces chemins : ceux de fichiers disparus, qu'on ne peut plus lire."""
+    inodes: set[int] = set()
+    with _db_lock:
+        with get_db() as conn:
+            for i in range(0, len(paths), _SQL_CHUNK):
+                lot = paths[i:i + _SQL_CHUNK]
+                inodes |= {r[0] for r in conn.execute(
+                    f"SELECT DISTINCT inode FROM files WHERE path IN ({','.join('?' * len(lot))})", lot)}
+    return inodes
 
 
 # ── Nettoyage ────────────────────────────────────────────────────────────────
@@ -6274,6 +6374,8 @@ def jellyfin_webhook():
 
     Le payload ne contient pas le chemin du fichier, seulement un ItemId — d'où
     la résolution via la colonne `files.jellyfin_item_id` remplie à chaque sync.
+    ItemAdded programme justement une sync, pour qu'un média tout juste arrivé
+    soit connu avant qu'on puisse le supprimer.
     """
     token = request.args.get("token") or request.headers.get("X-Token")
     if not verify_token(token):
@@ -6292,6 +6394,14 @@ def jellyfin_webhook():
     item_type = data.get("ItemType", "")
     item_id = data.get("ItemId", "")
     label = data.get("SeriesName") or data.get("Name") or item_id
+
+    if notif == "ItemAdded":
+        # Un par épisode d'un pack : journalisé en debug, la sync qui suit dit combien.
+        log.debug("Reçu event Jellyfin: ItemAdded | type=%s | %s", item_type, label)
+        if item_type not in ("Movie", "Episode", "Video"):
+            return jsonify({"status": "ignored", "notification": notif, "type": item_type})
+        programme = schedule_jellyfin_index()
+        return jsonify({"status": "index scheduled" if programme else "index already scheduled"})
 
     log.info(
         "Reçu event Jellyfin: %s | type=%s | %s%s",
@@ -6366,7 +6476,7 @@ def jellyfin_webhook():
     # son propre webhook, lequel déplace les torrents par le chemin de code habituel.
     if JELLYFIN_DELEGATE_TO_ARR:
         delegated = delegate_to_arr(disparus, item_type, dry_run)
-        if delegated:
+        if delegated and not delegated.get("garde"):
             return jsonify({
                 "status": "delegated",
                 "delegated_to": delegated,
@@ -6374,7 +6484,10 @@ def jellyfin_webhook():
                 "resolution": resolution,
                 "dry_run": dry_run,
             })
-        log.info("  Média inconnu de Sonarr/Radarr — déplacement direct des torrents")
+        if delegated:
+            log.info("  Fiche gardée : les torrents du fichier remplacé passent par la corbeille")
+        else:
+            log.info("  Média inconnu de Sonarr/Radarr — déplacement direct des torrents")
 
     # Un seul point d'entrée : la branche préfixe de move_torrents_for_path traite
     # tous les inodes d'un dossier en une passe, au lieu d'une session qBit par épisode.
