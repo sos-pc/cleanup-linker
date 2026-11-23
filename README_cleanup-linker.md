@@ -176,7 +176,7 @@ Les variables de simulation de l'assistant (`IMPORT_ASSIST_*_DRY_RUN`) ne font a
 | `IMPORT_ASSIST_TITRES_DRY_RUN` | `true` | Simulation de l'import par titre d'épisode de la règle 2 (Sonarr) |
 | `IMPORT_ASSIST_PACK_DRY_RUN` | `true` | Simulation de la règle 4 · pack incomplet |
 | `IMPORT_ASSIST_TROUS_DRY_RUN` | `true` | Simulation des saisons trouées (règle 4). Elles suivent aussi la simulation de la règle 4 |
-| `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier |
+| `IMPORT_ASSIST_PACK_MIN_SCORE` | `50` | Score de formats minimal d'un pack complet de remplacement, sans le bonus de pack. Il peut être plus bas que celui du pack incomplet : mieux vaut une saison sans trou. En dessous, un pack d'une autre langue ne sert qu'à combler les trous, fichier par fichier. Vaut pour les profils sans format « langue : French » à une seule condition ; ceux qui en ont un, comme le profil Opti, prennent les trois quarts de son score (15000) |
 | `PROWLARR_URL` | — | URL Prowlarr, où la règle 4 cherche les packs complets. Vide = elle signale les packs partiels sans rien remplacer |
 | `PROWLARR_API_KEY` | — | Clé API Prowlarr (Settings → General) |
 | `IMPORT_ASSIST_ACCORD_DRY_RUN` | `true` | Simulation de la règle 5 · bonne saison |
@@ -834,9 +834,9 @@ Un pack complet doit :
 - être un pack de la même saison, ni multi-saisons, ni « Part » ;
 - porter le même titre de série que le pack partiel. Une série d'anthologie rassemble sous une fiche TVDB des histoires que leurs releases nomment chacune « S01 ». Ainsi, « Monster: The Lizzie Borden Story » est la saison 4 de « Monster » pour TVDB, mais Sonarr la range en saison 1, celle de Dahmer, qui a 10 épisodes au lieu de 8. Le « S01 complet » serait une autre histoire que celle demandée. Si Sonarr ne reconnaît pas le titre du pack partiel, comme « Pokemon The Series », la version Netflix, ses propres titres pour la série sont admis aussi : « Pokemon ». Un titre qu'il connaît, comme « Monster The Lizzie Borden Story », reste seul juge. Un titre alternatif propre à une autre saison de scène ne l'est jamais : « Pokemon Horizons » est la saison 25 de Pokémon ;
 - avoir une qualité autorisée par le profil de la série, au moins aussi bonne que celle du pack partiel ;
-- avoir un score de formats d'au moins 50 (`IMPORT_ASSIST_PACK_MIN_SCORE`), même s'il est moins bien noté que le pack partiel : mieux vaut une saison sans trou. Si le pack partiel est lui-même sous 50, son propre score sert de seuil. Le bonus que le profil donne aux packs ne compte pas, puisque le partiel et ses remplaçants en ont tous. Avec le profil actuel :
-  - une release qui porte du français fait au moins 55 : MULTi 55, VOSTFR 80, VF 110, MULTi VFF 195 ;
-  - une release sans français part de -20, et gagne 10 par format technique (Atmos, Dolby Vision, HDR…). Un pack anglais reste donc sous le seuil ;
+- atteindre le seuil du français de son profil, même s'il est moins bien noté que le pack partiel : mieux vaut une saison sans trou. Si le pack partiel est lui-même sous ce seuil, son propre score sert de seuil. Le bonus que le profil donne aux packs ne compte pas, puisque le partiel et ses remplaçants en ont tous. Chaque profil a son échelle :
+  - un profil qui note l'audio français par un format à une seule condition, « langue : French », a pour seuil les trois quarts de ce score. Le profil Opti note ce format +20000 : son seuil est 15000. Un pack français 1080p y fait plus de 17000, un pack VOSTFR au plus 13600, un pack anglais environ 3000 ;
+  - les autres profils prennent `IMPORT_ASSIST_PACK_MIN_SCORE`, 50 par défaut. Avec le profil testtesttest, une release qui porte du français fait au moins 55 : MULTi 55, VOSTFR 80, VF 110, MULTi VFF 195. Une release sans français part de -20, et gagne 10 par format technique (Atmos, Dolby Vision, HDR…). Un pack anglais reste donc sous le seuil ;
 - avoir au moins 3 sources et un lien `.torrent`. Un magnet n'a pas de liste de fichiers à lire avant d'être ajouté.
 
 Les requêtes sont « Titre S01 » : le titre de la série, puis un titre alternatif valable pour cette saison, sans accents, comme les noms de releases. Pour Pokémon S04 : « Pokemon S04 », puis « Pokemon Johto League Champions S04 ». Les mieux classés passent d'abord : score, puis qualité, puis sources. Seuls les `.torrent` des 4 premiers sont lus, car chaque lecture passe par un tracker.
@@ -880,7 +880,7 @@ Les remplacements sont dans la table `pack_replace`.
 - d'une série ajoutée depuis plus de 24 h, et d'une saison demandée depuis plus de 24 h, le temps que Sonarr cherche et que le RSS passe. Chaque saison compte depuis sa propre demande : la saison 1 de Pokémon, demandée un matin, ne retarde pas la saison 4, demandée la veille.
 
 S'il y en a, l'assistant cherche un pack de la saison dans Prowlarr, comme pour un pack partiel, mais :
-- sans qualité ni score de référence : tout pack que Sonarr accepterait vaut mieux que rien ;
+- sans qualité de référence, et avec pour score de référence le seuil du français du profil : tout pack que Sonarr accepterait vaut mieux que rien, mais les packs français passent d'abord, et les autres sont notés « en VO » ;
 - le titre de série du pack doit être celui de la série, un de ses titres alternatifs pour cette saison, ou celui d'une release déjà prise pour elle. C'est le garde-fou des anthologies.
 
 Le pack trouvé ne télécharge que les fichiers des trous, dans la catégorie du client Sonarr de la série. Il est ensuite suivi comme un comblement en VO, jusqu'à l'import, puis la recherche en français.
