@@ -120,12 +120,16 @@ IMPORT_ASSIST_TITRES_DRY_RUN = os.getenv("IMPORT_ASSIST_TITRES_DRY_RUN", "true")
 # Sans Prowlarr, la règle se contente de signaler les packs partiels.
 IMPORT_ASSIST_PACK_DRY_RUN = os.getenv("IMPORT_ASSIST_PACK_DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
 # Mieux vaut une saison sans trou, même moins bien notée : un pack complet est
-# pris s'il atteint ce score de formats, sans le bonus que le profil donne aux
-# packs. Avec le profil actuel, une release qui porte du français fait au moins
-# 55, une release sans français au plus 40 environ. Si le pack partiel est
-# lui-même plus bas, c'est son score qui sert de seuil. Sous le seuil, un pack
-# d'une autre langue ne sert qu'à combler les trous : le partiel est gardé, et
-# seuls les fichiers des épisodes manquants sont téléchargés.
+# pris s'il atteint le seuil du français de son profil, sans le bonus que le
+# profil donne aux packs. Si le pack partiel est lui-même plus bas, c'est son
+# score qui sert de seuil. Sous le seuil, un pack d'une autre langue ne sert qu'à
+# combler les trous : le partiel est gardé, et seuls les fichiers des épisodes
+# manquants sont téléchargés.
+# Chaque profil a son échelle. Celui qui note l'audio français par un format à
+# une seule condition, « langue : French » (le profil Opti : +20000), a pour seuil
+# les trois quarts de ce score. Les autres prennent cette valeur : avec le profil
+# testtesttest, une release qui porte du français fait au moins 55, une release
+# sans français au plus 40 environ.
 IMPORT_ASSIST_PACK_MIN_SCORE = int(os.getenv("IMPORT_ASSIST_PACK_MIN_SCORE", "50"))
 # Règle 4, saisons trouées : une saison demandée dans Seerr garde des épisodes
 # diffusés, sans fichier ni téléchargement, faute de release à l'unité. Un pack de
@@ -4887,11 +4891,28 @@ def _pack_file_episodes(url: str, cle: str, serie_id: int, saison: int,
     return par_fichier
 
 
+_LANGUE_FRENCH = 2  # identifiant de la langue French dans Radarr et Sonarr
+
+
+def _francais_seul(cf: dict[str, Any]) -> bool:
+    """Format dont toutes les conditions disent « langue : French » : celui qui porte l'audio français d'un profil."""
+    specs = cf.get("specifications") or []
+
+    def champ(spec: dict[str, Any], nom: str) -> Any:
+        return next((c.get("value") for c in spec.get("fields") or [] if c.get("name") == nom), None)
+
+    return bool(specs) and all(
+        s.get("implementation") == "LanguageSpecification" and not s.get("negate")
+        and champ(s, "value") == _LANGUE_FRENCH and not champ(s, "exceptLanguage") for s in specs)
+
+
 def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any]:
     """
     Qualités autorisées par le profil, et leur rang : l'ordre du profil, de la
     moins bonne à la meilleure. Plus le bonus que le profil donne aux packs
     eux-mêmes : score des formats dont une condition porte sur le type de release.
+    Plus le seuil du français, à l'échelle du profil : les trois quarts du score
+    de son format « langue : French », ou IMPORT_ASSIST_PACK_MIN_SCORE sans ce format.
     """
     profil = (_arr_request("GET", url, cle, f"qualityprofile/{profil_id}") or {}) if profil_id else {}
     autorisees: set[int] = set()
@@ -4908,8 +4929,10 @@ def _quality_profile(url: str, cle: str, profil_id: int | None) -> dict[str, Any
     formats = (_arr_request("GET", url, cle, "customformat") or []) if notes else []
     bonus_pack = {f["id"]: notes[f["id"]] for f in formats if f.get("id") in notes and any(
         c.get("implementation") == "ReleaseTypeSpecification" for c in f.get("specifications") or [])}
+    francais = [notes[f["id"]] for f in formats if notes.get(f.get("id"), 0) > 0 and _francais_seul(f)]
     return {"autorisees": autorisees, "rangs": rangs, "bonus_pack": bonus_pack,
-            "score_min": profil.get("minFormatScore") or 0}
+            "score_min": profil.get("minFormatScore") or 0,
+            "seuil_fr": max(francais) * 3 // 4 if francais else IMPORT_ASSIST_PACK_MIN_SCORE}
 
 
 def _score_hors_pack(p: dict[str, Any], profil: dict[str, Any]) -> int:
@@ -4975,7 +4998,7 @@ def _pack_candidate(
     """
     Cherche dans Prowlarr un pack de la saison qui apporte tous les épisodes à
     couvrir. Mieux vaut une saison sans trou : son score de formats peut être plus
-    bas que celui du pack partiel, tant qu'il atteint IMPORT_ASSIST_PACK_MIN_SCORE
+    bas que celui du pack partiel, tant qu'il atteint le seuil du français du profil
     (le français reste le français), ou le score du partiel s'il est plus bas.
     À défaut, un pack d'une autre langue que Sonarr accepterait encore (score
     minimal du profil) : marqué « vo », il ne sert qu'à combler les trous, et
@@ -5000,7 +5023,7 @@ def _pack_candidate(
     with qbit_session() as s:
         deja = exclus | {t["hash"].lower() for t in qbit_get_torrents(s)}
 
-    seuil = min(ref["score"], IMPORT_ASSIST_PACK_MIN_SCORE)
+    seuil = min(ref["score"], profil.get("seuil_fr", IMPORT_ASSIST_PACK_MIN_SCORE))
     # Pour combler des trous, une autre langue suffit, tant que Sonarr l'accepterait.
     plancher = min(seuil, profil["score_min"])
     # Saisons trouées : plusieurs titres admis, faute de pack partiel de référence.
@@ -5598,10 +5621,11 @@ def _fill_season_holes(url: str, cle: str, serie: dict[str, Any], saison: int, e
     releases += [f.get("sceneName") or "" for f in _arr_request("GET", url, cle, "episodefile",
                                                                   params={"seriesId": serie_id}) or []
                  if f.get("seasonNumber") == saison]
-    # Ni score ni qualité de référence : un pack que Sonarr accepterait vaut mieux que rien.
-    ref = {"series_title": "", "series_titles": _series_titles(url, cle, serie, saison, [r for r in releases if r]),
-           "season": saison, "season_pack": True, "score": IMPORT_ASSIST_PACK_MIN_SCORE, "rang": -1}
+    # Ni score ni qualité de référence : un pack que Sonarr accepterait vaut mieux que rien. Au seuil du
+    # français du profil, il est pris pour la saison ; en dessous, il ne fait que combler, en VO.
     profil = _quality_profile(url, cle, serie.get("qualityProfileId"))
+    ref = {"series_title": "", "series_titles": _series_titles(url, cle, serie, saison, [r for r in releases if r]),
+           "season": saison, "season_pack": True, "score": profil["seuil_fr"], "rang": -1}
     with _pack_slots:
         cand, ecartes = _pack_candidate(url, cle, serie, saison, episodes, trous, ref, profil, set())
     if cand is None:
