@@ -129,13 +129,48 @@ def test_sync_sans_sauvegarde(tmp_path, sync, monkeypatch):
     assert copies == [True]
 
 
+def _verrou_pris() -> bool:
+    """Le verrou de la sync est-il tenu ? Essai par un autre descripteur, comme le ferait un autre process."""
+    import fcntl
+    fd = os.open(app.DB_PATH + ".sync.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
 def test_une_sync_a_la_fois(monkeypatch):
-    """Boucle, /sync, /cleanup et ajouts Jellyfin passent par le même verrou."""
+    """La boucle (maître gunicorn), /sync, /cleanup et les ajouts Jellyfin (workers) passent par un verrou de fichier."""
     vu = []
-    monkeypatch.setattr(app, "_sync_db", lambda force, sauvegarde, motif: vu.append(app._sync_run_lock.locked()) or "success")
+    monkeypatch.setattr(app, "_sync_db", lambda force, sauvegarde, motif: vu.append(_verrou_pris()) or "success")
     assert app.sync_db() == "success"
     assert vu == [True]
-    assert not app._sync_run_lock.locked()
+    assert not _verrou_pris()
+
+
+def test_sync_sautee_si_une_autre_a_commence_depuis(sync, monkeypatch):
+    """Deux workers ont reçu les ajouts d'un même pack : la seconde sync n'a rien de neuf à lire."""
+    lancees = []
+    monkeypatch.setattr(app, "_sync_db", lambda force, sauvegarde, motif: lancees.append(motif) or "success")
+    premier_ajout = time.time() - 60
+    with app.get_db() as conn:
+        conn.execute("INSERT INTO sync_log (started_at, finished_at, status) VALUES (?, ?, 'success')",
+                     (int(premier_ajout) - 10, int(premier_ajout) - 5))
+    assert app.sync_db(apres=premier_ajout, motif="a") == "success"  # la dernière précède l'ajout : elle a lieu
+    with app.get_db() as conn:
+        conn.execute("INSERT INTO sync_log (started_at, finished_at, status) VALUES (?, ?, 'failed')",
+                     (int(premier_ajout) + 20, int(premier_ajout) + 21))
+    assert app.sync_db(apres=premier_ajout, motif="b") == "success"  # une sync ratée ne compte pas
+    with app.get_db() as conn:
+        conn.execute("INSERT INTO sync_log (started_at, finished_at, status) VALUES (?, ?, 'success')",
+                     (int(premier_ajout) + 30, int(premier_ajout) + 35))
+    assert app.sync_db(apres=premier_ajout, motif="c") == "skipped"
+    assert app.sync_db(motif="boucle") == "success"  # sans `apres`, jamais sautée
+    assert lancees == ["a", "b", "boucle"]
 
 
 def test_qbittorrent_injoignable(tmp_path, sync):

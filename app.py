@@ -251,8 +251,6 @@ VIDEO_EXTENSIONS: set[str] = _parse_extensions(
 # ── Verrou global SQLite ─────────────────────────────────────────────────────
 _db_lock = threading.Lock()
 _sync_started = threading.Event()  # Empêche les doubles sync_loop (multi-workers)
-# Une seule sync à la fois : la boucle, /sync, /cleanup et les ajouts Jellyfin se suivent.
-_sync_run_lock = threading.Lock()
 
 
 # ── Base de données ──────────────────────────────────────────────────────────
@@ -868,14 +866,52 @@ def _sync_delay(statut: str, echecs: int) -> int:
     return min(SYNC_INTERVAL, _SYNC_RETRY_DELAYS[min(echecs, len(_SYNC_RETRY_DELAYS) - 1)])
 
 
-def sync_db(force: bool = False, sauvegarde: bool = True, motif: str = "") -> str:
+@contextmanager
+def _sync_exclusive():
     """
-    Une sync à la fois : celle qui arrive pendant qu'une autre tourne attend la fin
-    de la première, puis relit tout. `sauvegarde=False` saute la copie de la base,
-    pour les syncs déclenchées par un ajout dans Jellyfin, qui feraient tourner les
-    sauvegardes en quelques heures. `motif` s'affiche dans le journal.
+    Le verrou de la sync, partagé par tous les process : la boucle tourne dans le
+    maître gunicorn, /sync, /cleanup et les ajouts Jellyfin dans les workers. Même
+    principe que _assist_exclusive.
     """
-    with _sync_run_lock:
+    import fcntl  # POSIX seulement : importé ici pour que le module se charge ailleurs
+
+    fd = os.open(DB_PATH + ".sync.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _sync_reussie_depuis(instant: float) -> bool:
+    """Une sync réussie a-t-elle commencé après cet instant ? Elle a alors relu tout ce qui existait à ce moment."""
+    with _db_lock:
+        with get_db() as conn:
+            return conn.execute(
+                "SELECT 1 FROM sync_log WHERE status = 'success' AND started_at > ? LIMIT 1", (int(instant),)
+            ).fetchone() is not None
+
+
+def sync_db(force: bool = False, sauvegarde: bool = True, motif: str = "", apres: float | None = None) -> str:
+    """
+    Une sync à la fois, entre tous les process : celle qui arrive pendant qu'une
+    autre tourne attend la fin de la première, puis relit tout.
+
+    `apres` : la sync est sautée ("skipped") si une autre, réussie, a commencé
+    après cet instant, car elle a déjà tout relu. Les ajouts d'un même pack peuvent
+    arriver dans deux workers, qui programment chacun leur sync.
+
+    `sauvegarde=False` saute la copie de la base, pour les syncs déclenchées par un
+    ajout dans Jellyfin, qui feraient tourner les sauvegardes en quelques heures.
+    `motif` s'affiche dans le journal.
+    """
+    with _sync_exclusive():
+        if apres is not None and _sync_reussie_depuis(apres):
+            log.info("Sync sautée (%s) : une autre, commencée depuis, a déjà tout relu", motif or "?")
+            return "skipped"
         return _sync_db(force, sauvegarde, motif)
 
 
@@ -1388,6 +1424,7 @@ _JELLYFIN_INDEX_DELAY = 60
 _jellyfin_index_lock = threading.Lock()
 _jellyfin_index_timer: threading.Timer | None = None
 _jellyfin_index_items = 0
+_jellyfin_index_depuis = 0.0  # le premier ajout de la sync programmée
 
 
 def schedule_jellyfin_index() -> bool:
@@ -1399,11 +1436,12 @@ def schedule_jellyfin_index() -> bool:
     Oppenheimer, supprimé dans Jellyfin 12 min après son import, le 2026-11-22.
     False si une sync était déjà programmée : l'ajout y est compté.
     """
-    global _jellyfin_index_timer, _jellyfin_index_items
+    global _jellyfin_index_timer, _jellyfin_index_items, _jellyfin_index_depuis
     with _jellyfin_index_lock:
         _jellyfin_index_items += 1
         if _jellyfin_index_timer is not None and _jellyfin_index_timer.is_alive():
             return False
+        _jellyfin_index_depuis = time.time()
         _jellyfin_index_timer = threading.Timer(_JELLYFIN_INDEX_DELAY, _run_jellyfin_index)
         _jellyfin_index_timer.daemon = True
         _jellyfin_index_timer.start()
@@ -1416,8 +1454,10 @@ def _run_jellyfin_index() -> str:
     with _jellyfin_index_lock:
         _jellyfin_index_timer = None
         n, _jellyfin_index_items = _jellyfin_index_items, 0
+        depuis = _jellyfin_index_depuis
     try:
-        return sync_db(sauvegarde=False, motif=f"{n} ajout(s) dans Jellyfin")
+        # Sautée si l'autre worker a déjà fait une sync depuis le premier de ces ajouts.
+        return sync_db(sauvegarde=False, motif=f"{n} ajout(s) dans Jellyfin", apres=depuis)
     except Exception as e:
         log.error("Erreur sync après un ajout Jellyfin : %s", e)
         return "failed"

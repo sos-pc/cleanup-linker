@@ -4,6 +4,7 @@ hardlinks dans un dossier jetable, index rempli à la main, route /jellyfin appe
 Radarr qui notent chaque appel. Le cas de l'incident Westworld (2026-11-12) en tête.
 """
 import os
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -229,13 +230,17 @@ def ajout(item_type, item_id="x", nom="test"):
 def test_ajouts_regroupes_dans_une_seule_sync(porte, ajouts, monkeypatch):
     syncs = []
     monkeypatch.setattr(app, "sync_db", lambda **k: syncs.append(k) or "success")
+    avant = time.time()
     assert ajout("Episode") == "index scheduled"
     assert ajout("Episode") == "index already scheduled"
     assert ajout("Series") == "ignored"  # un conteneur n'a pas de fichier : ses épisodes arrivent à part
     assert syncs == []
     app._jellyfin_index_timer.cancel()
     assert app._run_jellyfin_index() == "success"
+    assert len(syncs) == 1
+    apres = syncs[0].pop("apres")
     assert syncs == [{"sauvegarde": False, "motif": "2 ajout(s) dans Jellyfin"}]
+    assert avant <= apres <= time.time()  # l'instant du premier ajout : une sync commencée depuis la rend inutile
     # La sync passée, un ajout en programme une autre.
     assert ajout("Movie") == "index scheduled"
 
@@ -245,6 +250,8 @@ def test_oppenheimer_supprime_juste_apres_son_ajout(tmp_path, porte, ajouts, mon
     Oppenheimer, 2026-11-22 : importé à 17:37, supprimé dans Jellyfin à 17:49, la dernière sync datait de 13:07.
     L'ItemAdded fait connaître l'item tout de suite, et la suppression atteint Radarr.
     """
+    with app.get_db() as conn:
+        conn.execute("DELETE FROM sync_log")  # aucune sync récente : celle de l'ajout doit avoir lieu
     films = tmp_path / "Multimedia/Films"
     torrent = fichier(str(films / "Oppenheimer.2023.QTZ.mkv"))
     dossier = tmp_path / "Media/Films/Oppenheimer (2023)"
