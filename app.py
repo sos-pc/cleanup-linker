@@ -6225,12 +6225,45 @@ def _alternatives(arr: str, url: str, cle: str, film: int | None, episodes: set[
     ]
 
 
+def _race_pointless(arr: str, url: str, cle: str, media: int, episodes: set[int]) -> str:
+    """
+    Pourquoi une course n'aurait pas d'objet. Elle sert une demande qui attend :
+    un film, ou au moins un épisode, surveillé et sans fichier. Un épisode non
+    surveillé n'attend rien, comme ceux d'une saison où un alias a rangé des
+    releases d'une autre série (Pokémon Horizons en saison 20). Un fichier déjà en
+    place non plus : la release morte n'était qu'un upgrade. "" si la course a un
+    objet, ou si les épisodes du téléchargement ne sont pas connus.
+    """
+    if arr == "radarr":
+        film = _arr_request("GET", url, cle, f"movie/{media}") or {}
+        if not film.get("monitored"):
+            return "le film n'est pas surveillé"
+        return "le film a déjà un fichier" if film.get("hasFile") else ""
+    if not episodes:
+        return ""
+    serie = _arr_request("GET", url, cle, f"series/{media}") or {}
+    if not serie.get("monitored"):
+        return "la série n'est pas surveillée"
+    eps = [e for e in _arr_request("GET", url, cle, "episode", params={"seriesId": media}) or []
+           if e.get("id") in episodes]
+    if not eps or any(e.get("monitored") and not e.get("hasFile") for e in eps):
+        return ""
+    presents = sum(1 for e in eps if e.get("hasFile"))
+    if presents == len(eps):
+        return "ses épisodes ont déjà un fichier" if len(eps) > 1 else "l'épisode a déjà un fichier"
+    if not presents:
+        return "ses épisodes ne sont pas surveillés" if len(eps) > 1 else "l'épisode n'est pas surveillé"
+    return f"{presents} de ses {len(eps)} épisodes ont déjà un fichier, et les autres ne sont pas surveillés"
+
+
 def _race_try(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any]], course: sqlite3.Row | None,
               inactif: float, dry: bool, ctx: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """
     Prend en plus la meilleure version pas encore essayée. Sans elle, l'original
     reste seul et en route. Si la bibliothèque a déjà mieux, il n'y a rien à
     remplacer : la règle 7 retire le téléchargement mort, sans rien chercher.
+    Si aucune demande ne l'attend (_race_pointless), rien n'est cherché, et une
+    course déjà lancée est close.
     """
     titre = records[0].get("title") or dl
     if course:
@@ -6252,7 +6285,15 @@ def _race_try(arr: str, url: str, cle: str, dl: str, records: list[dict[str, Any
             return _useless(arr, url, cle, dl, records, t, ctx, verdict,
                             f"{depuis}, et la bibliothèque a déjà mieux ({mieux}) que cette release ({_release_desc(arr, p)})",
                             arreter=not _must_seed(t))
-    if len(essayees) >= IMPORT_ASSIST_MORT_ESSAIS:
+    sans_objet = _race_pointless(arr, url, cle, media, episodes)
+    if sans_objet:
+        details = f"{depuis}, mais {sans_objet} : aucune autre version cherchée"
+        decision = "dead-wait"
+        if course and not dry:
+            # Ses téléchargements seront jugés un par un : la règle 7 retire ceux que la bibliothèque a déjà en mieux.
+            _race_update(course["id"], done=1)
+            details += " ; la course est close"
+    elif len(essayees) >= IMPORT_ASSIST_MORT_ESSAIS:
         details = f"{depuis}, {len(essayees)} autre(s) version(s) déjà essayée(s), sans résultat : on attend que l'une reparte"
         decision = "dead-wait"
     else:
