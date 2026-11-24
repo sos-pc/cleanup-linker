@@ -3088,7 +3088,11 @@ def _assist_log(regle: int, signe: str, arr: str, titre: str, details: str, dry_
 
 
 def _assist_modes() -> str:
-    """Ce que fait chaque règle avec la configuration actuelle : agir, simuler, ou rien."""
+    """
+    Ce que fait chaque règle avec la configuration actuelle : agir, simuler, ou
+    rien. Un réglage secondaire ne vaut que si sa règle agit : la simulation de la
+    règle s'étend à lui (mort-nés, identité confirmée, import par titre).
+    """
     def mode(simulation: bool) -> str:
         return "en simulation" if simulation else "ACTIVE"
     sonarr = bool(SONARR_URL and SONARR_API_KEY)
@@ -3098,10 +3102,10 @@ def _assist_modes() -> str:
           else "signale seulement (pas de Prowlarr)" if sonarr else "inactive (pas de Sonarr)")
     r5 = mode(IMPORT_ASSIST_ACCORD_DRY_RUN) if sonarr and SEERR_URL and SEERR_API_KEY else "inactive (Seerr ou Sonarr non configuré)"
     return (f"{_regle(1)} {mode(IMPORT_ASSIST_DRY_RUN)}, {_regle(2)} {mode(IMPORT_ASSIST_NOM_DRY_RUN)} "
-            f"(identité confirmée {mode(IMPORT_ASSIST_IDENTITE_DRY_RUN)}, import par titre d'épisode "
+            f"(identité confirmée {mode(IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_IDENTITE_DRY_RUN)}, import par titre d'épisode "
             f"{mode(IMPORT_ASSIST_NOM_DRY_RUN or IMPORT_ASSIST_TITRES_DRY_RUN) if sonarr else 'inactif (pas de Sonarr)'}), "
             f"{_regle(4)} {r4}, {_regle(5)} {r5}, {_regle(6)} {mode(IMPORT_ASSIST_MORT_DRY_RUN)} "
-            f"(mort-nés après {IMPORT_ASSIST_MORT_JAMAIS_HEURES:g} h {mode(IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN)}), "
+            f"(mort-nés après {IMPORT_ASSIST_MORT_JAMAIS_HEURES:g} h {mode(IMPORT_ASSIST_MORT_DRY_RUN or IMPORT_ASSIST_MORT_JAMAIS_DRY_RUN)}), "
             f"{_regle(7)} {mode(IMPORT_ASSIST_INUTILE_DRY_RUN)} (releases piégées {mode(IMPORT_ASSIST_PIEGE_DRY_RUN)})")
 
 
@@ -7433,6 +7437,29 @@ def corbeille_history():
     return jsonify([{**dict(r), "decision": json.loads(r["decision"]) if r["decision"] else None} for r in rows])
 
 
+@app.route("/etat")
+def etat_page():
+    """
+    État du flux, en lecture seule : demandes Seerr, files des *arr, fin de vie,
+    activité (module etat). `?refresh=1` relance un calcul, `?format=json` rend
+    l'instantané brut.
+    """
+    token = request.args.get("token") or request.headers.get("X-Token")
+    if not verify_token(token):
+        return jsonify({"error": "Unauthorized"}), 401
+    import etat  # importé ici : etat importe app
+
+    instantane = etat.lire()
+    if request.args.get("refresh") or instantane is None:
+        etat.lancer()
+    if request.args.get("format") == "json":
+        return jsonify(instantane or {})
+    from urllib.parse import quote
+
+    lien = f"/etat?token={quote(token or '', safe='')}&refresh=1"
+    return etat.page_html(instantane, etat.journal(), lien), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/stats")
 def stats():
     """Statistiques de la DB."""
@@ -7486,6 +7513,9 @@ def create_app() -> Flask:
                                        "active": "ACTIVE"}[CORBEILLE_GLOBALE])
     threading.Thread(target=sync_loop, daemon=True).start()
     threading.Thread(target=import_assist_loop, daemon=True).start()
+    import etat  # importé ici : etat importe app
+
+    threading.Thread(target=etat.boucle, daemon=True).start()
     return app
 
 

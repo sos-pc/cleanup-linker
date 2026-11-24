@@ -28,6 +28,7 @@ Trois principes valent partout :
 | Corbeille après une suppression ou un upgrade dans Sonarr/Radarr | Webhook Sonarr/Radarr | Oui |
 | Corbeille après une suppression dans Jellyfin, déléguée à Sonarr/Radarr si l'option est active | Webhook Jellyfin | Oui |
 | Assistant d'import (règles 1, 2, 4, 5, 6, 7) | Event « Manual Interaction Required », « On Grab » pour la règle 4, passage de renfort toutes les heures | Oui |
+| État du flux (`/etat`), en lecture seule | Toutes les 30 min, ou « recalculer » sur la page | Oui |
 | Balayage des orphelins (`/cleanup`) | À la main | Non |
 | Restauration, bootstrap, sync forcée | À la main | Non |
 
@@ -50,7 +51,7 @@ Trois principes valent partout :
 
 ### Image et fichiers
 
-GitHub Actions construit l'image `ghcr.io/sos-pc/cleanup-linker:latest` à chaque push sur `main`. Elle porte le commit dans le label `org.opencontainers.image.revision`. Le conteneur exécute `app.py` sous gunicorn, avec 2 workers et un délai de 120 s par requête.
+GitHub Actions construit l'image `ghcr.io/sos-pc/cleanup-linker:latest` à chaque push sur `main`. Elle porte le commit dans le label `org.opencontainers.image.revision`. Le conteneur exécute `app.py` sous gunicorn, avec 2 workers et un délai de 120 s par requête. Le module `etat.py`, en lecture seule, calcule la page `/etat`.
 
 Le dossier monté sur `/config` contient :
 
@@ -58,6 +59,8 @@ Le dossier monté sur `/config` contient :
 config/cleanup-linker/
 ├── db.sqlite               ← base locale, créée au premier démarrage
 ├── db.sqlite.assist.lock   ← verrou : un seul passage de l'assistant à la fois
+├── db.sqlite.etat.json     ← dernier instantané de l'état du flux
+├── db.sqlite.etat.lock     ← verrou : un seul calcul de l'état à la fois
 └── backups/                ← une copie de la base avant chaque sync
 ```
 
@@ -1047,6 +1050,44 @@ INFO     [SIMULATION] ⚠ [règle 7 · téléchargement inutile] [sonarr] South 
 
 ---
 
+## État du flux
+
+La page `/etat` montre, en lecture seule, ce que devient le flux de bout en bout. On l'ouvre dans un navigateur : `http://192.168.1.111:5001/etat?token=VOTRE_TOKEN`. Rien n'y agit.
+
+Un instantané est calculé deux minutes après le démarrage, puis toutes les 30 minutes, dans le maître gunicorn comme la sync. Il est écrit dans `db.sqlite.etat.json`. Le lien « recalculer » (`?refresh=1`) en lance un tout de suite, et `?format=json` rend l'instantané brut. Un seul calcul tourne à la fois (`db.sqlite.etat.lock`). Un service injoignable n'efface que sa partie, signalée en haut de la page.
+
+**Les demandes Seerr des 60 derniers jours.** Chaque demande reçoit un état. Pour une série, on regarde les épisodes déjà diffusés des saisons demandées.
+
+| Groupe | État | Ce que cela veut dire |
+|---|---|---|
+| À regarder | bloquée à l'import | un téléchargement fini que l'*arr n'importe pas (même définition que la règle 1) |
+| | téléchargement mort | plus rien ne vient (même définition que la règle 6, mort-nés compris) |
+| | introuvable | sortie, surveillée, mais rien en file depuis plus de 24 h : aucune release acceptée |
+| En attente normale | à approuver | pas encore approuvée dans Seerr |
+| | pas encore sortie | pas encore sortie en vidéo, avec les dates connues de Radarr, ou aucun épisode diffusé |
+| | en cours | un téléchargement avance, ou la demande a moins de 24 h |
+| Sans suite attendue | non suivie | film ou épisodes non surveillés : souvent après une suppression, qui dé-surveille les épisodes |
+| | fiche retirée | plus de fiche dans l'*arr, avec une mention si le média avait été disponible |
+| Aboutie | disponible | le film, ou tous les épisodes diffusés, ont un fichier |
+
+La page donne aussi le délai entre la demande et le premier import qui la suit (médiane, part en moins d'une heure et de 24 h, neuf sur dix). Elle donne enfin le nombre de demandes abouties grâce à une règle de l'assistant : renommage, accord de saison, pack, course gagnée, import par titre. Les demandes refusées ne comptent pas.
+
+**Les files.** Pour Sonarr et Radarr : les téléchargements par état, les médias qui en ont le plus, et ce que sert chaque téléchargement mort. « Attendu » désigne un film ou un épisode surveillé et sans fichier. « Upgrade » veut dire que tout a déjà un fichier. « Non surveillé » veut dire qu'aucune demande ne l'attend. Un média qui reçoit au moins 10 téléchargements en 24 heures est signalé « emballement ? ».
+
+**La fin de vie.** On y trouve :
+- la taille de la corbeille, avec ce qui seede et ce qui est arrêté ;
+- les torrents en erreur ou sans fichiers, hors corbeille ;
+- les éléments Jellyfin dont le fichier n'existe plus, par dossier ;
+- les gestes de la corbeille globale des 7 derniers jours.
+
+**L'activité.** Elle reprend les modes des règles et les verdicts des 7 derniers jours. Elle donne aussi le nombre de courses de la règle 6 ouvertes, et la dernière sync réussie.
+
+**L'évolution.** Chaque instantané ajoute son résumé à la table `etat_log`. La page montre le dernier résumé de chaque jour, sur 14 jours.
+
+Limites :
+- les saisons d'une demande Seerr sont numérotées comme sur TMDB, et celles de Sonarr comme sur TVDB. Pour un anime où les deux diffèrent, l'état peut porter sur la mauvaise saison ;
+- une demande « non suivie » ou « fiche retirée » est presque toujours une suppression voulue, mais la page ne le prouve pas.
+
 ## Exploitation
 
 ```bash
@@ -1055,6 +1096,9 @@ curl -XPOST 'http://192.168.1.111:5001/sync?token=VOTRE_TOKEN'
 
 # Resync qui passe outre le garde-fou, une fois : seulement si la chute est voulue
 curl -XPOST 'http://192.168.1.111:5001/sync?token=VOTRE_TOKEN&force=true'
+
+# État du flux, dans un navigateur
+#   http://192.168.1.111:5001/etat?token=VOTRE_TOKEN
 
 # État de la base
 curl -s 'http://192.168.1.111:5001/stats?token=VOTRE_TOKEN' | python3 -m json.tool
@@ -1078,7 +1122,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, fichier 480p remplacé, rien remplacé à qualité égale, règle 7 quand rien n'est apporté, sortie de file, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Et la règle 6 : une course seulement pour un film ou un épisode surveillé et sans fichier, et une course close quand plus rien ne l'attend. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, fichier 480p remplacé, rien remplacé à qualité égale, règle 7 quand rien n'est apporté, sortie de file, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Et la règle 6 : une course seulement pour un film ou un épisode surveillé et sans fichier, et une course close quand plus rien ne l'attend. Et l'état du flux : états des demandes et des téléchargements, instantané complet contre de faux services, service en panne, journal jour par jour, page et route. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
@@ -1146,6 +1190,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `/assist/history` | GET | `limit` (50, 500 au plus), `rule` | Derniers verdicts de l'assistant, avec la règle qui les a rendus |
 | `/history` | GET | `limit` (50, 500 au plus) | Derniers moves vers la corbeille |
 | `/corbeille/history` | GET | `limit` (50, 500 au plus) | Dernières décisions de la corbeille globale, simulées ou réelles |
+| `/etat` | GET | `refresh`, `format=json` | État du flux, en lecture seule. `refresh=1` relance un calcul, `format=json` rend l'instantané brut |
 | `/stats` | GET | — | Statistiques de la base |
 | `/health` | GET | — | Healthcheck, sans token |
 
@@ -1160,6 +1205,7 @@ Toutes les routes, sauf `/health`, demandent le token, en paramètre `token` ou 
 | `assist_log` | Les verdicts de l'assistant : téléchargement, *arr, titre, décision, détails, simulation ou non, règle, date |
 | `pack_replace` | Les remplacements de packs de la règle 4 |
 | `dead_race` | Les courses de versions de la règle 6 : original, versions essayées, torrents de la course, dernière tentative |
+| `etat_log` | Le résumé de chaque instantané de l'état du flux : demandes à regarder, files, corbeille, fantômes, date |
 | `corbeille_log` | Les décisions de la corbeille globale : source, geste, chemins, simulation ou non, résumé, détail, torrents déplacés par l'ancien geste, date |
 
 ---
