@@ -968,6 +968,13 @@ Un torrent mis en pause à la main compte aussi : s'il ne reçoit plus rien, il 
 
 **Rien à remplacer.** Si le fichier en place vaut déjà au moins la release morte, aucune recherche n'a lieu : la règle 7 retire le téléchargement (voir plus bas). Cela ne vaut qu'avant le début d'une course.
 
+**Seulement pour une demande qui attend.** Une course sert un film, ou au moins un épisode, surveillé et sans fichier. Sinon, aucune recherche n'a lieu, et le verdict `dead-wait` en donne la raison :
+- un épisode non surveillé, comme ceux d'une saison où un alias a rangé les releases d'une autre série ;
+- un film ou une série non surveillés ;
+- un fichier déjà en place : la release morte n'était qu'un upgrade.
+
+Une course déjà lancée est alors close, et ses téléchargements sont jugés un par un. Le 2026-11-24, des épisodes de Pokémon Horizons, rangés par Sonarr dans la saison 20 non surveillée, avaient lancé 28 courses, et autant de prises mortes.
+
 **La course.** Sinon, le téléchargement mort n'est **ni blacklisté ni retiré**, car un seeder peut revenir, même après des mois. L'assistant lance une course :
 1. **Le choix de l'autre version.**
    - Sonarr ou Radarr cherche les autres versions du même film, ou des mêmes épisodes. L'assistant prend la meilleure dans leur propre ordre de préférence : qualité, score de formats, langue.
@@ -988,7 +995,7 @@ Garde-fous : au plus 5 recherches par passage, les téléchargements les plus an
 
 Verdicts :
 - `dead-race` : une autre version est prise en plus ;
-- `dead-wait` : aucune autre version, on attend ;
+- `dead-wait` : aucune autre version, ou aucune demande n'attend ce téléchargement : on attend ;
 - `dead-won` : une version a gagné, les autres sont en corbeille ;
 - `dead-blocked` : une version est finie mais pas importée ;
 - `dead-refused` : la prise a été refusée, elle compte comme un essai ;
@@ -1071,7 +1078,7 @@ docker exec -e IMPORT_ASSIST_NOM_DRY_RUN=false cleanup-linker \
   python -c "import app; app.run_import_assist(source='passage manuel')"
 ```
 
-**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, fichier 480p remplacé, rien remplacé à qualité égale, règle 7 quand rien n'est apporté, sortie de file, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
+**Les tests.** Le dossier `tests/` vérifie l'identité confirmée (règle 2), la release piégée (règle 7) et les mort-nés (règle 6), avec des noms de releases réels. Il vérifie aussi la porte Jellyfin, avec de vrais fichiers et de vrais hardlinks dans un dossier jetable : doublon retiré (le cas Westworld), copie gérée des deux côtés, film de la bibliothèque « Films », déplacement connu ou non de l'index. Et la sync, de la même façon : montage `/data/Media` perdu, qBittorrent vide, doublons sans torrent, reprise après un échec, garde-fou de `/cleanup`. Et la corbeille, avec un faux qBittorrent qui répond comme la version 5.2 : dossiers jumeaux, torrent de corbeille déjà présent, refus de qBittorrent, place prise dans la corbeille, erreur au milieu du geste. Et `/restore` : torrent de corbeille, vrai torrent sans catégorie d'origine, vrai torrent avec catégorie. Et les saisons trouées, sur le cas StuGo : trous comptés, délais, simulation, garde-fou des anthologies, client de la série. Et le cas Pokémon : version Netflix importée par titre d'épisode, fichier 480p remplacé, rien remplacé à qualité égale, règle 7 quand rien n'est apporté, sortie de file, titres admis par la règle 4 (Monster et Pokémon Horizons toujours écartés), requêtes de pack, saison tenue par un magnet mort, demandes par saison. Et la règle 6 : une course seulement pour un film ou un épisode surveillé et sans fichier, et une course close quand plus rien ne l'attend. Les tests de bout en bout passent par le vrai code, avec de faux Sonarr, Radarr et qBittorrent : aucun appel réseau, une base SQLite jetable. GitHub les lance avant de construire chaque image.
 
 ```bash
 pip install -r requirements.txt pytest
