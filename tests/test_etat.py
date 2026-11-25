@@ -203,7 +203,7 @@ def services(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "_seerr_get", faux_seerr)
     monkeypatch.setattr(app, "qbit_session", session)
     monkeypatch.setattr(app, "qbit_get_torrents", lambda s: [dict(t) for t in torrents])
-    return {"appels": appels, "routes": routes, "torrents": torrents}
+    return {"appels": appels, "routes": routes, "torrents": torrents, "demandes": demandes}
 
 
 def test_instantane(services):
@@ -316,3 +316,37 @@ def test_demandes_aidees(services):
     assert etat.calculer(MAINTENANT)["demandes"]["aidees"] == 0
     action(0)
     assert etat.calculer(MAINTENANT)["demandes"]["aidees"] == 1
+
+
+def test_saisons_jugees():
+    assert etat.saisons_jugees([0, 2]) == [2] and etat.saisons_jugees([0]) == [0] and etat.saisons_jugees([1, 3]) == [1, 3]
+
+
+def test_speciaux_ignores_si_une_vraie_saison_est_demandee(services):
+    """Pokémon S0,2 : la saison 2 est complète, les spéciaux ne doivent pas rendre la demande introuvable."""
+    demandes = services["demandes"]
+    demandes.insert(0, {"type": "tv", "status": 2, "createdAt": _iso(MAINTENANT - 3 * J), "media": {"tvdbId": 76703},
+                     "seasons": [{"seasonNumber": 0}, {"seasonNumber": 2}], "requestedBy": {"displayName": "Eggshell"}})
+    services["routes"][(SONARR, "episode")].extend(
+        [_ep(201, True) | {"seasonNumber": 2}, _ep(202, False) | {"seasonNumber": 0}, _ep(203, True) | {"seasonNumber": 0}])
+    d = etat.calculer(MAINTENANT)["demandes"]
+    assert d["par_etat"]["disponible"] == 2  # No Other Land et Pokémon S0,2
+    assert not any("S0,2" in x["titre"] for x in d["lignes"])
+
+
+def test_demande_de_speciaux_seule(services):
+    """Une demande de la seule saison 0 reste jugée sur elle."""
+    services["demandes"].insert(0, {"type": "tv", "status": 2, "createdAt": _iso(MAINTENANT - 5 * J), "media": {"tvdbId": 76703},
+                                 "seasons": [{"seasonNumber": 0}], "requestedBy": {"displayName": "Eggshell"}})
+    services["routes"][(SONARR, "episode")].append(_ep(301, False) | {"seasonNumber": 0})
+    lignes = etat.calculer(MAINTENANT)["demandes"]["lignes"]
+    assert [(x["etat"], x["detail"]) for x in lignes if x["titre"] == "Pokémon S0"] ==         [("introuvable", "0/1 épisodes ; manquants : 1 sans téléchargement")]
+
+
+def test_les_speciaux_restent_visibles_dans_le_detail(services):
+    """Une vraie saison incomplète dit combien de spéciaux ne comptent pas."""
+    services["demandes"].insert(0, {"type": "tv", "status": 2, "createdAt": _iso(MAINTENANT - 5 * J), "media": {"tvdbId": 76703},
+                                 "seasons": [{"seasonNumber": 0}, {"seasonNumber": 1}], "requestedBy": {"displayName": "Eggshell"}})
+    services["routes"][(SONARR, "episode")].extend([_ep(i, i == 401) | {"seasonNumber": 0} for i in (401, 402, 403)])
+    ligne = next(x for x in etat.calculer(MAINTENANT)["demandes"]["lignes"] if x["titre"] == "Pokémon S0,1")
+    assert ligne["etat"] == "bloquée à l'import" and "spéciaux non comptés : 1/3 en place" in ligne["detail"]

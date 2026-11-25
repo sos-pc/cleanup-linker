@@ -129,6 +129,15 @@ def etat_film(film: dict[str, Any] | None, telechargements: list[dict[str, str]]
     return "introuvable", "rien dans la file : aucune release acceptée par Radarr"
 
 
+def saisons_jugees(saisons: list[int]) -> list[int]:
+    """
+    Les saisons qui décident de l'état d'une demande. Les spéciaux (saison 0) d'un
+    anime ne sortent souvent jamais en épisode, et Seerr les laisse demander avec
+    la vraie saison : ils ne comptent que si rien d'autre n'est demandé.
+    """
+    return [s for s in saisons if s != 0] or saisons
+
+
 # Épisodes manquants, du plus grave au moins grave.
 _MANQUES = ("bloqué(s) à l'import", "mort(s)", "sans téléchargement", "en cours", "non surveillé(s)")
 
@@ -301,6 +310,7 @@ def _demandes(maintenant: float, files: dict[str, dict[str, dict[str, Any]]]) ->
         else:
             serie = par_tvdb.get(m.get("tvdbId")) or par_tmdb.get(m.get("tmdbId"))
             saisons = sorted({s.get("seasonNumber") for s in d.get("seasons") or []})
+            jugees = saisons_jugees(saisons)
             nom = serie["title"] if serie else f"série TVDB {m.get('tvdbId')}"
             titre = f"{nom} S{','.join(str(s) for s in saisons)}"
             if serie is None:
@@ -309,8 +319,11 @@ def _demandes(maintenant: float, files: dict[str, dict[str, dict[str, Any]]]) ->
                 if serie["id"] not in episodes_serie:
                     episodes_serie[serie["id"]] = app._arr_request(
                         "GET", app.SONARR_URL, app.SONARR_API_KEY, "episode", params={"seriesId": serie["id"]}) or []
-                eps = [e for e in episodes_serie[serie["id"]] if e.get("seasonNumber") in saisons]
+                eps = [e for e in episodes_serie[serie["id"]] if e.get("seasonNumber") in jugees]
                 etat, detail = etat_serie(eps, dl_ep, age, maintenant)
+                if jugees != saisons and etat != ABOUTIE:
+                    specials = [e for e in episodes_serie[serie["id"]] if e.get("seasonNumber") == 0]
+                    detail += f" ; spéciaux non comptés : {sum(bool(e.get('hasFile')) for e in specials)}/{len(specials)} en place"
             diffuses = [e for e in eps if (_ts(e.get("airDateUtc")) or float("inf")) <= maintenant]
             cles = [("sonarr", e["id"]) for e in diffuses]
             premiers = [x for x in (delai(cree, imports.get(c, [])) for c in cles) if x is not None]
