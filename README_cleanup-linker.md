@@ -1070,6 +1070,8 @@ Un instantané est calculé deux minutes après le démarrage, puis toutes les 3
 | | fiche retirée | plus de fiche dans l'*arr, avec une mention si le média avait été disponible |
 | Aboutie | disponible | le film, ou tous les épisodes diffusés, ont un fichier |
 
+Les spéciaux (saison 0) ne comptent pas quand une vraie saison est demandée avec eux, car ils ne paraissent souvent jamais en épisode : l'état ne porte que sur les vraies saisons. Une demande de la seule saison 0 est jugée sur celle-ci.
+
 La page donne aussi le délai entre la demande et le premier import qui la suit (médiane, part en moins d'une heure et de 24 h, neuf sur dix). Elle donne enfin le nombre de demandes abouties grâce à une règle de l'assistant : renommage, accord de saison, pack, course gagnée, import par titre. Les demandes refusées ne comptent pas.
 
 **Les files.** Pour Sonarr et Radarr : les téléchargements par état, les médias qui en ont le plus, et ce que sert chaque téléchargement mort. « Attendu » désigne un film ou un épisode surveillé et sans fichier. « Upgrade » veut dire que tout a déjà un fichier. « Non surveillé » veut dire qu'aucune demande ne l'attend. Un média qui reçoit au moins 10 téléchargements en 24 heures est signalé « emballement ? ».
