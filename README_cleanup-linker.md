@@ -1070,6 +1070,8 @@ Un instantané est calculé deux minutes après le démarrage, puis toutes les 3
 | | fiche retirée | plus de fiche dans l'*arr, avec une mention si le média avait été disponible |
 | Aboutie | disponible | le film, ou tous les épisodes diffusés, ont un fichier |
 
+**Les demandes plus anciennes restent visibles.** Une demande de plus de 60 jours que Seerr tient encore pour ouverte (approuvée sans être terminée, en attente d'approbation, ou en échec) reçoit aussi un état, et paraît dans les tableaux avec son âge. Elle n'entre pas dans les chiffres de la fenêtre : nombre de demandes, disponibles, délais. Les cartes « à regarder », « en attente normale » et « sans suite attendue », comme le résumé suivi jour par jour, la comptent. Ainsi Ranma ½, bloquée depuis 311 jours, ne sort plus de la page parce qu'elle a vieilli.
+
 Les spéciaux (saison 0) ne comptent pas quand une vraie saison est demandée avec eux, car ils ne paraissent souvent jamais en épisode : l'état ne porte que sur les vraies saisons. Une demande de la seule saison 0 est jugée sur celle-ci.
 
 La page donne aussi le délai entre la demande et le premier import qui la suit (médiane, part en moins d'une heure et de 24 h, neuf sur dix). Elle donne enfin le nombre de demandes abouties grâce à une règle de l'assistant : renommage, accord de saison, pack, course gagnée, import par titre. Les demandes refusées ne comptent pas.

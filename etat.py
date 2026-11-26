@@ -215,6 +215,27 @@ def _seerr_demandes(debut: float) -> list[dict[str, Any]]:
             return demandes
 
 
+def _seerr_ouvertes(debut: float) -> list[dict[str, Any]]:
+    """
+    Demandes créées avant `debut` que Seerr tient encore pour ouvertes : approuvées
+    sans être terminées, en attente d'approbation, ou en échec. Une demande bloquée
+    depuis des mois ne doit pas sortir de la page parce qu'elle a vieilli.
+    """
+    ouvertes: dict[Any, dict[str, Any]] = {}
+    for filtre in ("processing", "pending", "failed"):
+        skip = 0
+        while True:
+            page = app._seerr_get("request", take=100, skip=skip, filter=filtre, sort="added") or {}
+            lot = page.get("results") or []
+            for d in lot:
+                if (_ts(d.get("createdAt")) or 0) < debut:
+                    ouvertes[d["id"] if d.get("id") is not None else id(d)] = d
+            skip += len(lot)
+            if not lot or skip >= ((page.get("pageInfo") or {}).get("results") or 0):
+                break
+    return list(ouvertes.values())
+
+
 def _arrs() -> Iterator[tuple[str, str, str]]:
     for arr, url, cle in (("sonarr", app.SONARR_URL, app.SONARR_API_KEY), ("radarr", app.RADARR_URL, app.RADARR_API_KEY)):
         if url and cle:
@@ -291,11 +312,9 @@ def _demandes(maintenant: float, files: dict[str, dict[str, dict[str, Any]]]) ->
             dl_ep[r.get("episodeId")].append({"titre": r.get("title") or "", "etat": d["etat"], "detail": d["detail"]})
 
     episodes_serie: dict[int, list[dict[str, Any]]] = {}
-    par_etat: collections.Counter[str] = collections.Counter()
-    delais: dict[str, list[float]] = {"films": [], "series": []}
-    lignes: list[dict[str, Any]] = []
-    deja_la = aidees = 0
-    for d in demandes:
+
+    def juger(d: dict[str, Any]) -> dict[str, Any]:
+        """L'état d'une demande, avec ce qu'il faut pour mesurer son délai."""
         m = d.get("media") or {}
         cree = _ts(d.get("createdAt")) or maintenant
         age = maintenant - cree
@@ -333,21 +352,42 @@ def _demandes(maintenant: float, files: dict[str, dict[str, dict[str, Any]]]) ->
             etat, detail = "à approuver", "demande pas encore approuvée dans Seerr"
         if etat == "fiche retirée" and m.get("mediaAddedAt"):
             detail += " ; le média avait été disponible : sans doute supprimé après coup"
-        par_etat[etat] += 1
-        if etat == ABOUTIE:
-            if attente is None:
+        return {"etat": etat, "detail": detail, "titre": titre, "genre": genre, "cles": cles, "attente": attente,
+                "cree": cree, "age": age, "qui": qui}
+
+    def ligne(j: dict[str, Any], ancienne: bool) -> dict[str, Any]:
+        return {"age": j["age"], "type": "film" if j["genre"] == "films" else "série", "titre": j["titre"],
+                "demandeur": j["qui"], "etat": j["etat"], "detail": j["detail"], "ancienne": ancienne}
+
+    par_etat: collections.Counter[str] = collections.Counter()
+    delais: dict[str, list[float]] = {"films": [], "series": []}
+    lignes: list[dict[str, Any]] = []
+    deja_la = aidees = 0
+    for d in demandes:
+        j = juger(d)
+        par_etat[j["etat"]] += 1
+        if j["etat"] == ABOUTIE:
+            if j["attente"] is None:
                 deja_la += 1
             else:
-                delais[genre].append(attente)
-                telechargements = {dl for c in cles for dl, quand in prises.get(c, []) if quand >= cree - 60}
+                delais[j["genre"]].append(j["attente"])
+                telechargements = {dl for c in j["cles"] for dl, quand in prises.get(c, []) if quand >= j["cree"] - 60}
                 aidees += bool(telechargements & aides)
             continue
-        lignes.append({"age": age, "type": "film" if genre == "films" else "série", "titre": titre, "demandeur": qui,
-                       "etat": etat, "detail": detail})
+        lignes.append(ligne(j, False))
+    # Les demandes plus anciennes que la fenêtre, encore ouvertes pour Seerr : elles
+    # restent sur la page, sans entrer dans les chiffres des _ETAT_JOURS jours.
+    anciennes: collections.Counter[str] = collections.Counter()
+    for d in _seerr_ouvertes(debut):
+        j = juger(d)
+        anciennes[j["etat"]] += 1
+        if j["etat"] != ABOUTIE:
+            lignes.append(ligne(j, True))
     ordre = {e: i for i, e in enumerate(A_REGARDER + EN_ATTENTE + SANS_SUITE)}
     lignes.sort(key=lambda x: (ordre.get(x["etat"], 99), -x["age"]))
     return {"jours": _ETAT_JOURS, "total": len(demandes), "par_etat": dict(par_etat), "deja_la": deja_la,
-            "aidees": aidees, "delais": {g: stats_delais(v) for g, v in delais.items()}, "lignes": lignes}
+            "aidees": aidees, "delais": {g: stats_delais(v) for g, v in delais.items()}, "lignes": lignes,
+            "anciennes": {"total": sum(anciennes.values()), "par_etat": dict(anciennes)}}
 
 
 def _resume_files(files: dict[str, dict[str, dict[str, Any]]], maintenant: float) -> dict[str, Any]:
@@ -425,11 +465,13 @@ def _activite(maintenant: float) -> dict[str, Any]:
 def _resume(inst: dict[str, Any]) -> dict[str, Any]:
     """Les chiffres suivis jour après jour."""
     d = inst.get("demandes") or {}
-    par_etat = d.get("par_etat") or {}
+    # Ce qu'il y a à regarder, quel que soit l'âge de la demande : fenêtre et anciennes encore ouvertes.
+    par_etat = collections.Counter(d.get("par_etat") or {}) + collections.Counter((d.get("anciennes") or {}).get("par_etat") or {})
     files = inst.get("files") or {}
     fin = inst.get("fin_de_vie") or {}
     return {
         "demandes": d.get("total"), "a_regarder": sum(par_etat.get(e, 0) for e in A_REGARDER),
+        "a_regarder_anciennes": sum(((d.get("anciennes") or {}).get("par_etat") or {}).get(e, 0) for e in A_REGARDER),
         **{e: par_etat.get(e, 0) for e in A_REGARDER},
         "mediane_films": ((d.get("delais") or {}).get("films") or {}).get("mediane"),
         "file_sonarr": (files.get("sonarr") or {}).get("total"), "file_radarr": (files.get("radarr") or {}).get("total"),
@@ -636,9 +678,12 @@ def page_html(inst: dict[str, Any] | None, histoire: list[dict[str, Any]], lien_
     d = inst.get("demandes")
     if d:
         par = d.get("par_etat") or {}
-        n_regarder = sum(par.get(e, 0) for e in A_REGARDER)
-        n_attente = sum(par.get(e, 0) for e in EN_ATTENTE)
-        n_sans = sum(par.get(e, 0) for e in SANS_SUITE)
+        # Les cartes comptent les lignes des tableaux, demandes anciennes encore ouvertes comprises.
+        toutes = d.get("lignes") or []
+        n_regarder = sum(1 for x in toutes if x["etat"] in A_REGARDER)
+        n_attente = sum(1 for x in toutes if x["etat"] in EN_ATTENTE)
+        n_sans = sum(1 for x in toutes if x["etat"] in SANS_SUITE)
+        n_anciennes = sum(1 for x in toutes if x.get("ancienne"))
         morceaux.append(f"<h2>Demandes Seerr des {d['jours']} derniers jours</h2>")
         morceaux.append('<div class="cartes">'
                         f'<div class="carte"><b>{d["total"]}</b>demandes</div>'
@@ -650,6 +695,9 @@ def page_html(inst: dict[str, Any] | None, histoire: list[dict[str, Any]], lien_
         deja = d.get("deja_la") or 0
         morceaux.append("<ul>" + _delais_texte("Films", delais.get("films") or {}) + _delais_texte("Séries", delais.get("series") or {})
                         + (f'<li class="doux">{deja} demande(s) portaient sur un média déjà là.</li>' if deja else "") + "</ul>")
+        if n_anciennes:
+            morceaux.append(f'<p class="doux">Les trois dernières cartes et les tableaux comptent aussi {n_anciennes} demande(s) de plus de '
+                            f'{d["jours"]} jours que Seerr tient encore pour ouvertes ; les délais n\'en tiennent pas compte.</p>')
         groupes = (("À regarder : bloquées, mortes, introuvables", A_REGARDER, True),
                    ("En attente normale : pas encore sorties, en cours", EN_ATTENTE, True),
                    ("Sans suite attendue : non suivies ou fiches retirées", SANS_SUITE, False))
