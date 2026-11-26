@@ -186,9 +186,12 @@ def services(monkeypatch, tmp_path):
         return routes[(base_url, endpoint)]
 
     def faux_seerr(route, **params):
+        """Toutes les demandes, ou celles d'un filtre de Seerr (« processing », « pending »…), marquées `_filtre` ici."""
         assert route == "request"
-        lot = demandes[params["skip"]:params["skip"] + params["take"]]
-        return {"results": lot, "pageInfo": {"results": len(demandes)}}
+        filtre = params.get("filter", "all")
+        liste = demandes if filtre == "all" else [d for d in demandes if d.get("_filtre") == filtre]
+        lot = liste[params["skip"]:params["skip"] + params["take"]]
+        return {"results": lot, "pageInfo": {"results": len(liste)}}
 
     @contextmanager
     def session():
@@ -350,3 +353,47 @@ def test_les_speciaux_restent_visibles_dans_le_detail(services):
     services["routes"][(SONARR, "episode")].extend([_ep(i, i == 401) | {"seasonNumber": 0} for i in (401, 402, 403)])
     ligne = next(x for x in etat.calculer(MAINTENANT)["demandes"]["lignes"] if x["titre"] == "Pokémon S0,1")
     assert ligne["etat"] == "bloquée à l'import" and "spéciaux non comptés : 1/3 en place" in ligne["detail"]
+
+
+def test_demandes_anciennes_encore_ouvertes(services):
+    """
+    Ranma ½ attendait depuis 311 jours sans paraître sur la page, limitée à 60 jours. Une demande que Seerr tient pour
+    ouverte reste visible quel que soit son âge, sans entrer dans les chiffres de la fenêtre.
+    """
+    services["routes"][(RADARR, "movie")].append(
+        {"id": 3, "tmdbId": 15, "title": "Tout est permis", "year": 2011, "monitored": True, "hasFile": False, "status": "released"})
+    services["demandes"].extend([
+        {"id": 901, "type": "movie", "status": 2, "createdAt": _iso(MAINTENANT - 268 * J), "media": {"tmdbId": 15},
+         "requestedBy": {"displayName": "methammer"}, "_filtre": "processing"},
+        {"id": 902, "type": "movie", "status": 2, "createdAt": _iso(MAINTENANT - 392 * J), "media": {"tmdbId": 11},
+         "requestedBy": {"displayName": "methammer"}, "_filtre": "processing"},
+        {"id": 903, "type": "movie", "status": 2, "createdAt": _iso(MAINTENANT - 482 * J), "media": {"tmdbId": 86495},
+         "requestedBy": {"displayName": "pascap"}, "_filtre": "processing"},
+        {"id": 904, "type": "movie", "status": 1, "createdAt": _iso(MAINTENANT - 100 * J), "media": {"tmdbId": 15},
+         "requestedBy": {"displayName": "Hind"}, "_filtre": "pending"},
+        {"id": 905, "type": "movie", "status": 2, "createdAt": _iso(MAINTENANT - 10 * J), "media": {"tmdbId": 15},
+         "requestedBy": {"displayName": "Hind"}, "_filtre": "processing"},  # dans la fenêtre : déjà comptée, pas en double
+    ])
+    inst = etat.calculer(MAINTENANT)
+    d = inst["demandes"]
+    assert d["total"] == 4 and "à approuver" not in d["par_etat"]  # les chiffres des 60 jours ne bougent pas
+    assert d["anciennes"] == {"total": 4, "par_etat": {"introuvable": 1, "disponible": 1, "fiche retirée": 1, "à approuver": 1}}
+    anciennes = [(x["titre"], x["etat"], round(x["age"] / J)) for x in d["lignes"] if x["ancienne"]]
+    assert anciennes == [("Tout est permis (2011)", "introuvable", 268), ("Tout est permis (2011)", "à approuver", 100),
+                         ("film TMDB 86495", "fiche retirée", 482)]
+    assert not any(x["ancienne"] for x in d["lignes"] if round(x["age"] / J) < 60)
+    assert (inst["resume"]["a_regarder"], inst["resume"]["a_regarder_anciennes"], inst["resume"]["introuvable"]) == (3, 1, 1)
+    page = etat.page_html(inst, [], "#", MAINTENANT)
+    assert "À regarder : bloquées, mortes, introuvables (3)" in page
+    assert "comptent aussi 3 demande(s) de plus de 60 jours" in page
+    assert '<b>3</b>à regarder' in page  # la carte compte les lignes, anciennes comprises
+
+
+def test_demandes_anciennes_sans_identifiant(services):
+    """Deux demandes anciennes sans identifiant ne se confondent pas."""
+    services["routes"][(RADARR, "movie")].append(
+        {"id": 3, "tmdbId": 15, "title": "Tout est permis", "year": 2011, "monitored": True, "hasFile": False, "status": "released"})
+    for age in (200, 300):
+        services["demandes"].append({"type": "movie", "status": 2, "createdAt": _iso(MAINTENANT - age * J), "media": {"tmdbId": 15},
+                                     "requestedBy": {"displayName": "methammer"}, "_filtre": "processing"})
+    assert etat.calculer(MAINTENANT)["demandes"]["anciennes"]["total"] == 2
